@@ -438,9 +438,9 @@ mod tests {
 
         resolve(&mut state, &ability, &mut events).unwrap();
 
-        // LIFO: PostCombatMain pushed first, BeginCombat on top → on the
-        // first EndCombat encountered, BeginCombat (the more recent entry)
-        // is consumed; the second EndCombat consumes PostCombatMain.
+        // LIFO: the follow-up main phase is pushed first and the combat on
+        // top, so the added combat (the more recent entry) runs first after
+        // EndCombat, and the main phase after the added combat ends.
         assert_eq!(
             scheduled(&state),
             vec![
@@ -1091,7 +1091,7 @@ mod tests {
     /// CR 608.2h + CR 611.2c: Last Night Together — "Only the chosen creatures
     /// can attack during that combat phase." The parser emits `ParentTarget`;
     /// the resolver must snapshot the spell's chosen targets into a fixed
-    /// tracked set and stamp it onto the scheduled BeginCombat ExtraPhase.
+    /// tracked set and stamp it onto the scheduled combat phase's ExtraPhase.
     #[test]
     fn restricted_combat_concretizes_parent_target_to_tracked_set() {
         let mut state = GameState {
