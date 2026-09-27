@@ -4525,7 +4525,7 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         ),
         Effect::AdditionalPhase {
             target,
-            phase: _,
+            segment: _,
             after: _,
             followed_by: _,
             count: _,
@@ -19824,7 +19824,7 @@ mod tests {
         // AdditionalPhase (Wyll): "there is" names no player (`None`); a grant
         // to the controller ("you get") survives too; a grant to a player the
         // trigger event names does not.
-        let phase = r#"{"type":"AdditionalPhase","target":{"type":"None"},"phase":"BeginCombat","after":{"type":"ThisPhase","data":{"named":["PrecombatMain","PostcombatMain"]}},"followed_by":["PostCombatMain"],"count":{"type":"Fixed","value":1}}"#;
+        let phase = r#"{"type":"AdditionalPhase","target":{"type":"None"},"segment":{"type":"Phase","data":"Combat"},"after":{"type":"ThisPhase","data":{"named":["PrecombatMain","PostcombatMain"]}},"followed_by":[{"type":"Phase","data":"PostcombatMain"}],"count":{"type":"Fixed","value":1}}"#;
         assert!(survives(DRAW, phase));
         assert!(survives(
             DRAW,

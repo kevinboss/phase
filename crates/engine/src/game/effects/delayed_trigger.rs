@@ -1790,7 +1790,7 @@ mod tests {
     };
     use crate::types::identifiers::{CardId, ExtraPhaseId, ObjectId, TrackedSetId};
     use crate::types::mana::ManaCost;
-    use crate::types::phase::{Phase, PhaseGroup};
+    use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
     use crate::types::player::PlayerId;
     use crate::types::triggers::{PlaneswalkRole, TriggerMode};
 
@@ -2164,7 +2164,7 @@ mod tests {
     fn add_combat(target: TargetFilter, after: ExtraPhaseAnchor, count: i32) -> Effect {
         Effect::AdditionalPhase {
             target,
-            phase: Phase::BeginCombat,
+            segment: TurnSegment::Phase(PhaseGroup::Combat),
             after,
             followed_by: vec![],
             count: QuantityExpr::Fixed { value: count },

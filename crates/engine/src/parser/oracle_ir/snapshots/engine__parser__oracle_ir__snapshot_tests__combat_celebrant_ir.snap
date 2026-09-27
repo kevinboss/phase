@@ -57,7 +57,10 @@ expression: "&ir"
                     "target": {
                       "type": "None"
                     },
-                    "phase": "BeginCombat",
+                    "segment": {
+                      "type": "Phase",
+                      "data": "Combat"
+                    },
                     "after": {
                       "type": "ThisPhase",
                       "data": {

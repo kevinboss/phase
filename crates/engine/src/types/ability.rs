@@ -24,7 +24,7 @@ use super::keywords::{Keyword, KeywordKind};
 use super::mana::{
     AbilityActivationScope, ManaColor, ManaCost, ManaType, SpellCostCriterion, ZoneSpend,
 };
-use super::phase::{Phase, PhaseGroup};
+use super::phase::{Phase, PhaseGroup, TurnSegment};
 use super::player::{PlayerCounterKind, PlayerId};
 use super::proposed_event::AppliedReplacementKey;
 use super::replacements::ReplacementEvent;
@@ -19688,9 +19688,12 @@ pub enum Effect {
         #[serde(default)]
         scope: SkipScope,
     },
-    /// CR 500.8: Add an additional step or phase after the specified anchor phase.
+    /// CR 500.8 + CR 500.9 + CR 500.10: Add an additional step or phase after
+    /// the specified anchor. `segment` is what is added — a whole phase, a
+    /// phase created to hold one step, or a step added to the phase in
+    /// progress — as the text words it.
     /// Uses a LIFO stack on GameState.extra_phases. `followed_by` entries are pushed
-    /// before `phase`, so "additional combat followed by an additional main phase"
+    /// before `segment`, so "additional combat followed by an additional main phase"
     /// resolves in printed order while preserving CR 500.8 LIFO ordering.
     /// CR 500.10a: Only adds steps/phases to the affected player's own turn.
     /// `count` resolves at resolution time so dynamic quantities such as Obeka,
@@ -19703,10 +19706,10 @@ pub enum Effect {
     AdditionalPhase {
         #[serde(default = "default_target_filter_controller")]
         target: TargetFilter,
-        phase: Phase,
+        segment: TurnSegment,
         after: ExtraPhaseAnchor,
         #[serde(default)]
-        followed_by: Vec<Phase>,
+        followed_by: Vec<TurnSegment>,
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
         /// CR 508.1c + CR 611.2c: Optional attacker restriction for the combat

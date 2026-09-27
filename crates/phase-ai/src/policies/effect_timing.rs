@@ -1652,9 +1652,9 @@ mod tests {
                     AbilityKind::Activated,
                     Effect::AdditionalPhase {
                         target: TargetFilter::Controller,
-                        phase: Phase::BeginCombat,
+                        segment: TurnSegment::Phase(PhaseGroup::Combat),
                         after: ExtraPhaseAnchor::this_main_phase(),
-                        followed_by: vec![Phase::PostCombatMain],
+                        followed_by: vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
                         count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
                         attacker_restriction: None,
                     },
@@ -1858,9 +1858,9 @@ mod tests {
                     AbilityKind::Activated,
                     Effect::AdditionalPhase {
                         target: TargetFilter::Controller,
-                        phase: Phase::BeginCombat,
+                        segment: TurnSegment::Phase(PhaseGroup::Combat),
                         after: ExtraPhaseAnchor::this_main_phase(),
-                        followed_by: vec![Phase::PostCombatMain],
+                        followed_by: vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
                         count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
                         attacker_restriction: None,
                     },

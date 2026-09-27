@@ -142,7 +142,7 @@ use crate::types::game_state::{NextSpellModifier, RetargetScope};
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
-use crate::types::phase::Phase;
+use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
 use crate::types::replacements::ReplacementEvent;
 #[cfg(test)]
 use crate::types::statics::CastFreeOrigin;
@@ -36870,7 +36870,7 @@ pub(crate) fn fold_additional_combat_attacker_restriction(def: &mut AbilityDefin
         let folded = match (&*cursor.effect, &cursor.sub_ability) {
             (
                 Effect::AdditionalPhase {
-                    phase: Phase::BeginCombat,
+                    segment: TurnSegment::Phase(PhaseGroup::Combat),
                     attacker_restriction: None,
                     ..
                 },
@@ -44295,11 +44295,11 @@ fn last_night_together_folds_attacker_restriction_into_additional_phase() {
                 panic!("unexpected Unimplemented node remained after fold: {name}");
             }
             Effect::AdditionalPhase {
-                phase,
+                segment,
                 attacker_restriction,
                 ..
             } => {
-                assert_eq!(*phase, Phase::BeginCombat);
+                assert_eq!(*segment, TurnSegment::Phase(PhaseGroup::Combat));
                 assert_eq!(
                     attacker_restriction.as_ref(),
                     Some(&TargetFilter::ParentTarget),

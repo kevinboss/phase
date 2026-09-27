@@ -5991,7 +5991,7 @@ fn rw_effect(
         Effect::AdditionalPhase {
             target: _,
             count,
-            phase: _,
+            segment: _,
             after: _,
             followed_by: _,
             attacker_restriction,
@@ -9109,7 +9109,9 @@ mod tests {
         // AdditionalPhase is likewise a TurnStructure write, never `Other`.
         let ap = ability_rw_profile(&ra(Effect::AdditionalPhase {
             target: TargetFilter::Controller,
-            phase: crate::types::phase::Phase::PostCombatMain,
+            segment: crate::types::phase::TurnSegment::Phase(
+                crate::types::phase::PhaseGroup::PostcombatMain,
+            ),
             after: crate::types::ability::ExtraPhaseAnchor::ThisPhase { named: None },
             followed_by: vec![],
             count: qfix(1),

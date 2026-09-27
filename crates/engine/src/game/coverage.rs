@@ -4122,14 +4122,14 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         }
         Effect::AdditionalPhase {
             target,
-            phase,
+            segment,
             after,
             followed_by,
             count,
             attacker_restriction,
         } => {
             d.push(("player".into(), fmt_target(target)));
-            d.push(("phase".into(), format!("{phase:?}")));
+            d.push(("segment".into(), format!("{segment:?}")));
             d.push(("after".into(), format!("{after:?}")));
             if !followed_by.is_empty() {
                 d.push(("followed by".into(), format!("{followed_by:?}")));

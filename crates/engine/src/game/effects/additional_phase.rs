@@ -30,35 +30,6 @@ fn anchor_step(after: &ExtraPhaseAnchor, state: &GameState) -> Option<Phase> {
     }
 }
 
-/// CR 500.8 + CR 500.9 + CR 500.10: what an `Effect::AdditionalPhase` adds,
-/// from the step it names and the kind of its anchor.
-fn added_segment(step: Phase, after: &ExtraPhaseAnchor) -> TurnSegment {
-    match step {
-        // CR 501.1 + CR 506.1 + CR 505.2: `Untap` names an added beginning
-        // phase by its first step, and `BeginCombat` an added combat phase; a
-        // main phase has no steps. Each is a whole phase (CR 500.8).
-        Phase::Untap | Phase::BeginCombat | Phase::PreCombatMain | Phase::PostCombatMain => {
-            TurnSegment::Phase(step.group())
-        }
-        Phase::Upkeep
-        | Phase::Draw
-        | Phase::DeclareAttackers
-        | Phase::DeclareBlockers
-        | Phase::CombatDamage
-        | Phase::EndCombat
-        | Phase::End
-        | Phase::Cleanup => match after {
-            // CR 500.9: a step added after a step joins the phase in progress.
-            ExtraPhaseAnchor::ThisStep | ExtraPhaseAnchor::Step(_) => TurnSegment::Step(step),
-            // CR 500.10 + CR 500.11: a step added after a phase sits in a phase
-            // created to hold only that step.
-            ExtraPhaseAnchor::ThisPhase { .. } | ExtraPhaseAnchor::FirstOfTurn(_) => {
-                TurnSegment::CreatedPhase(step)
-            }
-        },
-    }
-}
-
 /// CR 500.8: Add extra phases to the current turn via a LIFO stack.
 /// CR 500.10a: a phase an effect says "you get" is added only to its
 /// controller's own turn; an expletive "there is" phase is added to the turn in
@@ -68,18 +39,18 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (target, phase, after, followed_by, count_expr, attacker_restriction) =
+    let (target, segment, after, followed_by, count_expr, attacker_restriction) =
         match &ability.effect {
             Effect::AdditionalPhase {
                 target,
-                phase,
+                segment,
                 after,
                 followed_by,
                 count,
                 attacker_restriction,
             } => (
                 target,
-                *phase,
+                *segment,
                 after,
                 followed_by,
                 count,
@@ -212,13 +183,12 @@ pub fn resolve(
     // phase between them; Obeka's upkeeps).
     // CR 500.8: every scheduled entry carries its own minted identity, so
     // entries that share an anchor and a phase stay distinct.
-    let segment = added_segment(phase, after);
     for _ in 0..count {
         for &follow_up in followed_by.iter().rev() {
             let id = state.mint_extra_phase_id();
             state.extra_phases.push(ExtraPhase {
                 anchor,
-                segment: added_segment(follow_up, after),
+                segment: follow_up,
                 attacker_restriction: None,
                 attacker_restriction_source: None,
                 id,
@@ -275,14 +245,14 @@ mod tests {
 
     fn make_ability(
         target: TargetFilter,
-        phase: Phase,
+        segment: TurnSegment,
         after: ExtraPhaseAnchor,
-        followed_by: Vec<Phase>,
+        followed_by: Vec<TurnSegment>,
         controller: PlayerId,
     ) -> ResolvedAbility {
         make_ability_with_count(
             target,
-            phase,
+            segment,
             after,
             followed_by,
             controller,
@@ -292,9 +262,9 @@ mod tests {
 
     fn make_ability_with_count(
         target: TargetFilter,
-        phase: Phase,
+        segment: TurnSegment,
         after: ExtraPhaseAnchor,
-        followed_by: Vec<Phase>,
+        followed_by: Vec<TurnSegment>,
         controller: PlayerId,
         count: QuantityExpr,
     ) -> ResolvedAbility {
@@ -302,7 +272,7 @@ mod tests {
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::AdditionalPhase {
                 target,
-                phase,
+                segment,
                 after,
                 followed_by,
                 count,
@@ -405,7 +375,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability_with_count(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
             vec![],
             PlayerId(0),
@@ -435,7 +405,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::Step(Phase::EndCombat),
             vec![],
             PlayerId(0),
@@ -460,9 +430,9 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::Step(Phase::EndCombat),
-            vec![Phase::PostCombatMain],
+            vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             PlayerId(0),
         );
 
@@ -494,7 +464,7 @@ mod tests {
         // First effect: additional combat
         let ability1 = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::Step(Phase::EndCombat),
             vec![],
             PlayerId(0),
@@ -504,7 +474,7 @@ mod tests {
         // Second effect: another additional combat (most recent → first)
         let ability2 = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::Step(Phase::EndCombat),
             vec![],
             PlayerId(0),
@@ -536,9 +506,9 @@ mod tests {
     fn combat_then_main_bundle() -> ResolvedAbility {
         make_ability(
             TargetFilter::None,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
-            vec![Phase::PostCombatMain],
+            vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             PlayerId(0),
         )
     }
@@ -637,7 +607,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::Step(Phase::EndCombat),
             vec![],
             PlayerId(0),
@@ -662,7 +632,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::TriggeringPlayer,
-            Phase::Upkeep,
+            TurnSegment::Step(Phase::Upkeep),
             ExtraPhaseAnchor::ThisStep,
             vec![],
             PlayerId(0),
@@ -697,7 +667,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability_with_count(
             TargetFilter::Controller,
-            Phase::Upkeep,
+            TurnSegment::CreatedPhase(Phase::Upkeep),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -728,7 +698,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability_with_count(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
             vec![],
             PlayerId(0),
@@ -759,7 +729,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::Untap,
+            TurnSegment::Phase(PhaseGroup::Beginning),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -809,7 +779,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::Untap,
+            TurnSegment::Phase(PhaseGroup::Beginning),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -857,7 +827,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability_with_count(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
             vec![],
             PlayerId(0),
@@ -895,7 +865,8 @@ mod tests {
 
     /// CR 501.1 + CR 500.8: "additional beginning phase after this phase"
     /// resolving in a postcombat main phase schedules a beginning phase
-    /// (`phase: Untap`) anchored to that main phase (`last_step_of_phase`).
+    /// (`TurnSegment::Phase(Beginning)`) anchored to that main phase
+    /// (`last_step_of_phase`).
     #[test]
     fn additional_beginning_phase_anchors_to_resolving_main_phase() {
         let mut state = GameState {
@@ -906,7 +877,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::Untap,
+            TurnSegment::Phase(PhaseGroup::Beginning),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -936,7 +907,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::Untap,
+            TurnSegment::Phase(PhaseGroup::Beginning),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -967,7 +938,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::None,
-            Phase::Untap,
+            TurnSegment::Phase(PhaseGroup::Beginning),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -991,7 +962,7 @@ mod tests {
     fn granted_beginning_phase_is_gated_like_any_granted_phase() {
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::Untap,
+            TurnSegment::Phase(PhaseGroup::Beginning),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -1045,7 +1016,7 @@ mod tests {
             let mut events = Vec::new();
             let ability = make_ability(
                 target.clone(),
-                Phase::BeginCombat,
+                TurnSegment::Phase(PhaseGroup::Combat),
                 ExtraPhaseAnchor::ThisPhase { named: None },
                 vec![],
                 PlayerId(0),
@@ -1103,7 +1074,7 @@ mod tests {
             let mut events = Vec::new();
             let ability = make_ability(
                 TargetFilter::None,
-                Phase::BeginCombat,
+                TurnSegment::Phase(PhaseGroup::Combat),
                 after.clone(),
                 vec![],
                 PlayerId(0),
@@ -1132,7 +1103,7 @@ mod tests {
 
         let mut ability = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
             vec![],
             PlayerId(0),
@@ -1141,7 +1112,7 @@ mod tests {
         // `resolve_ability_chain` propagation would produce them.
         ability.effect = Effect::AdditionalPhase {
             target: TargetFilter::Controller,
-            phase: Phase::BeginCombat,
+            segment: TurnSegment::Phase(PhaseGroup::Combat),
             after: ExtraPhaseAnchor::this_main_phase(),
             followed_by: vec![],
             count: QuantityExpr::Fixed { value: 1 },
@@ -1180,7 +1151,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::Upkeep,
+            TurnSegment::Step(Phase::Upkeep),
             ExtraPhaseAnchor::ThisStep,
             vec![],
             PlayerId(0),
@@ -1205,7 +1176,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::Step(Phase::EndCombat),
             vec![],
             PlayerId(0),
@@ -1231,7 +1202,7 @@ mod tests {
     fn this_main_phase_anchor_outside_a_main_phase_adds_nothing() {
         let full_throttle = make_ability_with_count(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
             vec![],
             PlayerId(0),
@@ -1239,9 +1210,9 @@ mod tests {
         );
         let relentless_assault = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
-            vec![Phase::PostCombatMain],
+            vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             PlayerId(0),
         );
         let created_upkeep = vec![InsertedPhaseResume {
@@ -1301,7 +1272,7 @@ mod tests {
         let mut events = Vec::new();
         let obeka = make_ability_with_count(
             TargetFilter::Controller,
-            Phase::Upkeep,
+            TurnSegment::CreatedPhase(Phase::Upkeep),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -1311,7 +1282,7 @@ mod tests {
         state.phase = Phase::EndCombat;
         let combat = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::Step(Phase::EndCombat),
             vec![],
             PlayerId(0),
@@ -1355,7 +1326,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability(
             TargetFilter::Controller,
-            Phase::Upkeep,
+            TurnSegment::CreatedPhase(Phase::Upkeep),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -1391,7 +1362,7 @@ mod tests {
         let mut events = Vec::new();
         let ability = make_ability_with_count(
             TargetFilter::Controller,
-            Phase::Upkeep,
+            TurnSegment::CreatedPhase(Phase::Upkeep),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -1408,9 +1379,9 @@ mod tests {
     fn world_at_war() -> ResolvedAbility {
         make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::PostcombatMain),
-            vec![Phase::PostCombatMain],
+            vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             PlayerId(0),
         )
     }
@@ -1420,7 +1391,7 @@ mod tests {
     fn swinging_ship() -> ResolvedAbility {
         make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::Combat),
             vec![],
             PlayerId(0),
@@ -1535,9 +1506,9 @@ mod tests {
     fn second_main_phase_can_be_an_added_main_phase() {
         let relentless_assault = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::this_main_phase(),
-            vec![Phase::PostCombatMain],
+            vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             PlayerId(0),
         );
         let waw = world_at_war();
@@ -1605,7 +1576,7 @@ mod tests {
 
         let moraug = make_ability(
             TargetFilter::Controller,
-            Phase::BeginCombat,
+            TurnSegment::Phase(PhaseGroup::Combat),
             ExtraPhaseAnchor::ThisPhase { named: None },
             vec![],
             PlayerId(0),
@@ -1684,12 +1655,10 @@ mod tests {
         assert!(state.extra_phase_resume.is_empty());
     }
 
-    /// CR 500.8 + CR 500.9 + CR 500.10 + CR 500.11 + CR 505.1a: the segment
-    /// each `Effect::AdditionalPhase` shape the grammar emits adds. A whole
-    /// phase is named by its first step (`Untap`, `BeginCombat`) or is a main
-    /// phase; an upkeep or end step added after a step joins the phase in
-    /// progress; an upkeep added after a phase sits in a phase created to hold
-    /// only it. Follow-up phases are pushed before the primary one.
+    /// CR 500.8 + CR 500.9 + CR 500.10: each segment shape the grammar emits
+    /// is scheduled as written, after the anchor the resolving step or phase
+    /// gives, with follow-up phases pushed before the primary one so the
+    /// primary runs first.
     #[test]
     fn each_emitted_shape_adds_its_segment() {
         let mains = || ExtraPhaseAnchor::ThisPhase {
@@ -1701,7 +1670,7 @@ mod tests {
         let rows = [
             // Aurelia, the Warleader.
             (
-                Phase::BeginCombat,
+                combat,
                 any_phase(),
                 vec![],
                 Phase::DeclareAttackers,
@@ -1709,31 +1678,25 @@ mod tests {
             ),
             // Relentless Assault.
             (
-                Phase::BeginCombat,
+                combat,
                 mains(),
-                vec![Phase::PostCombatMain],
+                vec![postcombat_main],
                 Phase::PreCombatMain,
                 vec![postcombat_main, combat],
             ),
             // Full Throttle.
-            (
-                Phase::BeginCombat,
-                mains(),
-                vec![],
-                Phase::PreCombatMain,
-                vec![combat],
-            ),
+            (combat, mains(), vec![], Phase::PreCombatMain, vec![combat]),
             // All-Out Assault.
             (
-                Phase::BeginCombat,
+                combat,
                 any_phase(),
-                vec![Phase::PostCombatMain],
+                vec![postcombat_main],
                 Phase::PreCombatMain,
                 vec![postcombat_main, combat],
             ),
             // Raphael, Tag Team Tough.
             (
-                Phase::BeginCombat,
+                combat,
                 ExtraPhaseAnchor::ThisPhase {
                     named: Some(vec![PhaseGroup::Combat]),
                 },
@@ -1743,7 +1706,7 @@ mod tests {
             ),
             // Swinging Ship.
             (
-                Phase::BeginCombat,
+                combat,
                 ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::Combat),
                 vec![],
                 Phase::PreCombatMain,
@@ -1751,15 +1714,15 @@ mod tests {
             ),
             // World at War.
             (
-                Phase::BeginCombat,
+                combat,
                 ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::PostcombatMain),
-                vec![Phase::PostCombatMain],
+                vec![postcombat_main],
                 Phase::PreCombatMain,
                 vec![postcombat_main, combat],
             ),
             // Temple of Atropos.
             (
-                Phase::Untap,
+                TurnSegment::Phase(PhaseGroup::Beginning),
                 any_phase(),
                 vec![],
                 Phase::PreCombatMain,
@@ -1767,7 +1730,7 @@ mod tests {
             ),
             // Obeka, Splitter of Seconds.
             (
-                Phase::Upkeep,
+                TurnSegment::CreatedPhase(Phase::Upkeep),
                 any_phase(),
                 vec![],
                 Phase::CombatDamage,
@@ -1775,7 +1738,7 @@ mod tests {
             ),
             // Paradox Haze.
             (
-                Phase::Upkeep,
+                TurnSegment::Step(Phase::Upkeep),
                 ExtraPhaseAnchor::ThisStep,
                 vec![],
                 Phase::Upkeep,
@@ -1783,14 +1746,14 @@ mod tests {
             ),
             // Y'shtola Rhul.
             (
-                Phase::End,
+                TurnSegment::Step(Phase::End),
                 ExtraPhaseAnchor::ThisStep,
                 vec![],
                 Phase::End,
                 vec![TurnSegment::Step(Phase::End)],
             ),
         ];
-        for (phase, after, followed_by, resolving, expected) in rows {
+        for (segment, after, followed_by, resolving, expected) in rows {
             let mut state = GameState {
                 active_player: PlayerId(0),
                 phase: resolving,
@@ -1798,7 +1761,7 @@ mod tests {
             };
             let ability = make_ability(
                 TargetFilter::None,
-                phase,
+                segment,
                 after.clone(),
                 followed_by.clone(),
                 PlayerId(0),
@@ -1813,7 +1776,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 segments, expected,
-                "{phase:?} after {after:?} followed by {followed_by:?}"
+                "{segment:?} after {after:?} followed by {followed_by:?}"
             );
         }
     }

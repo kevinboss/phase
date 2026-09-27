@@ -57,7 +57,7 @@ use crate::types::ability::{
     ZoneOwner,
 };
 use crate::types::card_type::CoreType;
-use crate::types::phase::{Phase, PhaseGroup};
+use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
 use crate::types::player::PlayerCounterKind;
 use crate::types::statics::{ActivationExemption, CostModifyMode, StaticMode};
 use crate::types::zones::Zone;
@@ -11223,13 +11223,13 @@ fn additional_phase_recipient(lower: &str) -> TargetFilter {
 /// second "followed by"), parses as `Some(None)`: the combat arm fails closed
 /// on it rather than dropping the phase or step it names.
 /// `step_or_beginning_anchor` also scans for this parser: any match, whatever
-/// follows "followed by ", makes the upkeep, end-step and beginning-phase arms
-/// fail closed, so narrowing it narrows what those arms refuse.
-fn parse_combat_follow_up(input: &str) -> OracleResult<'_, Option<Phase>> {
+/// follows "followed by ", makes the step and beginning-phase arms fail
+/// closed, so narrowing it narrows what those arms refuse.
+fn parse_combat_follow_up(input: &str) -> OracleResult<'_, Option<TurnSegment>> {
     preceded(
         tag("followed by "),
         opt(value(
-            Phase::PostCombatMain,
+            TurnSegment::Phase(PhaseGroup::PostcombatMain),
             // A comma here opens a clause the combat arm does not model, so
             // unlike `peek_clause_terminator` this accepts only a sentence end.
             terminated(
@@ -11237,6 +11237,25 @@ fn parse_combat_follow_up(input: &str) -> OracleResult<'_, Option<Phase>> {
                 peek(alt((value((), tag(".")), value((), (space0, eof))))),
             ),
         )),
+    )
+    .parse(input)
+}
+
+/// CR 500.9 + CR 500.10: the step an added step names — "additional untap /
+/// upkeep / draw / end step", singular or plural ("that many additional
+/// upkeep steps", Obeka).
+fn parse_additional_step(input: &str) -> OracleResult<'_, Phase> {
+    preceded(
+        tag("additional "),
+        terminated(
+            alt((
+                value(Phase::Untap, tag("untap")),
+                value(Phase::Upkeep, tag("upkeep")),
+                value(Phase::Draw, tag("draw")),
+                value(Phase::End, tag("end")),
+            )),
+            tag(" step"),
+        ),
     )
     .parse(input)
 }
@@ -11298,8 +11317,8 @@ fn parse_extra_step_anchor(input: &str) -> OracleResult<'_, ExtraPhaseAnchor> {
     .parse(input)
 }
 
-/// CR 500.8 + CR 500.9 + CR 500.10: the anchor of an added upkeep step, end step or
-/// beginning phase. These arms model no continuation, so a text that carries a
+/// CR 500.8 + CR 500.9 + CR 500.10: the anchor of an added step or beginning
+/// phase. These arms model no continuation, so a text that carries a
 /// "followed by" continuation (`parse_combat_follow_up`, the one authority for
 /// that phrase), wherever it stands relative to the anchor, has no anchor they
 /// accept and fails closed rather than dropping what the continuation adds.
@@ -11650,7 +11669,7 @@ pub(super) fn parse_imperative_family_ast(
                     None | Some(Some(_)),
                 ) => Effect::AdditionalPhase {
                     target: additional_phase_recipient(lower),
-                    phase: Phase::BeginCombat,
+                    segment: TurnSegment::Phase(PhaseGroup::Combat),
                     after,
                     followed_by: follow_up.flatten().into_iter().collect(),
                     count: parse_additional_phase_count(lower),
@@ -11666,55 +11685,37 @@ pub(super) fn parse_imperative_family_ast(
             },
         ));
     }
-    if nom_primitives::scan_contains(lower, "additional upkeep step") {
-        // CR 500.9: "after this step" (Paradox Haze, The Ninth Doctor).
-        // CR 500.10: "after this phase" (Obeka, Untap Upkeep Draw) — the effect first
-        // creates a beginning phase holding only the upkeep; `turns` continues the turn
-        // after the anchor once that upkeep ends. No anchor phrase → strict failure.
-        return Some(ImperativeFamilyAst::GainKeyword(
-            match step_or_beginning_anchor(lower) {
-                Some(after) => Effect::AdditionalPhase {
-                    target: additional_phase_recipient(lower),
-                    phase: Phase::Upkeep,
-                    after,
-                    followed_by: vec![],
-                    count: parse_additional_phase_count(lower),
-                    attacker_restriction: None,
-                },
-                None => Effect::unimplemented("additional_phase", text),
+    // CR 500.9 + CR 500.10: "an additional <untap|upkeep|draw|end> step
+    // after this step / after this phase". A step added after a step joins the
+    // phase in progress (Paradox Haze, The Ninth Doctor, Y'shtola Rhul); a step
+    // added after a phase first creates the phase that normally holds it, whose
+    // other steps are skipped (CR 500.11; Obeka, Untap, Upkeep, Draw). A named
+    // step anchor (never parsed here) or no anchor phrase fails closed.
+    if let Some(step) = nom_primitives::scan_at_word_boundaries(lower, parse_additional_step) {
+        let segment = match step_or_beginning_anchor(lower) {
+            Some(after @ ExtraPhaseAnchor::ThisStep) => Some((TurnSegment::Step(step), after)),
+            Some(
+                after @ (ExtraPhaseAnchor::ThisPhase { .. } | ExtraPhaseAnchor::FirstOfTurn(_)),
+            ) => Some((TurnSegment::CreatedPhase(step), after)),
+            Some(ExtraPhaseAnchor::Step(_)) | None => None,
+        };
+        return Some(ImperativeFamilyAst::GainKeyword(match segment {
+            Some((segment, after)) => Effect::AdditionalPhase {
+                target: additional_phase_recipient(lower),
+                segment,
+                after,
+                followed_by: vec![],
+                count: parse_additional_phase_count(lower),
+                attacker_restriction: None,
             },
-        ));
-    }
-    // CR 500.9 + CR 513.1: "there is an additional end step after this step"
-    // (Y'shtola Rhul) — the extra end step follows the end step the effect
-    // resolves in. This arm emits only that step form; a phase anchor and a
-    // missing anchor fail closed.
-    if nom_primitives::scan_contains(lower, "additional end step") {
-        return Some(ImperativeFamilyAst::GainKeyword(
-            match step_or_beginning_anchor(lower) {
-                Some(after @ ExtraPhaseAnchor::ThisStep) => Effect::AdditionalPhase {
-                    target: additional_phase_recipient(lower),
-                    phase: Phase::End,
-                    after,
-                    followed_by: vec![],
-                    count: parse_additional_phase_count(lower),
-                    attacker_restriction: None,
-                },
-                Some(
-                    ExtraPhaseAnchor::ThisPhase { .. }
-                    | ExtraPhaseAnchor::FirstOfTurn(_)
-                    | ExtraPhaseAnchor::Step(_),
-                )
-                | None => Effect::unimplemented("additional_phase", text),
-            },
-        ));
+            None => Effect::unimplemented("additional_phase", text),
+        }));
     }
     // CR 501.1 + CR 500.8: "there is an additional beginning phase after this
-    // phase" (Temple of Atropos, Sphinx/Shadow of the Second Sun, Cyclonus). The
-    // beginning phase is untap → upkeep → draw (CR 501.1), so `phase: Untap`
-    // names the added phase by its first step. CR 500.8 adds phases after a
-    // phase, so only a phase anchor is accepted; a step anchor or no anchor
-    // phrase fails closed.
+    // phase" (Temple of Atropos, Sphinx/Shadow of the Second Sun, Cyclonus): a
+    // whole beginning phase, untap → upkeep → draw (CR 501.1). CR 500.8 adds
+    // phases after a phase, so only a phase anchor is accepted; a step anchor
+    // or no anchor phrase fails closed.
     if nom_primitives::scan_contains(lower, "additional beginning phase") {
         return Some(ImperativeFamilyAst::GainKeyword(
             match step_or_beginning_anchor(lower) {
@@ -11722,7 +11723,7 @@ pub(super) fn parse_imperative_family_ast(
                     after @ (ExtraPhaseAnchor::ThisPhase { .. } | ExtraPhaseAnchor::FirstOfTurn(_)),
                 ) => Effect::AdditionalPhase {
                     target: additional_phase_recipient(lower),
-                    phase: Phase::Untap,
+                    segment: TurnSegment::Phase(PhaseGroup::Beginning),
                     after,
                     followed_by: vec![],
                     count: parse_additional_phase_count(lower),
@@ -20170,7 +20171,7 @@ mod tests {
             matches!(
                 effect,
                 Effect::AdditionalPhase {
-                    phase: Phase::BeginCombat,
+                    segment: TurnSegment::Phase(PhaseGroup::Combat),
                     ref after,
                     ref followed_by,
                     count: QuantityExpr::Fixed { value: 2 },
@@ -20193,7 +20194,7 @@ mod tests {
                 effect,
                 Effect::AdditionalPhase {
                     target: TargetFilter::None,
-                    phase: Phase::BeginCombat,
+                    segment: TurnSegment::Phase(PhaseGroup::Combat),
                     after: ExtraPhaseAnchor::ThisPhase { named: None },
                     ref followed_by,
                     ..
@@ -20308,11 +20309,11 @@ mod tests {
                 effect,
                 Effect::AdditionalPhase {
                     target: TargetFilter::None,
-                    phase: Phase::BeginCombat,
+                    segment: TurnSegment::Phase(PhaseGroup::Combat),
                     after: ExtraPhaseAnchor::ThisPhase { named: None },
                     ref followed_by,
                     ..
-                } if followed_by == &vec![Phase::PostCombatMain]
+                } if followed_by == &vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)]
             ),
             "Expected AdditionalPhase with main phase, got {effect:?}"
         );
@@ -20329,7 +20330,7 @@ mod tests {
             matches!(
                 effect,
                 Effect::AdditionalPhase {
-                    phase: Phase::Upkeep,
+                    segment: TurnSegment::Step(Phase::Upkeep),
                     after: ExtraPhaseAnchor::ThisStep,
                     ref followed_by,
                     ..
@@ -20361,7 +20362,7 @@ mod tests {
         );
         match effect {
             Effect::AdditionalPhase {
-                phase: Phase::Upkeep,
+                segment: TurnSegment::CreatedPhase(Phase::Upkeep),
                 after: ExtraPhaseAnchor::ThisPhase { named: None },
                 count:
                     QuantityExpr::Ref {
@@ -20436,7 +20437,7 @@ mod tests {
         assert!(matches!(
             additional_phase_family_effect("get an additional upkeep step after this step"),
             Effect::AdditionalPhase {
-                phase: Phase::Upkeep,
+                segment: TurnSegment::Step(Phase::Upkeep),
                 after: ExtraPhaseAnchor::ThisStep,
                 ..
             }
@@ -20450,7 +20451,7 @@ mod tests {
         assert!(matches!(
             additional_phase_family_effect("after this phase, there is an additional upkeep step."),
             Effect::AdditionalPhase {
-                phase: Phase::Upkeep,
+                segment: TurnSegment::CreatedPhase(Phase::Upkeep),
                 after: ExtraPhaseAnchor::ThisPhase { named: None },
                 ..
             }
@@ -20478,24 +20479,152 @@ mod tests {
         );
     }
 
-    /// CR 500.9 + CR 513.1: the end-step arm accepts only "after this step"
-    /// (Y'shtola Rhul). A phase anchor and a missing anchor fail closed.
+    /// CR 500.9 + CR 500.10 + CR 513.1: an end step added after a step joins
+    /// the ending phase in progress (Y'shtola Rhul); one added after a phase
+    /// sits in an ending phase created to hold only it. A missing anchor fails
+    /// closed.
     #[test]
-    fn additional_end_step_accepts_only_this_step() {
+    fn additional_end_step_segment_follows_the_anchor_kind() {
         assert!(matches!(
             additional_phase_family_effect("there is an additional end step after this step"),
             Effect::AdditionalPhase {
-                phase: Phase::End,
+                segment: TurnSegment::Step(Phase::End),
                 after: ExtraPhaseAnchor::ThisStep,
                 ..
             }
         ));
-        for text in [
-            "there is an additional end step",
-            "there is an additional end step after this phase",
-            "there is an additional end step after this main phase",
+        for (text, anchor) in [
+            (
+                "there is an additional end step after this phase",
+                ExtraPhaseAnchor::ThisPhase { named: None },
+            ),
+            (
+                "there is an additional end step after this main phase",
+                ExtraPhaseAnchor::this_main_phase(),
+            ),
         ] {
-            assert_additional_phase_unimplemented(text);
+            match additional_phase_family_effect(text) {
+                Effect::AdditionalPhase {
+                    segment: TurnSegment::CreatedPhase(Phase::End),
+                    after,
+                    ..
+                } => assert_eq!(after, anchor, "{text:?}"),
+                other => panic!("{text:?}: expected a created ending phase, got {other:?}"),
+            }
+        }
+        assert_additional_phase_unimplemented("there is an additional end step");
+    }
+
+    /// CR 500.9 + CR 500.10: the step arm covers every step an effect adds —
+    /// untap, upkeep, draw and end — and picks the segment by anchor kind: a
+    /// step anchor adds the step to the phase in progress, a phase anchor adds
+    /// a phase created to hold only that step. No anchor, or a "followed by"
+    /// continuation, fails closed; the anchored rows are the reach guard.
+    #[test]
+    fn additional_step_arm_segment_follows_the_anchor_kind() {
+        for (word, step) in [
+            ("untap", Phase::Untap),
+            ("upkeep", Phase::Upkeep),
+            ("draw", Phase::Draw),
+            ("end", Phase::End),
+        ] {
+            for (text, segment, anchor) in [
+                (
+                    format!("there is an additional {word} step after this step"),
+                    TurnSegment::Step(step),
+                    ExtraPhaseAnchor::ThisStep,
+                ),
+                (
+                    format!("after this phase, there is an additional {word} step."),
+                    TurnSegment::CreatedPhase(step),
+                    ExtraPhaseAnchor::ThisPhase { named: None },
+                ),
+                (
+                    format!("you get two additional {word} steps after this main phase"),
+                    TurnSegment::CreatedPhase(step),
+                    ExtraPhaseAnchor::this_main_phase(),
+                ),
+                (
+                    format!(
+                        "there is an additional {word} step after the first combat phase this turn"
+                    ),
+                    TurnSegment::CreatedPhase(step),
+                    ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::Combat),
+                ),
+            ] {
+                match additional_phase_family_effect(&text) {
+                    Effect::AdditionalPhase {
+                        segment: parsed,
+                        after,
+                        followed_by,
+                        ..
+                    } => {
+                        assert_eq!(parsed, segment, "{text:?}");
+                        assert_eq!(after, anchor, "{text:?}");
+                        assert!(followed_by.is_empty(), "{text:?}");
+                    }
+                    other => panic!("{text:?}: expected AdditionalPhase, got {other:?}"),
+                }
+            }
+            for text in [
+                format!("there is an additional {word} step"),
+                format!("there is an additional {word} step after this step, followed by an additional main phase"),
+                format!("after this phase, there is an additional {word} step followed by an additional main phase"),
+            ] {
+                assert_additional_phase_unimplemented(&text);
+            }
+        }
+    }
+
+    /// CR 500.8 + CR 500.9 + CR 500.10: each printed producer sentence parses
+    /// to the segment its text names (Paradox Haze, The Ninth Doctor, Y'shtola
+    /// Rhul, Obeka, Temple of Atropos, Relentless Assault).
+    #[test]
+    fn each_producer_sentence_parses_to_its_segment() {
+        let postcombat_main = TurnSegment::Phase(PhaseGroup::PostcombatMain);
+        for (text, segment, followed_by) in [
+            (
+                "that player gets an additional upkeep step after this step.",
+                TurnSegment::Step(Phase::Upkeep),
+                vec![],
+            ),
+            (
+                "you get an additional upkeep step after this step.",
+                TurnSegment::Step(Phase::Upkeep),
+                vec![],
+            ),
+            (
+                "there is an additional end step after this step.",
+                TurnSegment::Step(Phase::End),
+                vec![],
+            ),
+            (
+                "you get that many additional upkeep steps after this phase.",
+                TurnSegment::CreatedPhase(Phase::Upkeep),
+                vec![],
+            ),
+            (
+                "there is an additional beginning phase after this phase.",
+                TurnSegment::Phase(PhaseGroup::Beginning),
+                vec![],
+            ),
+            (
+                "After this main phase, there is an additional combat phase followed by an additional main phase.",
+                TurnSegment::Phase(PhaseGroup::Combat),
+                vec![postcombat_main],
+            ),
+        ] {
+            match additional_phase_family_effect(text) {
+                Effect::AdditionalPhase {
+                    segment: parsed,
+                    followed_by: parsed_followed_by,
+                    ..
+                } => {
+                    assert_eq!(parsed, segment, "{text:?}");
+                    assert_eq!(parsed_followed_by, followed_by, "{text:?}");
+                }
+                other => panic!("{text:?}: expected AdditionalPhase, got {other:?}"),
+            }
         }
     }
 
@@ -20522,12 +20651,12 @@ mod tests {
             (
                 "there is an additional combat phase after this phase followed by an additional main phase",
                 ExtraPhaseAnchor::ThisPhase { named: None },
-                vec![Phase::PostCombatMain],
+                vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             ),
             (
                 "after this phase, there is an additional combat phase followed by an additional main phase",
                 ExtraPhaseAnchor::ThisPhase { named: None },
-                vec![Phase::PostCombatMain],
+                vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             ),
             (
                 "after this combat phase, there is an additional combat phase",
@@ -20542,12 +20671,12 @@ mod tests {
             (
                 "there is an additional combat phase after this phase, followed by an additional main phase",
                 ExtraPhaseAnchor::ThisPhase { named: None },
-                vec![Phase::PostCombatMain],
+                vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
             ),
         ] {
             match additional_phase_family_effect(text) {
                 Effect::AdditionalPhase {
-                    phase: Phase::BeginCombat,
+                    segment: TurnSegment::Phase(PhaseGroup::Combat),
                     after,
                     followed_by: parsed_followed_by,
                     ..
@@ -20672,7 +20801,7 @@ mod tests {
             "after this main phase, there is an additional combat phase followed by an additional main phase.",
         ) {
             Effect::AdditionalPhase {
-                phase: Phase::BeginCombat,
+                segment: TurnSegment::Phase(PhaseGroup::Combat),
                 after,
                 followed_by,
                 count: QuantityExpr::Fixed { value: 1 },
@@ -20684,7 +20813,7 @@ mod tests {
                         named: Some(vec![PhaseGroup::PrecombatMain, PhaseGroup::PostcombatMain]),
                     }
                 );
-                assert_eq!(followed_by, vec![Phase::PostCombatMain]);
+                assert_eq!(followed_by, vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)]);
             }
             other => panic!("expected AdditionalPhase, got {other:?}"),
         }
@@ -20709,7 +20838,7 @@ mod tests {
                 "there is an additional beginning phase after this phase"
             ),
             Effect::AdditionalPhase {
-                phase: Phase::Untap,
+                segment: TurnSegment::Phase(PhaseGroup::Beginning),
                 after: ExtraPhaseAnchor::ThisPhase { named: None },
                 ..
             }
@@ -20727,14 +20856,14 @@ mod tests {
             "After the second main phase this turn, there's an additional combat phase followed by an additional main phase.",
         ) {
             Effect::AdditionalPhase {
-                phase: Phase::BeginCombat,
+                segment: TurnSegment::Phase(PhaseGroup::Combat),
                 after,
                 followed_by,
                 count: QuantityExpr::Fixed { value: 1 },
                 ..
             } => {
                 assert_eq!(after, ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::PostcombatMain));
-                assert_eq!(followed_by, vec![Phase::PostCombatMain]);
+                assert_eq!(followed_by, vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)]);
             }
             other => panic!("expected World at War's AdditionalPhase, got {other:?}"),
         }
@@ -20742,7 +20871,7 @@ mod tests {
             "After the first combat phase this turn, there's an additional combat phase.",
         ) {
             Effect::AdditionalPhase {
-                phase: Phase::BeginCombat,
+                segment: TurnSegment::Phase(PhaseGroup::Combat),
                 after,
                 followed_by,
                 ..
@@ -20815,10 +20944,10 @@ mod tests {
         }
     }
 
-    /// CR 500.8: the combat and beginning-phase arms accept a first-of-turn
-    /// phase anchor; the end-step arm, which emits only the CR 500.9 step
-    /// form, fails closed on it. A combat insert after an ordinal phase the
-    /// grammar rejects has no phase anchor, so it fails closed too.
+    /// CR 500.8 + CR 500.10: every arm accepts a first-of-turn phase anchor; a
+    /// step added after it sits in a phase created to hold only that step. A
+    /// combat insert after an ordinal phase the grammar rejects has no phase
+    /// anchor, so it fails closed.
     #[test]
     fn first_of_turn_anchor_per_arm() {
         assert!(matches!(
@@ -20826,14 +20955,21 @@ mod tests {
                 "there is an additional beginning phase after the first combat phase this turn"
             ),
             Effect::AdditionalPhase {
-                phase: Phase::Untap,
+                segment: TurnSegment::Phase(PhaseGroup::Beginning),
                 after: ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::Combat),
                 ..
             }
         ));
-        assert_additional_phase_unimplemented(
-            "there is an additional end step after the first combat phase this turn",
-        );
+        assert!(matches!(
+            additional_phase_family_effect(
+                "there is an additional end step after the first combat phase this turn"
+            ),
+            Effect::AdditionalPhase {
+                segment: TurnSegment::CreatedPhase(Phase::End),
+                after: ExtraPhaseAnchor::FirstOfTurn(PhaseGroup::Combat),
+                ..
+            }
+        ));
         for text in [
             "after the second combat phase this turn, there is an additional combat phase",
             "after the third main phase this turn, there is an additional combat phase",

@@ -25,6 +25,7 @@ use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::game_state::WaitingFor;
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
+use crate::types::phase::{PhaseGroup, TurnSegment};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::{CastFrequency, StaticMode};
 
@@ -19236,7 +19237,7 @@ fn phase_trigger_enchanted_players_first_upkeep() {
         def.execute.as_ref().map(|ability| ability.effect.as_ref()),
         Some(Effect::AdditionalPhase {
             target: TargetFilter::TriggeringPlayer,
-            phase: Phase::Upkeep,
+            segment: TurnSegment::Step(Phase::Upkeep),
             after: crate::types::ability::ExtraPhaseAnchor::ThisStep,
             followed_by,
             ..
@@ -29557,7 +29558,7 @@ fn triggered_additional_combat_folds_land_creature_attacker_restriction() {
             "no Unimplemented node may remain after the fold"
         );
         if let Effect::AdditionalPhase {
-            phase: Phase::BeginCombat,
+            segment: TurnSegment::Phase(PhaseGroup::Combat),
             attacker_restriction: Some(TargetFilter::Typed(tf)),
             ..
         } = ability.effect.as_ref()

@@ -1891,7 +1891,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::AdditionalPhase {
             target,
             count,
-            phase: _,
+            segment: _,
             after: _,
             followed_by: _,
             attacker_restriction: _,

@@ -210,6 +210,12 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 83 — Effect.AdditionalPhase carries segment, a TurnSegment, in place of
+ *      phase, and followed_by holds TurnSegments — see PROTOCOL_VERSION's own
+ *      `/// 83` entry in crates/lobby-broker/src/protocol.rs. This client
+ *      hands server frames to JSON.parse, so a v82 client would take the new
+ *      shape with no decode error; the exact-match version check at connect
+ *      refuses the pairing instead.
  * 82 — Added-phase anchoring (CR 500.8–500.10): AdditionalPhase.after is an
  *      ExtraPhaseAnchor, DelayedTriggerCondition gained AtBeginningOfAddedPhase,
  *      ExtraPhase and extra_phase_resume entries carry a TurnSegment and a
@@ -565,7 +571,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      activation_cost_snapshot fields are additive and skipped when empty, so
  *      every spell frame is byte-identical to v78.
  */
-export const PROTOCOL_VERSION = 82;
+export const PROTOCOL_VERSION = 83;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

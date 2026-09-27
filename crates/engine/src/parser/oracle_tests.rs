@@ -11,6 +11,7 @@ use crate::types::ability::{
     DamageKindFilter, DoorLockOp, PlayerRelation, SpellStackToGraveyardReplacement, SubAbilityLink,
 };
 use crate::types::counter::{CounterMatch, CounterType};
+use crate::types::phase::{PhaseGroup, TurnSegment};
 use crate::types::triggers::AttackTargetFilter;
 
 #[test]
@@ -11902,16 +11903,15 @@ fn full_throttle_parses_additional_combats_and_delayed_combat_trigger() {
 }
 
 /// CR 501.1 + CR 500.8: "there is an additional beginning phase after this
-/// phase" lowers to `Effect::AdditionalPhase { phase: Untap, .. }` (the
-/// beginning-phase marker), covering Temple of Atropos, Sphinx/Shadow of the
-/// Second Sun, and Cyclonus.
+/// phase" lowers to an added whole beginning phase, covering Temple of
+/// Atropos, Sphinx/Shadow of the Second Sun, and Cyclonus.
 #[test]
-fn additional_beginning_phase_parses_as_untap_phase_insert() {
+fn additional_beginning_phase_parses_as_beginning_phase_insert() {
     use crate::parser::oracle_effect::parse_effect;
     assert!(matches!(
         parse_effect("there is an additional beginning phase after this phase"),
         Effect::AdditionalPhase {
-            phase: Phase::Untap,
+            segment: TurnSegment::Phase(PhaseGroup::Beginning),
             ..
         }
     ));
@@ -12003,7 +12003,7 @@ fn temple_of_atropos_parses_with_zero_unimplemented() {
         matches!(
             phase_exec.effect.as_ref(),
             Effect::AdditionalPhase {
-                phase: Phase::Untap,
+                segment: TurnSegment::Phase(PhaseGroup::Beginning),
                 ..
             }
         ),
@@ -12067,7 +12067,7 @@ fn turn_order_and_additional_beginning_phase_cards_parse_claimed_signatures() {
         matches!(
             effect,
             Effect::AdditionalPhase {
-                phase: Phase::Untap,
+                segment: TurnSegment::Phase(PhaseGroup::Beginning),
                 ..
             }
         )
