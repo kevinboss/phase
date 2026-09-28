@@ -14,14 +14,15 @@ use crate::types::ability::{
     CardTypeSetSource, CastFromZoneDriver, ChosenAttribute, CommanderOwnership,
     ContinuousModification, ControllerRef, CopyRetargetPermission, CostPaidObjectSnapshot,
     CounterKindDomain, DetachedRemainder, Duration, EachDamageRecipient, Effect, EffectError,
-    EffectKind, EffectOutcomeSignal, EffectResolutionResult, EffectScope, FilterProp,
-    ForEachCategoryAction, ForwardedResultContext, ManaProduction, MassLibraryShuffleMode,
-    ObjectSelectionCardinality, OpponentMayScope, PlayerFilter, PlayerRelation, PlayerScope,
-    PossessionAxis, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
-    RepeatContinuation, ResolvedAbility, RevealUntilDisposition, SacrificeCost,
-    SacrificeRequirement, SharedQuality, SharedQualityRelation, SiblingCondition, StaticDefinition,
-    SubAbilityLink, TapStateChange, TargetChoiceTiming, TargetDamageSourceBinding, TargetFilter,
-    TargetRef, ThisWayCause, TypedFilter, ZoneChoiceCandidateSource, ZoneChoiceChooser,
+    EffectKind, EffectOutcomeSignal, EffectResolutionResult, EffectScope, ExtraPhaseRecipient,
+    FilterProp, ForEachCategoryAction, ForwardedResultContext, ManaProduction,
+    MassLibraryShuffleMode, ObjectSelectionCardinality, OpponentMayScope, PlayerFilter,
+    PlayerRelation, PlayerScope, PossessionAxis, PtValue, QuantityExpr, QuantityRef,
+    ReciprocalZoneChoiceRole, RepeatContinuation, ResolvedAbility, RevealUntilDisposition,
+    SacrificeCost, SacrificeRequirement, SharedQuality, SharedQualityRelation, SiblingCondition,
+    StaticDefinition, SubAbilityLink, TapStateChange, TargetChoiceTiming,
+    TargetDamageSourceBinding, TargetFilter, TargetRef, ThisWayCause, TypedFilter,
+    ZoneChoiceCandidateSource, ZoneChoiceChooser,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackSubject, CombatHistoryScope};
@@ -4524,7 +4525,7 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
             },
         ),
         Effect::AdditionalPhase {
-            target,
+            recipient,
             segment: _,
             after: _,
             followed_by: _,
@@ -4533,13 +4534,18 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         } => (
             // CR 608.2c + CR 118.12: a declined "if you do" skips only a later
             // instruction whose referent the gated action supplies; "there is an
-            // additional … phase" (`TargetFilter::None`) names no player (CR 500.10a
-            // gates only "you get"), so the grant has no referent to audit.
+            // additional … phase" (`NoPlayer`) names no player (CR 500.10a gates
+            // only a player's grant), so the grant has no referent to audit.
             Some(
-                std::iter::once(target)
-                    .filter(|target| **target != TargetFilter::None)
-                    .chain(attacker_restriction.as_ref())
-                    .collect(),
+                match recipient {
+                    ExtraPhaseRecipient::NoPlayer => None,
+                    ExtraPhaseRecipient::Controller
+                    | ExtraPhaseRecipient::TriggeringPlayer
+                    | ExtraPhaseRecipient::TargetedPlayer(_) => Some(recipient.as_target_filter()),
+                }
+                .into_iter()
+                .chain(attacker_restriction.as_ref())
+                .collect(),
             ),
             ParentTargetHandling::NotAudited,
         ),
@@ -11566,9 +11572,9 @@ fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::SkipNextTurn { target, .. }
         | Effect::SkipNextStep { target, .. }
         | Effect::ControlNextTurn { target, .. }
-        | Effect::AdditionalPhase { target, .. }
         | Effect::Detain { target, .. }
         | Effect::TargetOnly { target } => target,
+        Effect::AdditionalPhase { recipient, .. } => recipient.as_target_filter(),
         // CR 701.26a/b + CR 603.7c: only the single-permanent tap/untap exposes
         // an event-context target. The mass (`All`) scope's `target` is a
         // population filter, not a per-event target ref — it must not be
@@ -19821,23 +19827,30 @@ mod tests {
                 r#""owner":{"type":"TriggeringPlayer"}"#
             )
         ));
-        // AdditionalPhase (Wyll): "there is" names no player (`None`); a grant
-        // to the controller ("you get") survives too; a grant to a player the
-        // trigger event names does not.
-        let phase = r#"{"type":"AdditionalPhase","target":{"type":"None"},"segment":{"type":"Phase","data":"Combat"},"after":{"type":"ThisPhase","data":{"named":["PrecombatMain","PostcombatMain"]}},"followed_by":[{"type":"Phase","data":"PostcombatMain"}],"count":{"type":"Fixed","value":1}}"#;
+        // AdditionalPhase (Wyll): "there is" names no player (`NoPlayer`); a
+        // grant to the controller ("you get") or to a targeted player survives
+        // too; a grant to a player the trigger event names does not.
+        let phase = r#"{"type":"AdditionalPhase","recipient":{"type":"NoPlayer"},"segment":{"type":"Phase","data":"Combat"},"after":{"type":"ThisPhase","data":{"named":["PrecombatMain","PostcombatMain"]}},"followed_by":[{"type":"Phase","data":"PostcombatMain"}],"count":{"type":"Fixed","value":1}}"#;
         assert!(survives(DRAW, phase));
         assert!(survives(
             DRAW,
             &phase.replace(
-                r#""target":{"type":"None"}"#,
-                r#""target":{"type":"Controller"}"#
+                r#""recipient":{"type":"NoPlayer"}"#,
+                r#""recipient":{"type":"Controller"}"#
+            )
+        ));
+        assert!(survives(
+            DRAW,
+            &phase.replace(
+                r#""recipient":{"type":"NoPlayer"}"#,
+                r#""recipient":{"type":"TargetedPlayer","data":{"type":"Player"}}"#
             )
         ));
         assert!(!survives(
             DRAW,
             &phase.replace(
-                r#""target":{"type":"None"}"#,
-                r#""target":{"type":"TriggeringPlayer"}"#
+                r#""recipient":{"type":"NoPlayer"}"#,
+                r#""recipient":{"type":"TriggeringPlayer"}"#
             )
         ));
         // GainLife.
@@ -19954,6 +19967,43 @@ mod tests {
             by: None
         }));
         assert!(!static_mode_names_no_referent(&StaticMode::CantBeTargeted));
+    }
+
+    /// CR 608.2c + CR 118.12: the declined-"if you do" audit reads each
+    /// additional-phase recipient kind as the referent it names: none for
+    /// `NoPlayer`, and the kind's own filter for every player kind. A declined
+    /// gate's verdict cannot tell the controller or a targeted player from no
+    /// referent, since both exist whether or not the gated action happened, so
+    /// this reads the audit's referent list. Every kind is checked before the
+    /// assertion, so a failure names each kind that went wrong.
+    #[test]
+    fn the_declined_gate_audit_names_each_player_recipient_as_its_referent() {
+        let wrong: Vec<String> = [
+            (r#"{"type":"NoPlayer"}"#, None),
+            (r#"{"type":"Controller"}"#, Some(TargetFilter::Controller)),
+            (
+                r#"{"type":"TriggeringPlayer"}"#,
+                Some(TargetFilter::TriggeringPlayer),
+            ),
+            (
+                r#"{"type":"TargetedPlayer","data":{"type":"Player"}}"#,
+                Some(TargetFilter::Player),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(recipient, referent)| {
+            let effect = effect_from_json(&format!(
+                r#"{{"type":"AdditionalPhase","recipient":{recipient},"segment":{{"type":"Phase","data":"Combat"}},"after":{{"type":"ThisPhase","data":{{"named":["PrecombatMain","PostcombatMain"]}}}},"count":{{"type":"Fixed","value":1}}}}"#
+            ));
+            let audited: Option<Vec<TargetFilter>> = audit_later_instruction(&effect)
+                .referents
+                .map(|referents| referents.into_iter().cloned().collect());
+            let expected = Some(referent.into_iter().collect::<Vec<_>>());
+            (audited != expected)
+                .then(|| format!("{recipient}: audited {audited:?}, expected {expected:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("; "));
     }
 
     /// Phase 7, J-3 (the building block): after a declined gate, each later

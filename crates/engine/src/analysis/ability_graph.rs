@@ -3004,7 +3004,7 @@ mod tests {
         let combat = build_node(
             "Aggravated",
             &activated(Effect::AdditionalPhase {
-                target: TargetFilter::Controller,
+                recipient: crate::types::ability::ExtraPhaseRecipient::Controller,
                 segment: TurnSegment::Phase(PhaseGroup::Combat),
                 after: crate::types::ability::ExtraPhaseAnchor::this_main_phase(),
                 followed_by: Vec::new(),
@@ -3019,7 +3019,7 @@ mod tests {
         // A non-combat extra phase carries no modeled axis ⇒ Unmodeled (M2).
         assert!(matches!(
             effect_projection(&Effect::AdditionalPhase {
-                target: TargetFilter::Controller,
+                recipient: crate::types::ability::ExtraPhaseRecipient::Controller,
                 segment: TurnSegment::Step(crate::types::phase::Phase::Upkeep),
                 after: crate::types::ability::ExtraPhaseAnchor::ThisStep,
                 followed_by: Vec::new(),

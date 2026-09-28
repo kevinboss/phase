@@ -54,8 +54,8 @@ expression: "&ir"
                   "kind": "Spell",
                   "effect": {
                     "type": "AdditionalPhase",
-                    "target": {
-                      "type": "None"
+                    "recipient": {
+                      "type": "NoPlayer"
                     },
                     "segment": {
                       "type": "Phase",

@@ -115,21 +115,22 @@ use crate::types::ability::{
     ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard, ConjureSource,
     ContinuousModification, ControlWindow, ControllerRef, CopyChooseScope, CopyRetargetPermission,
     CopyScale, DamageModification, DamageSource, DelayedTriggerCondition, DelayedTriggerLifetime,
-    DieResultBranch, DigRestOrder, Duration, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
-    GameRestriction, GuardReading, GuessSubject, IntensityScope, IterationKindBinding,
-    KeeperConstraint, KeeperCounterMark, LibraryPosition, ManaProduction, ManaSpendPermission,
-    ManaTargetRole, MassLibraryShuffleMode, MultiTargetSpec, NumberDistinctness, ObjectProperty,
-    ObjectScope, OriginConstraint, PerPlayerScope, PerpetualModification,
-    PlayPermissionInvalidation, PlayerChoiceDistinctness, PlayerFilter, PlayerRelation,
-    PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, PropertyAggregate, PtValue,
-    QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, ReplacementCondition,
-    ReplacementDefinition, ResolutionCastWindow, RestrictionExpiry, RestrictionPlayerScope,
-    RevealUntilDisposition, RoundingMode, SharedQuality, SharedQualityRelation, SiblingCondition,
-    SkipScope, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, StepSkipTarget,
-    SubAbilityLink, TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause,
-    TrackedAnaphorSource, TriggerCondition, TriggerDefinition, TurnGate, TypeFilter, TypedFilter,
-    UnlessPayModifier, UnloweredGuard, UntilCondition, VoteSubject, WheneverEventExpiry,
-    ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
+    DieResultBranch, DigRestOrder, Duration, Effect, EffectOutcomeSignal, EffectScope,
+    ExtraPhaseRecipient, FilterProp, GameRestriction, GuardReading, GuessSubject, IntensityScope,
+    IterationKindBinding, KeeperConstraint, KeeperCounterMark, LibraryPosition, ManaProduction,
+    ManaSpendPermission, ManaTargetRole, MassLibraryShuffleMode, MultiTargetSpec,
+    NumberDistinctness, ObjectProperty, ObjectScope, OriginConstraint, PerPlayerScope,
+    PerpetualModification, PlayPermissionInvalidation, PlayerChoiceDistinctness, PlayerFilter,
+    PlayerRelation, PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity,
+    PropertyAggregate, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
+    ReplacementCondition, ReplacementDefinition, ResolutionCastWindow, RestrictionExpiry,
+    RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
+    SharedQualityRelation, SiblingCondition, SkipScope, SpellStackToGraveyardReplacement,
+    StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
+    TargetFilter, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource, TriggerCondition,
+    TriggerDefinition, TurnGate, TypeFilter, TypedFilter, UnlessPayModifier, UnloweredGuard,
+    UntilCondition, VoteSubject, WheneverEventExpiry, ZoneChoiceCandidateSource, ZoneChoiceChooser,
+    ZoneOwner,
 };
 // `DoubleTarget` has no production use in this module since the counter-doubling
 // discriminator moved to `Effect::is_counter_multiplication()`; the child
@@ -9679,8 +9680,25 @@ fn retarget_effect_to_chosen_player(effect: &mut Effect, index: u8) {
         Effect::Bounce { target, .. } | Effect::ChangeZone { target, .. } => {
             rebind_owned_scope(target, ControllerRef::ChosenPlayer { index })
         }
+        // CR 500.10a: a chosen player ("an opponent gets", "choose a player to
+        // get") is a player no recipient kind names, so the grant fails closed
+        // rather than going to the controller.
+        Effect::AdditionalPhase {
+            recipient: ExtraPhaseRecipient::Controller,
+            ..
+        } => *effect = additional_phase_unnamed_recipient(),
         _ => {}
     }
+}
+
+/// CR 500.10a: the `additional_phase` strict failure for a sentence that
+/// grants an added step or phase to a player no `ExtraPhaseRecipient` kind
+/// names.
+fn additional_phase_unnamed_recipient() -> Effect {
+    Effect::unimplemented(
+        "additional_phase",
+        "the player who gets the added step or phase has no recipient kind",
+    )
 }
 
 /// CR 109.4 (issue #534): Tree-walk a `TargetFilter` and rewrite every
@@ -26215,10 +26233,16 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         Effect::LoseAllPlayerCounters { target } if *target == TargetFilter::Controller => {
             *target = subject_filter;
         }
-        // CR 500.8: "target player gets an additional combat phase" — inject subject target
-        Effect::AdditionalPhase { target, .. } if *target == TargetFilter::Controller => {
-            *target = subject_filter;
-        }
+        // CR 500.10a + CR 115.1: "target player / that player gets an
+        // additional …" — the subject names who gets it. A subject no recipient
+        // kind names fails closed rather than granting it to the controller.
+        Effect::AdditionalPhase {
+            recipient: recipient @ ExtraPhaseRecipient::Controller,
+            ..
+        } => match imperative::additional_phase_recipient_for_subject(&subject_filter) {
+            Some(kind) => *recipient = kind,
+            None => *effect = additional_phase_unnamed_recipient(),
+        },
         // CR 119.3 (issue #6381): "that player gains N life" / "target player
         // gains N life" — the imperative path defaults `player` to the
         // no-subject `Controller` (the "you gain life" reading); inject the
@@ -44992,5 +45016,173 @@ mod scan_at_random_authority_tests {
             Some(("2, 3, or 4 ", ""))
         );
         assert_eq!(scan_at_random("a color"), None);
+    }
+}
+
+/// CR 500.10a + CR 115.1: the recipient kind the whole parse pipeline gives an
+/// added step or phase, per subject (charter row P-RCa), and the subjects no
+/// kind names, which fail closed.
+#[cfg(test)]
+mod additional_phase_recipient_subject_tests {
+    use crate::parser::oracle::parse_oracle_text;
+    use crate::types::ability::{
+        AbilityDefinition, ControllerRef, Effect, ExtraPhaseRecipient, TargetFilter, TypedFilter,
+    };
+
+    /// Every `AdditionalPhase` recipient in the parsed card, and every
+    /// `additional_phase` strict failure (as `None`), in chain order.
+    fn recipients(
+        name: &str,
+        card_type: &str,
+        subtype: Option<&str>,
+        text: &str,
+    ) -> Vec<Option<ExtraPhaseRecipient>> {
+        fn walk(def: &AbilityDefinition, out: &mut Vec<Option<ExtraPhaseRecipient>>) {
+            match &*def.effect {
+                Effect::AdditionalPhase { recipient, .. } => out.push(Some(recipient.clone())),
+                Effect::Unimplemented { name, .. } if name == "additional_phase" => out.push(None),
+                _ => {}
+            }
+            for next in [&def.sub_ability, &def.else_ability].into_iter().flatten() {
+                walk(next, out);
+            }
+        }
+        let subtypes: Vec<String> = subtype.into_iter().map(str::to_string).collect();
+        let parsed = parse_oracle_text(text, name, &[], &[card_type.to_string()], &subtypes);
+        let mut out = Vec::new();
+        for def in &parsed.abilities {
+            walk(def, &mut out);
+        }
+        for trigger in &parsed.triggers {
+            if let Some(execute) = &trigger.execute {
+                walk(execute, &mut out);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn each_subject_parses_to_its_recipient_kind() {
+        let opponent =
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent));
+        let rows = [
+            (
+                "Take the Bait",
+                "Instant",
+                None,
+                "Cast this spell only during combat on an opponent's turn.\nPrevent all combat damage that would be dealt to you and planeswalkers you control this turn. Untap all attacking creatures and goad them. After this phase, there is an additional combat phase.",
+                ExtraPhaseRecipient::NoPlayer,
+            ),
+            (
+                "Aurelia, the Warleader",
+                "Creature",
+                None,
+                "Flying, vigilance, haste\nWhenever Aurelia attacks for the first time each turn, untap all creatures you control. After this phase, there is an additional combat phase.",
+                ExtraPhaseRecipient::NoPlayer,
+            ),
+            (
+                "The Ninth Doctor",
+                "Creature",
+                None,
+                "Haste\nInto the TARDIS \u{2014} Whenever The Ninth Doctor becomes untapped during your untap step, you get an additional upkeep step after this step.",
+                ExtraPhaseRecipient::Controller,
+            ),
+            (
+                "Paradox Haze",
+                "Enchantment",
+                Some("Aura"),
+                "Enchant player\nAt the beginning of enchanted player's first upkeep each turn, that player gets an additional upkeep step after this step.",
+                ExtraPhaseRecipient::TriggeringPlayer,
+            ),
+            (
+                "Probe",
+                "Sorcery",
+                None,
+                "Target player gets an additional combat phase after this phase.",
+                ExtraPhaseRecipient::TargetedPlayer(TargetFilter::Player),
+            ),
+            (
+                "Probe",
+                "Sorcery",
+                None,
+                "Target opponent gets an additional combat phase after this phase.",
+                ExtraPhaseRecipient::TargetedPlayer(opponent),
+            ),
+            // Each seat's grant is its own controller's (player_scope fan-out).
+            (
+                "Probe",
+                "Sorcery",
+                None,
+                "Each player gets an additional upkeep step after this step.",
+                ExtraPhaseRecipient::Controller,
+            ),
+        ];
+        for (name, card_type, subtype, text, expected) in rows {
+            assert_eq!(
+                recipients(name, card_type, subtype, text),
+                vec![Some(expected)],
+                "{name}: {text:?}"
+            );
+        }
+    }
+
+    /// Hostile siblings: a player subject no kind names fails closed. Reach
+    /// guard: `each_subject_parses_to_its_recipient_kind` parses the same
+    /// arms with a mapped subject.
+    #[test]
+    fn a_subject_no_kind_names_fails_closed() {
+        for (card_type, subtype, text) in [
+            (
+                "Instant",
+                None,
+                "The active player gets an additional combat phase after this phase.",
+            ),
+            (
+                "Instant",
+                None,
+                "Tap target creature. Its controller gets an additional combat phase after this phase.",
+            ),
+            (
+                "Instant",
+                None,
+                "Defending player gets an additional combat phase after this phase.",
+            ),
+            (
+                "Sorcery",
+                None,
+                "An opponent gets an additional combat phase after this phase.",
+            ),
+            (
+                "Sorcery",
+                None,
+                "Choose an opponent. That player gets an additional combat phase after this phase.",
+            ),
+            (
+                "Sorcery",
+                None,
+                "Choose a player to get an additional combat phase after this phase.",
+            ),
+            (
+                "Sorcery",
+                None,
+                "Target creature gets an additional combat phase after this phase.",
+            ),
+            (
+                "Enchantment",
+                Some("Aura"),
+                "Enchant player\nAt the beginning of your upkeep, enchanted player gets an additional upkeep step after this step.",
+            ),
+            (
+                "Enchantment",
+                None,
+                "At the beginning of each player's upkeep, that player gets an additional upkeep step after this step.",
+            ),
+        ] {
+            assert_eq!(
+                recipients("Probe", card_type, subtype, text),
+                vec![None],
+                "{text:?}"
+            );
+        }
     }
 }

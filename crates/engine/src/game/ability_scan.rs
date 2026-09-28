@@ -1889,7 +1889,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::AdditionalPhase {
-            target,
+            recipient,
             count,
             segment: _,
             after: _,
@@ -1897,7 +1897,11 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             attacker_restriction: _,
         } => {
             let mut acc = Axes::NONE;
-            acc = acc.or(scan_target_filter(target, target_ctx, mode));
+            acc = acc.or(scan_target_filter(
+                recipient.as_target_filter(),
+                target_ctx,
+                mode,
+            ));
             acc = acc.or(scan_quantity_expr(count, mode));
             acc
         }

@@ -66,11 +66,16 @@ pub struct TournamentRequestId(pub u64);
 ///      (`{"type":"Phase","data":"Combat"}`,
 ///      `{"type":"CreatedPhase","data":"Untap"}`,
 ///      `{"type":"Step","data":"End"}`), and `followed_by` changed its
-///      element type from `Phase` to `TurnSegment`. `segment` has no serde
-///      default and abilities ride inside `GameObject`, so every
-///      full-GameState frame holding any additional-phase card is unparseable
-///      across the pair — an unconditional PARSE bump like 82. Lobby messages
-///      are unchanged, and P2P moves in lockstep (wire 65).
+///      element type from `Phase` to `TurnSegment`. Its `target` field (a
+///      `TargetFilter`) was replaced by `recipient`, the adjacently tagged
+///      `ExtraPhaseRecipient` (`{"type":"NoPlayer"}`, `{"type":"Controller"}`,
+///      `{"type":"TriggeringPlayer"}`,
+///      `{"type":"TargetedPlayer","data":{"type":"Player"}}`). Neither
+///      `segment` nor `recipient` has a serde default and abilities ride inside
+///      `GameObject`, so every full-GameState frame holding any
+///      additional-phase card is unparseable across the pair — an
+///      unconditional PARSE bump like 82. Lobby messages are unchanged, and
+///      P2P moves in lockstep (wire 65).
 ///
 /// 82 — Added phases and steps anchored, identified and counted per
 ///      CR 500.8–500.10. Every change rides full-game state; lobby messages

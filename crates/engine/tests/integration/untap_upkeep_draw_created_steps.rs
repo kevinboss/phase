@@ -5,7 +5,7 @@
 
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{Effect, ExtraPhaseAnchor, TargetFilter};
+use engine::types::ability::{Effect, ExtraPhaseAnchor, ExtraPhaseRecipient};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::identifiers::ObjectId;
@@ -75,7 +75,7 @@ fn each_mode_parses_to_a_created_phase_after_this_phase() {
         .iter()
         .map(|ability| match &*ability.effect {
             Effect::AdditionalPhase {
-                target: TargetFilter::None,
+                recipient: ExtraPhaseRecipient::NoPlayer,
                 segment,
                 after: ExtraPhaseAnchor::ThisPhase { named: None },
                 followed_by,

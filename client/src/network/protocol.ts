@@ -108,7 +108,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * Bumps to date:
  *  65 — game_setup and state_update carry GameState, whose additional-phase
  *       abilities now name what they add as a TurnSegment (segment, and
- *       followed_by's elements) in place of a Phase. Both peers are browsers
+ *       followed_by's elements) in place of a Phase, and who gets it as an
+ *       ExtraPhaseRecipient (recipient) in place of a TargetFilter. Both peers are browsers
  *       and neither validates the shape, so a v64 peer would take the new
  *       shape with no decode error; first contact rejects the skew instead.
  *       Bumped in lockstep with full-game protocol 83.

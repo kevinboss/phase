@@ -47,14 +47,14 @@ use crate::types::ability::{
     AttachSelection, BounceSelection, CardSelectionMode, CategoryChooserScope, ChoiceType, Chooser,
     ContinuousModification, ControlWindow, ControllerRef, CopyRetargetPermission,
     CounterAdjustment, CounterKindChooser, CounterKindDomain, DigSource, DoorLockOp, Duration,
-    Effect, EffectScope, ExtraPhaseAnchor, FaceDownProfile, FilterProp, ForceBlockAttackerRef,
-    GrantedAbilityScope, LibraryPosition, MassLibraryShuffleMode, MultiTargetSpec,
-    ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope,
-    PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PreventionAmount, PreventionScope,
-    PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode, SearchSelectionConstraint,
-    StaticDefinition, StickerTicketCostPayment, TapStateChange, TargetChoiceTiming, TargetFilter,
-    TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter, ZoneChoiceCandidateSource,
-    ZoneOwner,
+    Effect, EffectScope, ExtraPhaseAnchor, ExtraPhaseRecipient, FaceDownProfile, FilterProp,
+    ForceBlockAttackerRef, GrantedAbilityScope, LibraryPosition, MassLibraryShuffleMode,
+    MultiTargetSpec, ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool,
+    PerPlayerScope, PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PreventionAmount,
+    PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode,
+    SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment, TapStateChange,
+    TargetChoiceTiming, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
+    ZoneChoiceCandidateSource, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
@@ -11203,15 +11203,81 @@ fn parse_expletive_additional_subject(input: &str) -> OracleResult<'_, ()> {
     .parse(input)
 }
 
+/// CR 500.10a: the verb of a player's grant, "get(s)", immediately followed
+/// by the added step's or phase's own quantifier ("gets an additional combat
+/// phase", "get that many additional upkeep steps").
+fn parse_additional_grant_verb(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (
+            alt((tag("gets "), tag("get "))),
+            peek(parse_additional_quantifier),
+        ),
+    )
+    .parse(input)
+}
+
 /// CR 500.10a: who gets an added step or phase. "There is / are" names no
-/// player (`TargetFilter::None`), so the step or phase is added to the turn in
-/// progress. Otherwise the text grants it to a player: "you get" is the
-/// controller, and a player subject ("that player gets", Paradox Haze) is
-/// bound over this default by subject injection.
-fn additional_phase_recipient(lower: &str) -> TargetFilter {
-    match nom_primitives::scan_at_word_boundaries(lower, parse_expletive_additional_subject) {
-        Some(()) => TargetFilter::None,
-        None => TargetFilter::Controller,
+/// player (`NoPlayer`), so the step or phase is added to the turn in
+/// progress. "You get" names the controller, whether the sentence still
+/// carries it or subject stripping left the bare verb ("get an additional
+/// …"); subject injection then rebinds a stripped player subject ("that
+/// player gets", Paradox Haze) through
+/// `additional_phase_recipient_for_subject`. Any other subject ("the active
+/// player gets") names a player no recipient kind identifies: `None`.
+fn additional_phase_recipient(lower: &str) -> Option<ExtraPhaseRecipient> {
+    if nom_primitives::scan_at_word_boundaries(lower, parse_expletive_additional_subject).is_some()
+    {
+        return Some(ExtraPhaseRecipient::NoPlayer);
+    }
+    let names_controller = parse_additional_grant_verb(lower).is_ok()
+        || nom_primitives::scan_at_word_boundaries(lower, |i| {
+            preceded(tag("you "), parse_additional_grant_verb).parse(i)
+        })
+        .is_some();
+    names_controller.then_some(ExtraPhaseRecipient::Controller)
+}
+
+/// CR 500.10a + CR 115.1: the recipient kind a stripped player subject names:
+/// "you" is the controller; "that player" in a trigger is the triggering
+/// player; "target player" / "target opponent" is a targeted player, a real
+/// target slot (CR 115.1). Any other subject ("its controller", "that player"
+/// bound to a spell's target, "defending player", a chosen player, or a
+/// subject that is not a player) has no kind: `None`, and the caller fails
+/// closed.
+pub(super) fn additional_phase_recipient_for_subject(
+    subject: &TargetFilter,
+) -> Option<ExtraPhaseRecipient> {
+    match subject {
+        TargetFilter::Controller => Some(ExtraPhaseRecipient::Controller),
+        TargetFilter::TriggeringPlayer => Some(ExtraPhaseRecipient::TriggeringPlayer),
+        filter if filter.denotes_player_target() && !filter.is_context_ref() => {
+            Some(ExtraPhaseRecipient::TargetedPlayer(filter.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// CR 500.8 + CR 500.10a: the added step or phase `segment`, after `after`,
+/// granted to the recipient the text names. A recipient no kind identifies
+/// fails closed.
+fn additional_phase_effect(
+    text: &str,
+    lower: &str,
+    segment: TurnSegment,
+    after: ExtraPhaseAnchor,
+    followed_by: Vec<TurnSegment>,
+) -> Effect {
+    match additional_phase_recipient(lower) {
+        Some(recipient) => Effect::AdditionalPhase {
+            recipient,
+            segment,
+            after,
+            followed_by,
+            count: parse_additional_phase_count(lower),
+            attacker_restriction: None,
+        },
+        None => Effect::unimplemented("additional_phase", text),
     }
 }
 
@@ -11667,14 +11733,13 @@ pub(super) fn parse_imperative_family_ast(
                         | ExtraPhaseAnchor::FirstOfTurn(_)),
                     ),
                     None | Some(Some(_)),
-                ) => Effect::AdditionalPhase {
-                    target: additional_phase_recipient(lower),
-                    segment: TurnSegment::Phase(PhaseGroup::Combat),
+                ) => additional_phase_effect(
+                    text,
+                    lower,
+                    TurnSegment::Phase(PhaseGroup::Combat),
                     after,
-                    followed_by: follow_up.flatten().into_iter().collect(),
-                    count: parse_additional_phase_count(lower),
-                    attacker_restriction: None,
-                },
+                    follow_up.flatten().into_iter().collect(),
+                ),
                 (
                     Some(ExtraPhaseAnchor::ThisPhase { .. } | ExtraPhaseAnchor::FirstOfTurn(_)),
                     Some(None),
@@ -11700,14 +11765,7 @@ pub(super) fn parse_imperative_family_ast(
             Some(ExtraPhaseAnchor::Step(_)) | None => None,
         };
         return Some(ImperativeFamilyAst::GainKeyword(match segment {
-            Some((segment, after)) => Effect::AdditionalPhase {
-                target: additional_phase_recipient(lower),
-                segment,
-                after,
-                followed_by: vec![],
-                count: parse_additional_phase_count(lower),
-                attacker_restriction: None,
-            },
+            Some((segment, after)) => additional_phase_effect(text, lower, segment, after, vec![]),
             None => Effect::unimplemented("additional_phase", text),
         }));
     }
@@ -11721,14 +11779,13 @@ pub(super) fn parse_imperative_family_ast(
             match step_or_beginning_anchor(lower) {
                 Some(
                     after @ (ExtraPhaseAnchor::ThisPhase { .. } | ExtraPhaseAnchor::FirstOfTurn(_)),
-                ) => Effect::AdditionalPhase {
-                    target: additional_phase_recipient(lower),
-                    segment: TurnSegment::Phase(PhaseGroup::Beginning),
+                ) => additional_phase_effect(
+                    text,
+                    lower,
+                    TurnSegment::Phase(PhaseGroup::Beginning),
                     after,
-                    followed_by: vec![],
-                    count: parse_additional_phase_count(lower),
-                    attacker_restriction: None,
-                },
+                    vec![],
+                ),
                 Some(ExtraPhaseAnchor::ThisStep | ExtraPhaseAnchor::Step(_)) | None => {
                     Effect::unimplemented("additional_phase", text)
                 }
@@ -20193,7 +20250,7 @@ mod tests {
             matches!(
                 effect,
                 Effect::AdditionalPhase {
-                    target: TargetFilter::None,
+                    recipient: ExtraPhaseRecipient::NoPlayer,
                     segment: TurnSegment::Phase(PhaseGroup::Combat),
                     after: ExtraPhaseAnchor::ThisPhase { named: None },
                     ref followed_by,
@@ -20308,7 +20365,7 @@ mod tests {
             matches!(
                 effect,
                 Effect::AdditionalPhase {
-                    target: TargetFilter::None,
+                    recipient: ExtraPhaseRecipient::NoPlayer,
                     segment: TurnSegment::Phase(PhaseGroup::Combat),
                     after: ExtraPhaseAnchor::ThisPhase { named: None },
                     ref followed_by,
@@ -20583,8 +20640,10 @@ mod tests {
     fn each_producer_sentence_parses_to_its_segment() {
         let postcombat_main = TurnSegment::Phase(PhaseGroup::PostcombatMain);
         for (text, segment, followed_by) in [
+            // Paradox Haze, as subject stripping delivers it ("that player"
+            // is rebound by subject injection).
             (
-                "that player gets an additional upkeep step after this step.",
+                "get an additional upkeep step after this step.",
                 TurnSegment::Step(Phase::Upkeep),
                 vec![],
             ),
@@ -20737,7 +20796,8 @@ mod tests {
     }
 
     /// CR 500.10a: who gets an added step or phase. "There is / there's / there
-    /// are" names no player (`TargetFilter::None`); "you get" is the controller.
+    /// are" names no player (`NoPlayer`); "you get", or the bare verb subject
+    /// stripping leaves, is the controller.
     /// An expletive that opens another clause ("if there are three or more
     /// cards …") is not the grant's subject.
     #[test]
@@ -20745,51 +20805,74 @@ mod tests {
         for (text, recipient) in [
             (
                 "after this phase, there is an additional combat phase",
-                TargetFilter::None,
+                ExtraPhaseRecipient::NoPlayer,
             ),
             (
                 "after this main phase, there are two additional combat phases",
-                TargetFilter::None,
+                ExtraPhaseRecipient::NoPlayer,
             ),
             (
                 "there's an additional combat phase after the first combat phase this turn",
-                TargetFilter::None,
+                ExtraPhaseRecipient::NoPlayer,
             ),
             (
                 "there\u{2019}s an additional combat phase after this phase",
-                TargetFilter::None,
+                ExtraPhaseRecipient::NoPlayer,
             ),
             (
                 "there is an additional end step after this step",
-                TargetFilter::None,
+                ExtraPhaseRecipient::NoPlayer,
             ),
             (
                 "there is an additional beginning phase after this phase",
-                TargetFilter::None,
+                ExtraPhaseRecipient::NoPlayer,
             ),
             (
                 "there is an additional upkeep step after this phase",
-                TargetFilter::None,
+                ExtraPhaseRecipient::NoPlayer,
             ),
             (
                 "you get an additional upkeep step after this step",
-                TargetFilter::Controller,
+                ExtraPhaseRecipient::Controller,
             ),
             (
                 "you get that many additional upkeep steps after this phase",
-                TargetFilter::Controller,
+                ExtraPhaseRecipient::Controller,
             ),
             (
                 "if there are three or more cards in your hand, you get an additional upkeep step after this step",
-                TargetFilter::Controller,
+                ExtraPhaseRecipient::Controller,
+            ),
+            (
+                "after this phase, you get an additional combat phase",
+                ExtraPhaseRecipient::Controller,
+            ),
+            (
+                "get an additional beginning phase after this phase",
+                ExtraPhaseRecipient::Controller,
             ),
         ] {
             match additional_phase_family_effect(text) {
-                Effect::AdditionalPhase { target, .. } => {
-                    assert_eq!(target, recipient, "{text:?}")
+                Effect::AdditionalPhase { recipient: parsed, .. } => {
+                    assert_eq!(parsed, recipient, "{text:?}")
                 }
                 other => panic!("{text:?}: expected AdditionalPhase, got {other:?}"),
             }
+        }
+    }
+
+    /// CR 500.10a: a subject no recipient kind names fails closed in each of
+    /// the three arms, rather than granting the step or phase to the
+    /// controller. Reach guard: `additional_phase_recipient_follows_the_subject`
+    /// parses the same arms with "you get" and "there is".
+    #[test]
+    fn unnamed_player_subject_fails_closed() {
+        for text in [
+            "the active player gets an additional combat phase after this phase",
+            "the active player gets an additional upkeep step after this step",
+            "the active player gets an additional beginning phase after this phase",
+        ] {
+            assert_additional_phase_unimplemented(text);
         }
     }
 

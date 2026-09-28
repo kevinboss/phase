@@ -18,6 +18,7 @@ mod ad_nauseam_repeat;
 mod adamant_enters_with_leading_if_gate;
 mod adapter_contract_fixtures;
 mod additional_combat_anchor_and_recipient;
+mod additional_phase_recipient_kinds;
 mod advanced_reconstruction_regression;
 mod affinity_plural_subtype;
 mod agent_frank_horrigan_attacked_this_turn_indestructible;

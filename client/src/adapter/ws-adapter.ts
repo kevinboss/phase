@@ -211,7 +211,8 @@ export class NativeEngineVersionMismatchError extends Error {
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
  * 83 — Effect.AdditionalPhase carries segment, a TurnSegment, in place of
- *      phase, and followed_by holds TurnSegments — see PROTOCOL_VERSION's own
+ *      phase, followed_by holds TurnSegments, and recipient, an
+ *      ExtraPhaseRecipient, replaces target — see PROTOCOL_VERSION's own
  *      `/// 83` entry in crates/lobby-broker/src/protocol.rs. This client
  *      hands server frames to JSON.parse, so a v82 client would take the new
  *      shape with no decode error; the exact-match version check at connect

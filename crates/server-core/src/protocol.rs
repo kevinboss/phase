@@ -3319,8 +3319,9 @@ mod tests {
     }
 
     /// `Effect::AdditionalPhase` now carries a `TurnSegment` in place of its
-    /// `phase` field; a v82 peer cannot parse it, so it must be refused before
-    /// it receives v83 state.
+    /// `phase` field and an `ExtraPhaseRecipient` in place of its `target`
+    /// field; a v82 peer cannot parse it, so it must be refused before it
+    /// receives v83 state.
     ///
     /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
     /// <n>)` under a function named for `<n-1>` is green, so

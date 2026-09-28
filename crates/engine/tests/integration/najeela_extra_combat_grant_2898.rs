@@ -16,8 +16,8 @@
 use engine::game::effects::resolve_ability_chain;
 use engine::game::zones::create_object;
 use engine::types::ability::{
-    ContinuousModification, Duration, Effect, EffectScope, ExtraPhaseAnchor, ResolvedAbility,
-    StaticDefinition, TapStateChange, TargetFilter, TypeFilter, TypedFilter,
+    ContinuousModification, Duration, Effect, EffectScope, ExtraPhaseAnchor, ExtraPhaseRecipient,
+    ResolvedAbility, StaticDefinition, TapStateChange, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::card_type::CoreType;
 use engine::types::game_state::ExtraPhase;
@@ -43,7 +43,7 @@ fn najeela_chain(source: ObjectId, controller: PlayerId) -> ResolvedAbility {
     // Link 3: additional combat phase (the only effect that currently works).
     let additional_phase = ResolvedAbility::new(
         Effect::AdditionalPhase {
-            target: TargetFilter::Controller,
+            recipient: ExtraPhaseRecipient::Controller,
             segment: TurnSegment::Phase(PhaseGroup::Combat),
             after: ExtraPhaseAnchor::Step(Phase::EndCombat),
             followed_by: vec![],

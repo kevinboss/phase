@@ -3117,11 +3117,13 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::ExtraTurn { target, count }
         | Effect::SkipNextTurn { target, count }
         | Effect::SkipNextStep { target, count, .. }
-        | Effect::AdditionalPhase { target, count, .. }
         | Effect::GrantExtraLoyaltyActivations {
             amount: count,
             target,
         } => legacy_quantity_expr(count) || legacy_target_filter(target),
+        Effect::AdditionalPhase {
+            recipient, count, ..
+        } => legacy_quantity_expr(count) || legacy_target_filter(recipient.as_target_filter()),
         // CR 701.58a: `object_source` (Some) names already-chosen objects to cloak —
         // an `Option<TargetFilter>` that can nest a frozen event-context tag, so it is
         // walked here (the shared `{ target, count }` group above cannot).
@@ -5989,7 +5991,7 @@ fn rw_effect(
         }
         // §L14 (CR 500.8): an additional phase/step is a turn-structure write.
         Effect::AdditionalPhase {
-            target: _,
+            recipient: _,
             count,
             segment: _,
             after: _,
@@ -9108,7 +9110,7 @@ mod tests {
     fn l14_extra_turn_and_phase_are_turn_structure_not_other() {
         // AdditionalPhase is likewise a TurnStructure write, never `Other`.
         let ap = ability_rw_profile(&ra(Effect::AdditionalPhase {
-            target: TargetFilter::Controller,
+            recipient: crate::types::ability::ExtraPhaseRecipient::Controller,
             segment: crate::types::phase::TurnSegment::Phase(
                 crate::types::phase::PhaseGroup::PostcombatMain,
             ),
