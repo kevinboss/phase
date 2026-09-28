@@ -1,8 +1,10 @@
 //! CR 500.10a + CR 115.1 + CR 608.2b: a player the text names as getting an
 //! added phase is a real target when the text says "target player": the target
 //! is chosen when the spell is cast, re-checked when it resolves, and the phase
-//! goes only to that player's own turn. A target lost before resolution is not
-//! replaced by the spell's controller.
+//! goes only to that player's own turn. A player target lost before
+//! resolution in the spell's first clause is not replaced by the spell's
+//! controller; a later clause's lost target is refilled from the parent
+//! clause's targets by chain target propagation (follow-up F-26).
 //!
 //! No printed card says "target player gets an additional … phase"; the
 //! grammar reaches it (charter C8c-a), so these rows use synthetic text.
