@@ -3425,7 +3425,40 @@ pub(super) fn handle_resolution_choice(
                             } | WaitingFor::Priority { .. }
                         ) {
                             state.deferred_step_trigger_resume = None;
-                            crate::game::turns::auto_advance(state, events)
+                            // CR 500.1 + CR 500.8: the run can commit a leave that
+                            // ends the turn, and the next turn begins from a settled
+                            // Priority window (`turns::start_next_turn`). The answered
+                            // collapse prompt is spent, so the active player's
+                            // provisional window replaces it before the run; a
+                            // `Priority` an applier wrote is left as it stands.
+                            if matches!(
+                                state.waiting_for,
+                                WaitingFor::PayAmountChoice {
+                                    resource: PayableResource::LoopCollapse { .. },
+                                    ..
+                                }
+                            ) {
+                                public_state::sync_waiting_for(
+                                    state,
+                                    &WaitingFor::Priority {
+                                        player: state.active_player,
+                                    },
+                                );
+                            }
+                            // CR 502.3 + CR 500.8: the entered step can be an added
+                            // untap step whose leave ends the turn while a resolution
+                            // is live, so the interpreter stops with the untap done
+                            // and the waiting state from before the run standing.
+                            // CR 502.4: that is no window to hand a player in the
+                            // untap step, so the deferral is settled and retried as
+                            // after an untap-choice answer.
+                            match crate::game::turns::auto_advance_reporting_deferral(state, events)
+                            {
+                                (waiting_for, false) => waiting_for,
+                                (_, true) => {
+                                    super::engine::settle_deferred_untap_transition(state, events)
+                                }
+                            }
                         } else {
                             state.waiting_for.clone()
                         }
@@ -5388,7 +5421,15 @@ pub(super) fn handle_resolution_choice(
                 match turns::advance_phase_once(state, events) {
                     turns::AdvancePhaseOnce::Deferred => {}
                     turns::AdvancePhaseOnce::Entry(_) | turns::AdvancePhaseOnce::Skipped => {
-                        let advanced = turns::auto_advance(state, events);
+                        // CR 502.3 + CR 500.8: the run can enter an added untap step
+                        // whose leave ends the turn and defers; the deferral goes to
+                        // the settlement an untap-choice answer uses.
+                        let advanced = match turns::auto_advance_reporting_deferral(state, events) {
+                            (waiting_for, false) => waiting_for,
+                            (_, true) => {
+                                super::engine::settle_deferred_untap_transition(state, events)
+                            }
+                        };
                         public_state::sync_waiting_for(state, &advanced);
                     }
                 }
