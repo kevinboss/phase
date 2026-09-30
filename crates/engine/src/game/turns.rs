@@ -303,7 +303,8 @@ pub(in crate::game) fn advance_phase_once(
     // CR 500.8: Extra phases are inserted *directly after* their anchor phase
     // (e.g., Aurelia's "after this phase" extra combat is inserted after the
     // current combat phase ends — anchor = `EndCombat`), scanning from the end so
-    // the most recently created entry occurs first ("the most recently created
+    // the most recently created phase occurs first, after any step queued at the
+    // same anchor (CR 500.9) ("the most recently created
     // phase will occur first" per CR 500.8). Successor selection, including
     // CR 500.8 + CR 500.9 + CR 500.10 continuation after every inserted unit, is
     // `take_scheduled_successor`.
