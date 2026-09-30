@@ -15698,8 +15698,11 @@ impl StepSkipTarget {
 }
 
 /// CR 500.8 + CR 500.9 + CR 500.10: where an added phase or step is inserted.
-/// `ThisStep` and `ThisPhase` are resolved when the effect resolves, against
-/// the step it resolves in; `FirstOfTurn`, against the steps begun this turn.
+/// `ThisStep` and `ThisPhase` are resolved when the effect resolves:
+/// `ThisStep` against the step it resolves in, `ThisPhase` against the phase in
+/// progress, which the added-unit records decide (CR 500.9: an added step is
+/// part of its phase; CR 500.10: a created phase ends with its one step);
+/// `FirstOfTurn`, against the steps begun this turn.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ExtraPhaseAnchor {
@@ -19931,8 +19934,9 @@ pub enum Effect {
     /// triggering event amount through `QuantityRef::EventContextAmount`. Legacy
     /// callers and explicit "an additional" wording deserialize to a Fixed 1.
     /// `after` is the CR 500.8/500.9/500.10 insertion point, resolved at
-    /// resolution time by `additional_phase::resolve`; `ThisStep`/`ThisPhase` are
-    /// relative to the step the effect resolves in.
+    /// resolution time by `additional_phase::resolve`; `ThisStep` is the step the
+    /// effect resolves in, and `ThisPhase` is the phase in progress
+    /// (`turns::final_step_of_phase_in_progress`).
     AdditionalPhase {
         recipient: ExtraPhaseRecipient,
         segment: TurnSegment,
