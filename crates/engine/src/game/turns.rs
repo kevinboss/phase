@@ -1082,8 +1082,9 @@ pub(super) fn drain_pending_phase_transition_progress(
 /// or not the beat was eligible to go back through the interpreter, and `stack.rs`'s quiescence
 /// predicate requires it clear.
 ///
-/// A transition the resumed run defers is settled and retried here, as after an untap-choice
-/// answer, so the returned beat is never the stale window the run stopped at.
+/// A transition the resumed run defers is settled and retried once here, as after an
+/// untap-choice answer. Only a carrier that cannot settle leaves the provisional
+/// `Priority { active }` window standing (see `engine::settle_deferred_untap_transition`).
 pub(crate) fn resume_deferred_step_triggers(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
@@ -2129,9 +2130,11 @@ pub fn execute_untap_with_choices(
 }
 
 /// CR 611.2a: end or arm the durations whose deadline is the start of
-/// `active`'s turn, as that turn's untap step begins. An untap step an effect
-/// adds (CR 500.8 + CR 500.9 + CR 500.10) is not the start of a turn, so it
-/// runs none of these.
+/// `active`'s turn, as that turn's untap step begins (with the untap-step
+/// casting-permission deadline, CR 500.4, which that seam also runs). An
+/// untap step an effect adds (CR 500.8 + CR 500.9 + CR 500.10) is not the
+/// start of a turn, so it runs none of these; it runs only
+/// `layers::prune_added_untap_step_casting_permissions`.
 fn expire_next_turn_durations(state: &mut GameState, active: PlayerId) {
     // CR 611.2a: Prune "until your next turn" transient effects for the active player.
     super::layers::prune_until_next_turn_effects(state, active);
@@ -2169,10 +2172,10 @@ fn expire_next_turn_durations(state: &mut GameState, active: PlayerId) {
             );
         }
     }
-    // CR 500.4 + CR 514.2: the casting-permission seam of the untap step that
-    // begins a turn — arms "until the end of your next turn" grants and expires
-    // both untap-step shapes ("until your next turn" and "until [its
-    // controller's] next untap step"). See
+    // CR 500.4 + CR 514.2 + CR 611.2a: the casting-permission seams of the
+    // untap step that begins a turn — arms "until the end of your next turn"
+    // grants, expires "until your next turn" (the turn start) and "until [its
+    // controller's] next untap step" (CR 500.4). See
     // `layers::prune_untap_step_casting_permissions`.
     super::layers::prune_untap_step_casting_permissions(state, active);
     for obj in state.objects.iter_mut().map(|(_, v)| v) {

@@ -584,7 +584,7 @@ fn permission_duration_expires_at(
                 && permission_scope_selects(player, keyed, active_player)
         }
         // CR 514.2: "until the end of your next turn" is ARMED at the untap
-        // step (rewritten to `UntilEndOfTurn` by
+        // step that begins the grantee's turn, never an added one (rewritten to `UntilEndOfTurn` by
         // `prune_untap_step_casting_permissions`) and ended by the cleanup arm
         // above. It never expires directly, at any seam.
         Duration::UntilEndOfNextTurnOf { .. } => false,
@@ -647,7 +647,7 @@ pub(crate) fn casting_permission_duration_is_enforceable(
         // a scope cannot be unselectable at the table and enforceable here.
         Duration::UntilNextTurnOf { player } => permission_scope_is_keyable(player),
         // CR 514.2: this shape is ARMED rather than expired — rewritten to
-        // `UntilEndOfTurn` at the untap step, which is why the expiry table
+        // `UntilEndOfTurn` at the untap step that begins a turn, which is why the expiry table
         // answers `false` for it at every seam. The arming in
         // `prune_untap_step_casting_permissions` matches
         // `PlayerScope::Controller` alone, so any other scope is never armed
