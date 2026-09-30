@@ -22,7 +22,10 @@ import type {
   TournamentUpdateReply,
 } from "../adapter/types";
 import { AdapterError, AdapterErrorCode, isCustomGameFormat } from "../adapter/types";
-import { isFormatConfigShape } from "../adapter/format-config-shape";
+import {
+  isFormatConfigShape,
+  rehydrateExperimentalDungeons,
+} from "../adapter/format-config-shape";
 import { findSavedCustomFormat } from "../services/customFormats";
 import { AI_DIFFICULTIES } from "../constants/ai";
 import { FORMAT_REGISTRY } from "../data/formatRegistry";
@@ -159,6 +162,8 @@ let activeBrokerGameCode: string | null = null;
 let activeP2PHostAdapter: P2PHostAdapter | null = null;
 let activeP2PHostGameId: string | null = null;
 let p2pHostingAttempt = 0;
+// A server-host dial acts after its socket opens only while it is the latest.
+let serverHostAttempt = 0;
 
 function asDeckPayload(deck: HostingDeck): {
   main_deck: string[];
@@ -1888,6 +1893,7 @@ function disposeActiveP2PHost(): void {
 }
 
 function closeHostWebSocket(): void {
+  serverHostAttempt += 1;
   if (hostReconnectTimer) {
     clearTimeout(hostReconnectTimer);
     hostReconnectTimer = null;
@@ -1900,6 +1906,23 @@ function closeHostWebSocket(): void {
     hostWs.close();
     hostWs = null;
   }
+}
+
+const ABANDON_CLOSE_TIMEOUT_MS = 5_000;
+
+// Closing a LAN bridge drops frames it has not yet written, so wait for the server's reply.
+function abandonThenClose(ws: PhaseSocketTransport): void {
+  const close = () => {
+    clearTimeout(timer);
+    ws.close();
+  };
+  const timer = setTimeout(close, ABANDON_CLOSE_TIMEOUT_MS);
+  ws.onerror = null;
+  ws.onclose = null;
+  ws.onmessage = (event) => {
+    if ((JSON.parse(event.data) as { type: string }).type === "GameAbandoned") close();
+  };
+  ws.send(JSON.stringify({ type: "AbandonGame" }));
 }
 
 function activeServerHostingSocket(get: () => MultiplayerState): PhaseSocketTransport | null {
@@ -2338,7 +2361,12 @@ function normalizeCustomHostConfig(
   if (typeof savedCustomFormatId !== "string") return null;
   if (!findSavedCustomFormat(savedCustomFormatId)) return null;
 
-  const storedFormatConfig = persisted.formatConfig;
+  // Configs persisted before the experimental-dungeons axis existed lack the
+  // flag; the engine defaults it to false, so rehydrate it here — before the
+  // shape guard — rather than discarding the whole remembered setup.
+  // Non-boolean values reset to the default too: a capability flag must never
+  // rehydrate as truthy from corrupt data.
+  const storedFormatConfig = rehydrateExperimentalDungeons(persisted.formatConfig);
   if (!isFormatConfigShape(storedFormatConfig)) return null;
   // The blob must describe the format it is filed under. `isFormatConfigShape`
   // already ties `format` to `custom_rules.id`; this ties both to the key the
@@ -2389,6 +2417,10 @@ function normalizeBuiltInHostConfig(
     allow_debug_actions: typeof storedFormatConfig.allow_debug_actions === "boolean"
       ? storedFormatConfig.allow_debug_actions
       : defaults.allow_debug_actions,
+    allow_experimental_dungeons:
+      typeof storedFormatConfig.allow_experimental_dungeons === "boolean"
+        ? storedFormatConfig.allow_experimental_dungeons
+        : defaults.allow_experimental_dungeons,
   };
   return finalizeRememberedHostConfig(persisted, format, formatConfig, null);
 }
@@ -2729,10 +2761,12 @@ async function openServerHostSocket(
     return;
   }
 
+  const attempt = ++serverHostAttempt;
   let socket;
   try {
     socket = await openPhaseSocket(url);
   } catch (err) {
+    if (attempt !== serverHostAttempt) return;
     if (
       err instanceof HandshakeError &&
       err.kind === "protocol_mismatch"
@@ -2745,6 +2779,10 @@ async function openServerHostSocket(
       hostWs = null;
       onReopen();
     }
+    return;
+  }
+  if (attempt !== serverHostAttempt) {
+    socket.ws.close();
     return;
   }
 
@@ -3183,6 +3221,11 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
 
       cancelHosting: () => {
         p2pHostingAttempt += 1;
+        // A closed host socket leaves the room alive for the reconnect grace.
+        if (hostWs?.readyState === WebSocket.OPEN) {
+          abandonThenClose(hostWs);
+          hostWs = null;
+        }
         closeHostWebSocket();
         disposeActiveP2PHost();
         if (activeBroker) {

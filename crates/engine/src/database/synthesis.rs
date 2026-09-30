@@ -3110,6 +3110,24 @@ pub fn synthesize_dredge(face: &mut CardFace) {
         return;
     }
 
+    face.replacements.push(dredge_replacement_definition(n));
+}
+
+/// CR 702.52a + CR 121.6b + CR 113.6b: the single per-value Dredge Draw
+/// replacement definition — "if you would draw a card, you may instead mill N
+/// cards and return this card from your graveyard to your hand."
+///
+/// The single authority for building a Dredge replacement, shared by:
+/// - build-time synthesis (`synthesize_dredge`) for PRINTED Dredge, and
+/// - the runtime granted-keyword replacement path (`granted_dredge_value` →
+///   `find_applicable_replacements` in `game/replacement.rs`), which surfaces
+///   one virtual candidate for a graveyard card whose Dredge is granted at
+///   runtime (e.g. The Necrobloom's "Land cards in your graveyard have dredge
+///   2") rather than printed.
+///
+/// Because both callers build identical definitions, printed + granted
+/// instances each apply through the same shape.
+pub(crate) fn dredge_replacement_definition(n: u32) -> ReplacementDefinition {
     // CR 702.52a: "return this card from your graveyard to your hand."
     let return_to_hand = AbilityDefinition::new(
         AbilityKind::Spell,
@@ -3152,13 +3170,16 @@ pub fn synthesize_dredge(face: &mut CardFace) {
         .draw_scope(crate::types::ability::DrawReplacementScope::IndividualDraw)
         .active_zones(vec![Zone::Graveyard]);
     replacement.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
-    replacement.description = Some(
-        "CR 702.52a: Dredge — instead of drawing, you may mill N cards and return this \
-         card from your graveyard to your hand."
-            .to_string(),
-    );
+    // CR 616.1: a printed and a differently-valued GRANTED dredge candidate can
+    // co-occur on one card in a single ordering prompt, so this label must show
+    // its own N (the granted label interpolates its own value the same way).
+    let cards = if n == 1 { "card" } else { "cards" };
+    replacement.description = Some(format!(
+        "CR 702.52a: Dredge — instead of drawing, you may mill {n} {cards} and return \
+         this card from your graveyard to your hand."
+    ));
     replacement.execute = Some(Box::new(mill));
-    face.replacements.push(replacement);
+    replacement
 }
 
 /// Idempotency-shape predicate for the synthesized Dredge draw-replacement — a
@@ -11914,6 +11935,26 @@ mod madness_synthesis_tests {
         synthesize_dredge(&mut face);
         assert!(face.replacements.is_empty());
     }
+
+    /// F1 — the printed label pluralizes its own count: Dredge 1 (Shenanigans,
+    /// Grave-Shell Scarab) reads "mill 1 card", never "mill 1 cards".
+    #[test]
+    fn dredge_description_pluralizes_its_own_count() {
+        assert_eq!(
+            dredge_replacement_definition(1).description.as_deref(),
+            Some(
+                "CR 702.52a: Dredge — instead of drawing, you may mill 1 card and return \
+                 this card from your graveyard to your hand."
+            )
+        );
+        assert_eq!(
+            dredge_replacement_definition(3).description.as_deref(),
+            Some(
+                "CR 702.52a: Dredge — instead of drawing, you may mill 3 cards and return \
+                 this card from your graveyard to your hand."
+            )
+        );
+    }
 }
 
 #[cfg(test)]
@@ -18599,16 +18640,7 @@ mod idempotency_tests {
 
     /// CR 609.3 + CR 111.7 (#8147): one mobilized token trades in combat before
     /// the end step, so it has ceased to exist by the time the delayed
-    /// "sacrifice them" fires. The delayed trigger snapshots BOTH token ids at
-    /// creation and carries no incarnation pins, so `live_object_targets` still
-    /// hands the resolver the dead id; `sacrifice::resolve` used to `?` out with
-    /// `EffectError::ObjectNotFound` on it and abandon the whole effect, leaving
-    /// the survivor on the battlefield forever.
-    ///
-    /// Discriminating (fail-on-revert): restore the `ok_or(...)?` in
-    /// `effects/sacrifice.rs` and the survivor stays on the battlefield.
-    /// `synthesize_mobilize_runtime_sacrifices_tokens_at_next_end_step` cannot
-    /// see this — nothing dies in it, so every snapshotted id is still live.
+    /// "sacrifice them" fires.
     #[test]
     fn mobilize_end_step_sacrifice_still_takes_the_survivor_of_a_combat_trade() {
         let mut face = CardFace::default();
@@ -18650,6 +18682,62 @@ mod idempotency_tests {
             state.objects[&survivor].zone,
             Zone::Graveyard,
             "surviving mobilized token must still be sacrificed"
+        );
+    }
+
+    /// CR 603.7c + CR 111.7: both mobilized tokens are gone before the end step, and
+    /// a later token producer has overwritten `last_created_token_ids`. The delayed
+    /// "sacrifice them" has no referent left, so it must not sacrifice that later
+    /// token.
+    #[test]
+    fn mobilize_end_step_sacrifice_ignores_a_later_producers_token_when_all_referents_are_gone() {
+        let mut face = CardFace::default();
+        face.keywords
+            .push(Keyword::Mobilize(QuantityExpr::Fixed { value: 2 }));
+        synthesize_mobilize(&mut face);
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mobilizer".to_string(),
+            Zone::Battlefield,
+        );
+        let execute = face
+            .triggers
+            .first()
+            .and_then(|trigger| trigger.execute.as_deref())
+            .expect("mobilize trigger must have an execute body");
+        let ability = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let tokens = state.last_created_token_ids.clone();
+        assert_eq!(tokens.len(), 2);
+        for token in tokens {
+            state.battlefield.retain(|id| *id != token);
+            state.objects.remove(&token);
+        }
+
+        let later_token = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Later Token".to_string(),
+            Zone::Battlefield,
+        );
+        state.last_created_token_ids = vec![later_token];
+
+        let stacked =
+            check_delayed_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        assert_eq!(stacked.len(), 1, "end-step cleanup must still stack");
+        resolve_top(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&later_token].zone,
+            Zone::Battlefield,
+            "the later producer's token was never named by the delayed trigger"
         );
     }
 

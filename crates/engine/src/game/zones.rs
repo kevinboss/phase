@@ -171,6 +171,20 @@ pub(crate) fn apply_zone_exit_cleanup(
     to: Zone,
     attachments: Vec<crate::types::game_state::AttachmentSnapshot>,
 ) {
+    // CR 608.2h + CR 707.2: record the spell's stack entry and object before
+    // any of this function's own reverts (`cast_occurrence` clear below,
+    // modal/face-down face swap further down) erase what "that spell" looked
+    // like while it was on the stack.
+    if from == Zone::Stack && to != Zone::Stack {
+        let departed_entry = state
+            .stack
+            .iter()
+            .find(|entry| entry.id == object_id)
+            .cloned();
+        if let Some(entry) = departed_entry {
+            super::stack::record_departed_stack_spell(state, &entry);
+        }
+    }
     // CR 400.7: An object that changes zones becomes a new object with no
     // memory of its previous existence. The information authority receives the
     // pre-move occurrence so the future Zone command can apply this same clear
@@ -1137,6 +1151,13 @@ pub fn apply_resolved_zone_change(
     // double-applied; the returned ids are dropped because replay reproduces
     // state, not events (the live transition already emitted them).
     let _ = sever_battlefield_attachment_graph_on_exit(state, command.object.object_id);
+    // CR 400.7 + CR 701.20a: replay bypasses `apply_zone_exit_cleanup`, so it
+    // must reproduce that cleanup's stack-bound reveal drop for the departing
+    // occurrence (validated above), or a lease the live move ended survives as a
+    // stale row in replay. A same-zone reorder is not a new object and keeps it.
+    if command.from != command.to {
+        state.drop_stack_bound_reveals_for_occurrence(command.object);
+    }
     remove_from_zone(state, command.object.object_id, command.from, command.owner);
     add_to_zone(state, command.object.object_id, command.to, command.owner);
 
@@ -1298,6 +1319,11 @@ pub(crate) fn move_to_zone_with_entry_flags(
                         *attack_target
                     }
                     crate::types::game_state::LiminalEntryKind::Token => None,
+                    // Never reached at delivery: `TransformedEntry` projections
+                    // are released before the caller delivers the move (see
+                    // `replacement::release_transformed_entry_projection`).
+                    // This arm exists for exhaustiveness only.
+                    crate::types::game_state::LiminalEntryKind::TransformedEntry => None,
                 })
         })
         .flatten();

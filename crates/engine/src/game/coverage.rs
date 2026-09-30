@@ -20,16 +20,16 @@ use crate::parser::oracle_util::normalize_card_name_refs;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityUseTally,
     ActivationRestriction, AdditionalCost, AggregateFunction, AttackSubject, AttackedYouScope,
-    CardTypeSetSource, ChoiceType, CoinFlipResult, CombatHistoryScope, CommanderOwnership,
-    Comparator, ContinuousModification, ControllerRef, CountScope, CounterKindChooser,
-    CounterKindDomain, CounterSourceRider, DelayedTriggerCondition, DieRollModifier, DoublePTMode,
-    Duration, EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
-    ForEachCategoryAction, GameRestriction, LibraryPosition, ManaProduction,
-    MassLibraryShuffleMode, ObjectProperty, ObjectScope, ObjectSelectionCardinality,
-    ObjectSelectionEligibility, ParsedCondition, PerpetualModification, PlayerFilter,
-    PlayerRelation, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-    ReplacementCondition, ReplacementDefinition, ReplacementMode, SeatDirection, SharedQuality,
-    SharedQualityRelation, SpeedDelta, SpellCastingOption, SpellCastingOptionKind,
+    AttackerBlockStatus, CardTypeSetSource, ChoiceType, CoinFlipResult, CombatHistoryScope,
+    CommanderOwnership, Comparator, ContinuousModification, ControllerRef, CountScope,
+    CounterKindChooser, CounterKindDomain, CounterSourceRider, DelayedTriggerCondition,
+    DieRollModifier, DoublePTMode, Duration, EachDamageRecipient, Effect, EffectOutcomeSignal,
+    EffectScope, FilterProp, ForEachCategoryAction, GameRestriction, LetterQuery, LibraryPosition,
+    ManaProduction, MassLibraryShuffleMode, NameStickerSet, ObjectProperty, ObjectScope,
+    ObjectSelectionCardinality, ObjectSelectionEligibility, ParsedCondition, PerpetualModification,
+    PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr,
+    QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode, SeatDirection,
+    SharedQuality, SharedQualityRelation, SpeedDelta, SpellCastingOption, SpellCastingOptionKind,
     SpellStackToGraveyardReplacement, StackAbilityKind, StaticCondition, StaticDefinition,
     TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
 };
@@ -386,9 +386,8 @@ impl ResolverFeatureFamily {
     /// is not under any family.
     ///
     /// A family whose classifier has no `Unhandled` arm never produces a `ResolverFeature`
-    /// gap, so it never reaches this decode from a coverage gap. When this was written that
-    /// held for `Structural` and `Condition`; it is a snapshot, and a new `Unhandled` arm
-    /// changes it.
+    /// gap, so it never reaches this decode from a coverage gap. Which families that
+    /// describes changes whenever a classifier gains or loses an `Unhandled` arm.
     pub fn from_feature_key(key: &str) -> Option<(Self, &str)> {
         Self::iter().find_map(|family| {
             key.strip_prefix(family.tag())?
@@ -867,7 +866,13 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::Blocking => parts.push("blocking".into()),
             FilterProp::BlockingSource => parts.push("blocking source".into()),
             FilterProp::CombatRelation { .. } => parts.push("combat related".into()),
-            FilterProp::Unblocked => parts.push("unblocked".into()),
+            FilterProp::BlockStatus { status } => parts.push(
+                match status {
+                    AttackerBlockStatus::Blocked => "blocked",
+                    AttackerBlockStatus::Unblocked => "unblocked",
+                }
+                .into(),
+            ),
             FilterProp::AttackingAlone => parts.push("attacking alone".into()),
             FilterProp::BlockingAlone => parts.push("blocking alone".into()),
             FilterProp::Tapped => parts.push("tapped".into()),
@@ -1504,6 +1509,34 @@ fn fmt_player_scope(scope: &PlayerScope) -> String {
     }
 }
 
+/// CR 123.6d + CR 123.6e: "unique vowels on that sticker", "letter 'o' in name
+/// stickers on self".
+fn fmt_name_sticker_letter_count(stickers: &NameStickerSet, letters: &LetterQuery) -> String {
+    let statistic = match letters {
+        LetterQuery::UniqueVowels => "unique vowels".to_string(),
+        LetterQuery::Letter { letter } => format!("letter '{letter}'"),
+    };
+    let set = match stickers {
+        NameStickerSet::ThatSticker => "on that sticker",
+        NameStickerSet::OnObject { scope } => match scope {
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "in name stickers on self"
+            }
+            ObjectScope::Target => "in name stickers on target",
+            ObjectScope::Recipient => "in name stickers on recipient",
+            ObjectScope::EventSource => "in name stickers on event source",
+            ObjectScope::EventTarget => "in name stickers on event target",
+            ObjectScope::CostPaidObject => "in name stickers on cost-paid object",
+            ObjectScope::OtherRevealedCard => "in name stickers on other revealed card",
+            ObjectScope::OwnedLinkedExileCard => "in name stickers on owned linked-exiled card",
+            ObjectScope::AmassedArmy => "in name stickers on amassed Army",
+            ObjectScope::BatchSource => "in name stickers on batch source",
+            ObjectScope::ChainRootTarget => "in name stickers on chain-root target",
+        },
+    };
+    format!("{statistic} {set}")
+}
+
 fn fmt_quantity_ref(qty: &QuantityRef) -> String {
     match qty {
         QuantityRef::HandSize { player } => {
@@ -1703,6 +1736,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::BatchSource => "words in batch source's name".into(),
             ObjectScope::ChainRootTarget => "words in chain-root target's name".into(),
         },
+        QuantityRef::NameStickerLetterCount { stickers, letters } => {
+            fmt_name_sticker_letter_count(stickers, letters)
+        }
         QuantityRef::ManaSymbolsInManaCost { scope, color } => {
             let scope_str = match scope {
                 ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => "self",
@@ -4820,6 +4856,9 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
             parts.join(" or ")
         }
         TC::Not { condition } => format!("not ({})", fmt_trigger_condition(condition)),
+        TC::EventTime { condition } => {
+            format!("at the event: {}", fmt_trigger_condition(condition))
+        }
     }
 }
 
@@ -5981,7 +6020,7 @@ fn build_casting_option_item(option: &SpellCastingOption, items: &mut Vec<Parsed
 ///
 /// Replaces concrete numbers, mana symbols, and p/t modifiers with placeholders
 /// so that structurally identical Oracle phrases group together.
-fn normalize_oracle_pattern(text: &str) -> String {
+pub(crate) fn normalize_oracle_pattern(text: &str) -> String {
     let s = text.to_lowercase();
     let s = s.trim_end_matches('.');
     let mut result = String::with_capacity(s.len());
@@ -6679,6 +6718,7 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
         // Flag cards whose parsed features have no runtime resolver. Without
         // this, a card can parse cleanly yet silently do nothing on resolution.
         check_resolver_features(face, &mut missing);
+        check_shared_source_graveyard_slot(face, &mut missing);
 
         // Flag cards where the parser consumed Oracle text without producing
         // a corresponding parse item. Uses the parse tree computed above.
@@ -7165,7 +7205,58 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
         &static_registry,
         &mut missing,
     );
+    check_shared_source_graveyard_slot(face, &mut missing);
     missing
+}
+
+/// The coverage label for a graveyard-cast permission whose extra cost
+/// replaces the mana cost (CR 118.9): the graveyard route can't pay it, so a
+/// cast through it is refused. Unsupported and fails closed.
+pub const GRAVEYARD_ALTERNATIVE_COST_GAP: &str = "GraveyardCastPermission:alternative_cost";
+
+/// The coverage label for a graveyard-cast permission whose extra cost is a
+/// choice of costs (CR 601.2f): the graveyard route can't pay it, so the
+/// permission is never offered. Unsupported and fails closed.
+pub const GRAVEYARD_CHOICE_COST_GAP: &str = "GraveyardCastPermission:choice_cost";
+
+/// Two once-per-turn graveyard permissions printed on one face share the
+/// source's per-turn slot (see `SHARED_SOURCE_GRAVEYARD_SLOT_GAP`).
+fn check_shared_source_graveyard_slot(face: &CardFace, missing: &mut Vec<String>) {
+    if face
+        .static_abilities
+        .iter()
+        .filter(|definition| is_bounded_graveyard_cast_permission(definition))
+        .count()
+        > 1
+    {
+        push_shared_source_graveyard_slot_gap(missing);
+    }
+}
+
+/// A graveyard-cast permission whose extra cost the graveyard route can't pay:
+/// one that replaces the mana cost (`GRAVEYARD_ALTERNATIVE_COST_GAP`), or one
+/// that is a choice of costs (`GRAVEYARD_CHOICE_COST_GAP`). Checked on every
+/// static definition, printed or granted (`check_static_definition`), so a face
+/// that grants such a permission is marked like one that prints it.
+fn check_graveyard_permission_extra_cost(definition: &StaticDefinition, missing: &mut Vec<String>) {
+    let StaticMode::GraveyardCastPermission {
+        extra_cost: Some(extra),
+        ..
+    } = &definition.mode
+    else {
+        return;
+    };
+    let mut push = |label: &str| {
+        if !missing.iter().any(|existing| existing == label) {
+            missing.push(label.to_string());
+        }
+    };
+    if extra.mode == crate::types::statics::CastCostMode::Alternative {
+        push(GRAVEYARD_ALTERNATIVE_COST_GAP);
+    }
+    if crate::game::casting::cost_contains_choice(&extra.cost) {
+        push(GRAVEYARD_CHOICE_COST_GAP);
+    }
 }
 
 /// Convenience wrapper that builds the registries internally so callers
@@ -7278,6 +7369,7 @@ fn check_static_definition(
             missing.push(label);
         }
     }
+    check_graveyard_permission_extra_cost(def, missing);
     // Flag unrecognized conditions — these represent parser gaps where
     // the condition text wasn't decomposed into typed building blocks.
     // Recurse through And/Or/Not (`contains_unrecognized`/`unrecognized_texts`)
@@ -7336,15 +7428,48 @@ fn collect_modification_missing_parts(
                 );
             });
         }
-        ContinuousModification::GrantStaticAbility { definition } => check_static_tree(
-            definition,
-            trigger_registry,
-            static_registry,
-            token_static_traversal,
-            missing,
-        ),
+        ContinuousModification::GrantStaticAbility { definition } => {
+            // A bounded graveyard permission granted to another object can
+            // stack a second bounded grant onto a source that has one.
+            if is_bounded_graveyard_cast_permission(definition) {
+                push_shared_source_graveyard_slot_gap(missing);
+            }
+            check_static_tree(
+                definition,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+                missing,
+            )
+        }
         _ => {}
     }
+}
+
+/// The coverage label for a graveyard-cast permission shape the runtime can't
+/// charge: two or more once-per-turn grants on one source share its per-turn
+/// ledger slot, so none of them is offered (see
+/// `casting::graveyard_permission_candidates`). Unsupported and fails closed.
+pub const SHARED_SOURCE_GRAVEYARD_SLOT_GAP: &str =
+    "GraveyardCastPermission:shared_source_graveyard_slot";
+
+fn push_shared_source_graveyard_slot_gap(missing: &mut Vec<String>) {
+    if !missing
+        .iter()
+        .any(|label| label == SHARED_SOURCE_GRAVEYARD_SLOT_GAP)
+    {
+        missing.push(SHARED_SOURCE_GRAVEYARD_SLOT_GAP.to_string());
+    }
+}
+
+/// CR 601.2a: a `GraveyardCastPermission` limited to one cast per turn (per
+/// source, or per source and permanent type).
+fn is_bounded_graveyard_cast_permission(definition: &StaticDefinition) -> bool {
+    matches!(
+        definition.mode,
+        StaticMode::GraveyardCastPermission { frequency, .. }
+            if frequency != crate::types::statics::CastFrequency::Unlimited
+    )
 }
 
 fn check_trigger(
@@ -9555,6 +9680,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
                 ("EffectOutcomeCurrentScopeSucceeded", Handled)
             }
             EffectOutcomeSignal::Guessed { .. } => ("EffectOutcomeGuessed", Handled),
+            EffectOutcomeSignal::RevealUntilMatched => ("EffectOutcomeRevealUntilMatched", Handled),
         },
         AbilityCondition::EventOutcomeWon => ("EventOutcomeWon", Handled),
         AbilityCondition::CoinFlipOutcome { .. } => ("CoinFlipOutcome", Handled),
@@ -9578,7 +9704,8 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         AbilityCondition::ManaColorSpent { .. } => ("ManaColorSpent", Handled),
         AbilityCondition::HasMaxSpeed => ("HasMaxSpeed", Handled),
         AbilityCondition::IsMonarch => ("IsMonarch", Handled),
-        // CR 903.3d: evaluated at resolution via `game::commander`.
+        // CR 903.3 / CR 903.3d: evaluated at resolution via `game::commander`
+        // (both ownership scopes).
         AbilityCondition::ControlsCommander { .. } => ("ControlsCommander", Handled),
         // CR 309.7: evaluated at resolution via `dungeon::has_completed_dungeon`.
         AbilityCondition::CompletedDungeon { .. } => ("CompletedDungeon", Handled),
@@ -9806,6 +9933,42 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
             ObjectScope::ChainRootTarget => ("ChainRootTargetObjectNameWordCount", Unhandled),
+        },
+        // CR 608.2c: `game/quantity.rs` reads the resolution's placed-sticker record.
+        QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::ThatSticker,
+            letters: _,
+        } => ("ThatStickerNameStickerLetterCount", Handled),
+        // CR 123.6d: `game/quantity.rs` reads the live object `object_for_scope`
+        // returns.
+        QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        } => match scope {
+            ObjectScope::Source => ("SourceNameStickerLetterCount", Handled),
+            ObjectScope::Target => ("TargetNameStickerLetterCount", Handled),
+            ObjectScope::Recipient => ("RecipientNameStickerLetterCount", Handled),
+            ObjectScope::EventSource => ("EventSourceNameStickerLetterCount", Handled),
+            ObjectScope::EventTarget => ("EventTargetNameStickerLetterCount", Handled),
+            ObjectScope::BatchSource => ("BatchSourceNameStickerLetterCount", Handled),
+            // `object_for_scope` has no referent for this scope → fail-closed 0.
+            ObjectScope::CostPaidObject => ("CostPaidObjectNameStickerLetterCount", Unhandled),
+            // `object_for_scope` has no referent for this scope → fail-closed 0.
+            ObjectScope::Anaphoric => ("AnaphoricNameStickerLetterCount", Unhandled),
+            // `object_for_scope` has no referent for this scope → fail-closed 0.
+            ObjectScope::Demonstrative => ("DemonstrativeNameStickerLetterCount", Unhandled),
+            // `object_for_scope` has no referent for this scope → fail-closed 0.
+            ObjectScope::OtherRevealedCard => {
+                ("OtherRevealedCardNameStickerLetterCount", Unhandled)
+            }
+            // `object_for_scope` has no referent for this scope → fail-closed 0.
+            ObjectScope::OwnedLinkedExileCard => {
+                ("OwnedLinkedExileCardNameStickerLetterCount", Unhandled)
+            }
+            // `object_for_scope` has no referent for this scope → fail-closed 0.
+            ObjectScope::AmassedArmy => ("AmassedArmyNameStickerLetterCount", Unhandled),
+            // `object_for_scope` has no referent for this scope → fail-closed 0.
+            ObjectScope::ChainRootTarget => ("ChainRootTargetNameStickerLetterCount", Unhandled),
         },
         QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -10063,7 +10226,13 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         // `combat::attacker_can_attack_target` rather than guess. The board census is
         // `filter::player_controls_matching` (CR 109.2 + CR 108.4).
         StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Handled),
-        StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Unhandled),
+        // CR 506.5: resolved by `layers::evaluate_condition_inner` against the live
+        // `combat.attackers` set. Every static-condition consumer (layers, combat's
+        // `evaluate_condition_with_recipient` callers, `functioning_abilities`)
+        // routes through that evaluator, and combat membership edits mark layers
+        // dirty. `OpponentPoisonAtLeast` / `CompletedADungeon` stay `Unhandled`:
+        // poison and dungeon-completion writes do not mark layers dirty.
+        StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Handled),
         // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
         // attacker/blocker sets (conditions.rs:81 / layers.rs:1118 / layers.rs:1123).
         StaticCondition::SourceIsAttacking => ("SourceIsAttacking", Handled),
@@ -10102,28 +10271,9 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         }
         StaticCondition::OpponentPoisonAtLeast { .. } => ("OpponentPoisonAtLeast", Unhandled),
         StaticCondition::UnlessPay { .. } => ("UnlessPay", Handled),
-        // CR 903.3d: the RUNTIME does evaluate this static
-        // (the `ControlsCommander` arm of `layers::evaluate_condition_with_context`,
-        // delegating both ownership arms to the single `game::commander` authority), so the
-        // `Unhandled` tag below understates the resolver.
-        //
-        // It stays `Unhandled` DELIBERATELY, and must not be flipped as a rider on
-        // an unrelated change: the tag is currently the only thing holding two
-        // demonstrably MISPARSED Lieutenant cards out of the supported set. Of the
-        // seven `ControlsCommander` statics in the pool, Convergence of Dominion
-        // parses to a static with `modifications: []` (a no-op continuous effect)
-        // and Thunderfoot Baloth collapses "this creature gets +2/+2 and other
-        // creatures you control get +2/+2 and have trample" into ONE `SelfRef`
-        // static, dropping the "other creatures you control" clause and granting
-        // trample to the Baloth itself. Flipping the tag alone would advertise both
-        // as `supported: true, gap_count: 0`.
-        //
-        // Land the flip in its own change, AFTER an empty-`modifications` static
-        // and a dropped continuous-modification clause each register as real gaps.
-        // Nothing in the commander-gate work depends on this tag — Fight for the
-        // Throne's intervening-`if` is an `AbilityCondition`, classified `Handled`
-        // in `condition_feature` above.
-        StaticCondition::ControlsCommander { .. } => ("ControlsCommander", Unhandled),
+        // CR 903.3 / CR 903.3d: resolved by the `ControlsCommander` arm of
+        // `layers::evaluate_condition_inner` (both ownership scopes).
+        StaticCondition::ControlsCommander { .. } => ("ControlsCommander", Handled),
         // SourceIsEquipped resolved by layers::evaluate_condition_inner.
         StaticCondition::SourceIsEquipped => ("SourceIsEquipped", Handled),
         // SourceIsEnchanted resolved by layers::evaluate_condition_inner.
@@ -14864,75 +15014,174 @@ mod tests {
         );
     }
 
-    /// CR 903.3d: the Lieutenant STATIC's `Unhandled` coverage tag is a
-    /// deliberate mask, not an oversight — this pins both halves so the flip
-    /// cannot be smuggled in as a rider on an unrelated change.
-    ///
-    /// The runtime DOES evaluate `StaticCondition::ControlsCommander`
-    /// (the `ControlsCommander` arm of `layers::evaluate_condition_with_context`), so on the
-    /// resolver axis alone the tag understates the engine. But the tag is also
-    /// the only thing keeping two demonstrably misparsed Lieutenant cards out
-    /// of the supported set, so it must stay until those misparses register as
-    /// real gaps.
-    ///
-    /// The second assertion is the evidence, on verbatim Oracle text: Thunderfoot
-    /// Baloth's "…this creature gets +2/+2 AND OTHER CREATURES YOU CONTROL get
-    /// +2/+2 and have trample" collapses into a single `SelfRef` static, so the
-    /// other-creatures clause is silently dropped and trample lands on the Baloth
-    /// itself — with no gap recorded anywhere.
-    ///
-    /// FLIP PROTOCOL: when the dropped-clause misparse (and Convergence of
-    /// Dominion's empty-`modifications` no-op static) each register as a gap, the
-    /// second assertion here goes red. THAT is the signal to flip the tag to
-    /// `Handled` and delete this test — not before.
-    #[test]
-    fn lieutenant_commander_static_tag_is_a_deliberate_mask() {
-        let (label, support) = static_condition_feature(&StaticCondition::ControlsCommander {
-            ownership: CommanderOwnership::Own,
-        });
-        assert_eq!(label, "ControlsCommander");
-        assert!(
-            matches!(support, FeatureSupport::Unhandled),
-            "the mask must stay until the two misparses register as gaps; see the \
-             FLIP PROTOCOL on this test"
-        );
+    /// Build an `AtomicCard` for a `ControlsCommander` static-ability test with
+    /// its real MTGJSON keyword array, so the tests exercise the production
+    /// MTGJSON→face path (shaped like `tiered_atomic_card`).
+    fn commander_condition_atomic_card(case: &CommanderConditionCase) -> AtomicCard {
+        AtomicCard {
+            name: case.name.to_string(),
+            mana_cost: Some("{1}{G}".to_string()),
+            colors: vec!["G".to_string()],
+            color_identity: vec!["G".to_string()],
+            power: case.power.map(|p| p.to_string()),
+            toughness: case.toughness.map(|t| t.to_string()),
+            loyalty: None,
+            defense: None,
+            text: Some(case.oracle.to_string()),
+            layout: "normal".to_string(),
+            type_line: Some(case.type_line.to_string()),
+            types: case.types.iter().map(|t| (*t).to_string()).collect(),
+            subtypes: case.subtypes.iter().map(|t| (*t).to_string()).collect(),
+            supertypes: vec![],
+            keywords: if case.keywords.is_empty() {
+                None
+            } else {
+                // allow-raw-authority: fixture copies MTGJSON keyword text, not game-object state.
+                Some(case.keywords.iter().map(|k| (*k).to_string()).collect())
+            },
+            side: None,
+            face_name: None,
+            mana_value: 2.0,
+            legalities: Default::default(),
+            leadership_skills: None,
+            printings: Vec::new(),
+            rulings: Vec::new(),
+            is_game_changer: false,
+            identifiers: AtomicIdentifiers {
+                scryfall_oracle_id: Some(format!("{}-oracle", case.name.to_lowercase())),
+                scryfall_id: Some(format!("{}-face", case.name.to_lowercase())),
+            },
+            foreign_data: Vec::new(),
+            related_cards: crate::database::mtgjson::SetRelatedCards::default(),
+        }
+    }
 
-        let parsed = crate::parser::parse_oracle_text(
-            "Trample\nLieutenant — As long as you control your commander, this creature gets \
-             +2/+2 and other creatures you control get +2/+2 and have trample.",
-            "Thunderfoot Baloth",
-            &[],
-            &["Creature".to_string()],
-            &["Beast".to_string()],
-        );
-        // Reach-guard: the fixture only exercises the misparse if the parser
-        // really produced the OWNER-scoped commander gate.
-        let commander_statics: Vec<_> = parsed
-            .statics
-            .iter()
-            .filter(|s| {
-                matches!(
+    /// One row of the `controls_commander_statics_report_supported` table.
+    struct CommanderConditionCase<'a> {
+        name: &'a str,
+        type_line: &'a str,
+        types: &'a [&'a str],
+        subtypes: &'a [&'a str],
+        keywords: &'a [&'a str],
+        power: Option<&'a str>,
+        toughness: Option<&'a str>,
+        oracle: &'a str,
+    }
+
+    /// CR 903.3: Own-scoped statics gated on `StaticCondition::ControlsCommander`
+    /// carry no resolver gap in `analyze_coverage`.
+    #[test]
+    fn controls_commander_statics_report_supported() {
+        let cases: &[CommanderConditionCase] = &[
+            CommanderConditionCase {
+                name: "Stormsurge Kraken",
+                type_line: "Creature — Kraken",
+                types: &["Creature"],
+                subtypes: &["Kraken"],
+                keywords: &["Hexproof", "Lieutenant"],
+                power: Some("5"),
+                toughness: Some("5"),
+                oracle: "Hexproof\nLieutenant — As long as you control your commander, this \
+                 creature gets +2/+2 and has \"Whenever this creature becomes blocked, you may \
+                 draw two cards.\"",
+            },
+            CommanderConditionCase {
+                name: "Angelic Field Marshal",
+                type_line: "Creature — Angel",
+                types: &["Creature"],
+                subtypes: &["Angel"],
+                keywords: &["Flying", "Lieutenant"],
+                power: Some("3"),
+                toughness: Some("3"),
+                oracle: "Flying\nLieutenant — As long as you control your commander, this \
+                 creature gets +2/+2 and creatures you control have vigilance.",
+            },
+            CommanderConditionCase {
+                name: "Demon of Wailing Agonies",
+                type_line: "Creature — Demon",
+                types: &["Creature"],
+                subtypes: &["Demon"],
+                keywords: &["Flying", "Lieutenant"],
+                power: Some("4"),
+                toughness: Some("4"),
+                oracle: "Flying\nLieutenant — As long as you control your commander, this \
+                 creature gets +2/+2 and has \"Whenever this creature deals combat damage to a \
+                 player, that player sacrifices a creature of their choice.\"",
+            },
+            CommanderConditionCase {
+                name: "Tyrant's Familiar",
+                type_line: "Creature — Dragon",
+                types: &["Creature"],
+                subtypes: &["Dragon"],
+                keywords: &["Flying", "Haste", "Lieutenant"],
+                power: Some("5"),
+                toughness: Some("5"),
+                oracle: "Flying, haste\nLieutenant — As long as you control your commander, \
+                 this creature gets +2/+2 and has \"Whenever this creature attacks, it deals 7 \
+                 damage to target creature defending player controls.\"",
+            },
+            CommanderConditionCase {
+                name: "Skyhunter Strike Force",
+                type_line: "Creature — Cat Knight",
+                types: &["Creature"],
+                subtypes: &["Cat", "Knight"],
+                keywords: &["Flying", "Lieutenant", "Melee"],
+                power: Some("2"),
+                toughness: Some("2"),
+                oracle: "Flying\nMelee (Whenever this creature attacks, it gets +1/+1 until \
+                 end of turn for each opponent you attacked this combat.)\nLieutenant — As \
+                 long as you control your commander, other creatures you control have melee.",
+            },
+            CommanderConditionCase {
+                name: "Thunderfoot Baloth",
+                type_line: "Creature — Beast",
+                types: &["Creature"],
+                subtypes: &["Beast"],
+                keywords: &["Lieutenant", "Trample"],
+                power: Some("5"),
+                toughness: Some("5"),
+                oracle: "Trample\nLieutenant — As long as you control your commander, this \
+                 creature gets +2/+2 and other creatures you control get +2/+2 and have \
+                 trample.",
+            },
+            CommanderConditionCase {
+                name: "Convergence of Dominion",
+                type_line: "Artifact",
+                types: &["Artifact"],
+                subtypes: &[],
+                keywords: &["Dynastic Command Node", "Mill", "Translocation Protocols"],
+                power: None,
+                toughness: None,
+                oracle: "Dynastic Command Node — As long as you control your commander, \
+                 activated abilities of cards in your graveyard cost {2} less to activate. \
+                 This effect can't reduce the mana in that ability's activation cost to less \
+                 than one mana.\nTranslocation Protocols — {3}, {T}: Mill three cards.",
+            },
+        ];
+
+        for case in cases {
+            let card = commander_condition_atomic_card(case);
+            let name = case.name;
+            let face = build_oracle_face(&card, None);
+            // Reach-guard: the fixture only counts if the parser really produced
+            // an Own-scoped ControlsCommander static.
+            assert!(
+                face.static_abilities.iter().any(|s| matches!(
                     &s.condition,
                     Some(StaticCondition::ControlsCommander {
                         ownership: CommanderOwnership::Own
                     })
-                )
-            })
-            .collect();
-        assert!(
-            !commander_statics.is_empty(),
-            "the Lieutenant line must parse to an Own-scoped ControlsCommander static: {:#?}",
-            parsed.statics
-        );
-        assert!(
-            commander_statics
-                .iter()
-                .all(|s| matches!(s.affected, Some(TargetFilter::SelfRef))),
-            "MISPARSE STILL PRESENT (expected): the \"other creatures you control\" clause \
-             is dropped and the whole Lieutenant grant lands on SelfRef. When this goes \
-             red the parser was fixed — flip `static_condition_feature` to Handled and \
-             delete this test. Got {commander_statics:#?}"
-        );
+                )),
+                "{name} must parse a static gated on ControlsCommander{{Own}}: {:#?}",
+                face.static_abilities
+            );
+            let result = coverage_result_for_face(face);
+            assert!(
+                result.gap_details.is_empty(),
+                "{name} must carry no resolver gap: {:?}",
+                result.gap_details
+            );
+        }
     }
 
     /// CR 903.3 vs CR 903.3d: the parse-details label is what bug triage reads,
@@ -16174,6 +16423,195 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
             .expect("Sentry coverage thread starts")
             .join()
             .expect("Sentry coverage thread completes");
+    }
+
+    fn graveyard_permission(
+        frequency: crate::types::statics::CastFrequency,
+        required_cast_keyword: Option<crate::types::keywords::KeywordKind>,
+    ) -> StaticDefinition {
+        StaticDefinition::new(StaticMode::GraveyardCastPermission {
+            frequency,
+            play_mode: crate::types::ability::CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            extra_cost: None,
+            enters_with_counter: None,
+            required_cast_keyword,
+        })
+        .affected(TargetFilter::Typed(
+            crate::types::ability::TypedFilter::creature(),
+        ))
+    }
+
+    /// Two once-per-turn graveyard permissions printed on one face share the
+    /// source's per-turn slot, which the runtime can't charge separately: the
+    /// face is unsupported with the named reason. One bounded permission, or
+    /// two unlimited ones, is not.
+    #[test]
+    fn two_bounded_graveyard_permissions_on_one_face_are_a_named_gap() {
+        use crate::types::keywords::KeywordKind;
+        use crate::types::statics::CastFrequency;
+        let shared = SHARED_SOURCE_GRAVEYARD_SLOT_GAP.to_string();
+        let mut face = make_face();
+        face.static_abilities.push(graveyard_permission(
+            CastFrequency::OncePerTurn,
+            Some(KeywordKind::Blitz),
+        ));
+        assert!(
+            !card_face_gaps(&face).contains(&shared),
+            "one bounded grant"
+        );
+        face.static_abilities
+            .push(graveyard_permission(CastFrequency::OncePerTurn, None));
+        assert!(card_face_gaps(&face).contains(&shared));
+        assert!(!coverage_result_for_face(face).supported);
+
+        let mut unlimited = make_face();
+        for _ in 0..2 {
+            unlimited
+                .static_abilities
+                .push(graveyard_permission(CastFrequency::Unlimited, None));
+        }
+        assert!(!card_face_gaps(&unlimited).contains(&shared));
+    }
+
+    /// A graveyard permission whose extra cost replaces the mana cost can't be
+    /// paid by the graveyard route: the face is unsupported with that reason.
+    #[test]
+    fn an_alternative_cost_graveyard_permission_is_a_named_gap() {
+        use crate::types::statics::CastFrequency;
+        let mut definition = graveyard_permission(CastFrequency::Unlimited, None);
+        if let StaticMode::GraveyardCastPermission { extra_cost, .. } = &mut definition.mode {
+            *extra_cost = Some(crate::types::statics::CastExtraCost {
+                cost: crate::types::ability::AbilityCost::PayLife {
+                    amount: crate::types::ability::QuantityExpr::Fixed { value: 2 },
+                },
+                mode: crate::types::statics::CastCostMode::Alternative,
+            });
+        }
+        let mut face = make_face();
+        face.static_abilities.push(definition);
+        assert!(card_face_gaps(&face).contains(&GRAVEYARD_ALTERNATIVE_COST_GAP.to_string()));
+    }
+
+    /// A graveyard permission whose extra cost is a choice can't be paid by the
+    /// graveyard route: the face is unsupported with that reason.
+    #[test]
+    fn a_choice_cost_graveyard_permission_is_a_named_gap() {
+        use crate::types::ability::{AbilityCost, QuantityExpr};
+        use crate::types::statics::CastFrequency;
+        let mut definition = graveyard_permission(CastFrequency::Unlimited, None);
+        if let StaticMode::GraveyardCastPermission { extra_cost, .. } = &mut definition.mode {
+            *extra_cost = Some(crate::types::statics::CastExtraCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![AbilityCost::OneOf {
+                        costs: vec![
+                            AbilityCost::PayLife {
+                                amount: QuantityExpr::Fixed { value: 2 },
+                            },
+                            AbilityCost::Mana {
+                                cost: crate::types::mana::ManaCost::generic(2),
+                            },
+                        ],
+                    }],
+                },
+                mode: crate::types::statics::CastCostMode::Additional,
+            });
+        }
+        let mut face = make_face();
+        face.static_abilities.push(definition);
+        assert!(card_face_gaps(&face).contains(&GRAVEYARD_CHOICE_COST_GAP.to_string()));
+    }
+
+    /// A face whose continuous static GRANTS a graveyard permission with an
+    /// extra cost the graveyard route can't pay (a choice of costs; one that
+    /// replaces the mana cost) is marked like a face that prints one.
+    #[test]
+    fn granting_an_unpayable_extra_cost_graveyard_permission_is_a_named_gap() {
+        use crate::types::ability::{AbilityCost, QuantityExpr};
+        use crate::types::statics::{CastCostMode, CastExtraCost, CastFrequency};
+        let life = |value| AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value },
+        };
+        for (cost, mode, label) in [
+            (
+                AbilityCost::OneOf {
+                    costs: vec![life(2), life(3)],
+                },
+                CastCostMode::Additional,
+                GRAVEYARD_CHOICE_COST_GAP,
+            ),
+            (
+                life(2),
+                CastCostMode::Alternative,
+                GRAVEYARD_ALTERNATIVE_COST_GAP,
+            ),
+        ] {
+            let mut permission = graveyard_permission(CastFrequency::Unlimited, None);
+            if let StaticMode::GraveyardCastPermission { extra_cost, .. } = &mut permission.mode {
+                *extra_cost = Some(CastExtraCost { cost, mode });
+            }
+            let grant = StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    crate::types::ability::TypedFilter::creature(),
+                ))
+                .modifications(vec![ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(permission.clone()),
+                }]);
+            // A static that grants it, and a spell whose resolution creates it
+            // (Yawgmoth's Will's shape), each on its own face and both on one
+            // face: the label appears, once.
+            let spell = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GenericEffect {
+                    static_abilities: vec![permission.clone()],
+                    duration: None,
+                    target: None,
+                    end_cost: None,
+                },
+            );
+            let mut granting = make_face();
+            granting.static_abilities.push(grant.clone());
+            let mut resolving = make_face();
+            resolving.abilities.push(spell.clone());
+            let mut both = make_face();
+            both.static_abilities.push(grant);
+            both.abilities.push(spell);
+            for face in [granting, resolving, both] {
+                let gaps = card_face_gaps(&face);
+                assert_eq!(
+                    gaps.iter().filter(|gap| gap.as_str() == label).count(),
+                    1,
+                    "{label}: {gaps:?}"
+                );
+            }
+        }
+    }
+
+    /// A face that GRANTS a bounded graveyard permission to another object can
+    /// stack a second bounded grant onto a source at runtime, so it carries the
+    /// same named gap; granting an unlimited one does not.
+    #[test]
+    fn granting_a_bounded_graveyard_permission_is_a_named_gap() {
+        use crate::types::statics::CastFrequency;
+        let shared = SHARED_SOURCE_GRAVEYARD_SLOT_GAP.to_string();
+        let grant = |frequency| {
+            StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    crate::types::ability::TypedFilter::creature(),
+                ))
+                .modifications(vec![ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(graveyard_permission(frequency, None)),
+                }])
+        };
+        let mut face = make_face();
+        face.static_abilities
+            .push(grant(CastFrequency::OncePerTurn));
+        assert!(card_face_gaps(&face).contains(&shared));
+        let mut unlimited = make_face();
+        unlimited
+            .static_abilities
+            .push(grant(CastFrequency::Unlimited));
+        assert!(!card_face_gaps(&unlimited).contains(&shared));
     }
 
     #[test]
@@ -19960,7 +20398,11 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
     /// intentionally NOT asserted here so a future stub does not silently pass.
     #[test]
     fn source_state_static_conditions_are_marked_handled() {
-        let conditions: [(StaticCondition, &str); 6] = [
+        let conditions: [(StaticCondition, &str); 7] = [
+            (
+                StaticCondition::SourceAttackingAlone,
+                "SourceAttackingAlone",
+            ),
             (StaticCondition::SourceIsEquipped, "SourceIsEquipped"),
             (StaticCondition::SourceIsEnchanted, "SourceIsEnchanted"),
             (StaticCondition::SourceIsMonstrous, "SourceIsMonstrous"),

@@ -311,6 +311,10 @@
     "eligibleCount": "{{count}} válidas",
     "attackingCount": "atq {{count}}",
     "selectedCount": "sel {{count}}",
+    "directBlockTargetCount": "alvos de bloqueio {{count}}",
+    "blockingWith": "Bloqueando com {{name}}",
+    "blockedBy": "Bloqueado por {{names}}",
+    "unblocked": "Não bloqueado",
     "pickAll": "Todas",
     "pickNone": "Nenhuma",
     "underAttack_one": "Atacado por {{count}} criatura",
@@ -768,6 +772,8 @@
     "mustAttackSatisfiedBadge": "Attacking ✓",
     "mustBlockBadge": "Must block",
     "mustBlockExactBadge": "Deve bloquear {{attacker}}",
+    "mustBeBlockedBadge": "Deve ser bloqueado",
+    "bandBadge": "Bando {{n}}",
     "mustBlockSatisfiedBadge": "Blocking ✓",
     "cantAttackBadge": "Can't attack",
     "cantBlockBadge": "Can't block",
@@ -802,6 +808,7 @@
     "titleTargets": "Alvos: {{targets}}",
     "titlePaid": "Pago: {{paid}}",
     "titleContext": "Contexto: {{context}}",
+    "revealedCards": "Revelada: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} de mana",
     "paidColorsSpent": "{{count}} cores",
@@ -1341,6 +1348,8 @@
     },
     "config": {
       "startingLife": "Vida Inicial",
+      "experimentalDungeons": "Masmorras experimentais",
+      "experimentalDungeonsHelp": "Oferecer Baldur's Gate Wilderness nas opções de masmorra e ao tomar a iniciativa. Experimental e não oficial.",
       "players": "Jogadores",
       "whoGoesFirst": "Quem Começa",
       "firstPlayer": {
@@ -1376,6 +1385,7 @@
       "target": "Alvo",
       "return": "Devolver",
       "discard": "Descartar",
+      "reveal": "Revelar",
       "evidence": "Evidência",
       "manifest": "Manifestar",
       "untap": "Desvirar",
@@ -1426,7 +1436,16 @@
       "subtitleUpTo_other": "Selecione até {{count}} cartas para colocar {{destination}}",
       "destinationTop": "no topo de seu grimório",
       "destinationBattlefield": "no campo de batalha",
-      "destinationHand": "em sua mão"
+      "destinationHand": "em sua mão",
+      "titleSplit": "Dividir as Cartas Restantes",
+      "subtitleSplit_one": "Organize as cartas: {{count}} vai para o topo de seu grimório; as outras {{remaining}} vão para o fundo",
+      "subtitleSplit_other": "Organize as cartas: {{count}} vão para o topo de seu grimório; as outras {{remaining}} vão para o fundo",
+      "badgeTop": "Topo {{order}}",
+      "badgeBottom": "Fundo",
+      "hintSplit": "Arraste para reordenar · as verdes vão para o topo (a primeira no topo), as cinzas para o fundo",
+      "moveEarlier": "Mover {{card}} para antes",
+      "moveLater": "Mover {{card}} para depois",
+      "hintSplitOrderOnly": "Arraste ou use as setas para reordenar dentro de cada pilha · outro jogador escolheu quais cartas vão para o topo"
     },
     "surveil": {
       "title": "Vigiar",
@@ -1943,6 +1962,8 @@
     "additionalExile": "+ Exile uma carta",
     "additionalSacrifice": "+ Sacrifique um permanente",
     "additionalPayLife": "+ Pague vida",
+    "additionalPayLifeAmount": "+ Pague {{amount}} de vida",
+    "additionalCollectEvidence": "+ Coletar evidências {{amount}}",
     "additionalDiscard": "+ Descarte uma carta",
     "additionalTapCreatures": "+ Vire criaturas",
     "additionalGeneric": "+ {{type}}"
@@ -2070,6 +2091,7 @@
     "variantForetell": "Conjurar de Prever",
     "variantOverload": "Conjurar com Sobrecarregar",
     "variantBestow": "Conjurar com Conceder",
+    "variantBlitz": "Conjurar com Blitz",
     "variantFreerunning": "Conjurar com Freerunning",
     "variantFuse": "Conjurar com Fusão",
     "variantMutate": "Conjurar com Mutate",
@@ -2079,7 +2101,14 @@
     "variantMoreThanMeetsTheEye": "Cast Converted",
     "variantPrototype": "Conjurar com Protótipo",
     "variantFaceDown": "Conjurar Virada para Baixo",
-    "variantFallback": "Conjurar com {{type}}"
+    "variantFallback": "Conjurar com {{type}}",
+    "viaSource": "via {{name}}",
+    "extraCostAdditional": "+ {{cost}}",
+    "extraCostAlternative": "em vez de seu custo de mana: {{cost}}",
+    "entersWithCounter": "entra com um marcador de {{counter}}",
+    "slotPerType": "usa o espaço de {{type}}",
+    "slotChooseType": "escolha um tipo de permanente",
+    "slotOncePerTurn": "uma vez neste turno"
   },
   "categoryChoice": {
     "title": "Escolher Permanentes para Manter",
@@ -2247,6 +2276,12 @@
     "dontAskAgain": "Não perguntar novamente neste jogo",
     "dontAskAgainForSameCard": "Usar esta escolha para cada cópia desta carta neste jogo"
   },
+  "keywordDetail": {
+    "selfManaCost": "seu custo de mana",
+    "selfManaValue": "seu valor de mana",
+    "manaCostReduced": "seu custo de mana reduzido em {{reduction}}",
+    "spliceOnto": "em {{subtype}} {{cost}}"
+  },
   "resolutionOptionalPayment": {
     "title": "Escolha um pagamento opcional",
     "pay": "Pagar {{cost}}",
@@ -2264,7 +2299,8 @@
       "zoneExile": "o exílio",
       "zoneHand": "sua mão",
       "discard": "Descarte {{count}} {{cards}}",
-      "exile": "Exile {{count}} {{cards}} de {{zone}}"
+      "exile": "Exile {{count}} {{cards}} de {{zone}}",
+      "reveal": "Revele {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {

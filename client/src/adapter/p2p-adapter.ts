@@ -16,6 +16,7 @@ import type {
   PersistedGameState,
   RestoredGameStateResult,
   SubmitResult,
+  ViewerSnapshot,
   WaitingFor,
 } from "./types";
 import type {
@@ -559,6 +560,17 @@ function isDeckListPlayerShape(x: unknown): x is DeckListPayload["player"] {
  */
 type GameRunState = "running" | "paused-disconnect" | "paused-manual" | "terminal";
 
+interface BrowserTransition {
+  result: SubmitResult;
+  generation: number;
+}
+
+interface ProjectedBrowserTransition {
+  snapshot: ViewerSnapshot;
+  events: GameEvent[];
+  fresh: boolean;
+}
+
 /** Default grace window for guest auto-reconnect, in milliseconds. */
 const DEFAULT_GRACE_PERIOD_MS = 30_000;
 
@@ -720,6 +732,7 @@ function defaultSeatState(playerCount: number, formatConfig?: FormatConfig): Sea
       default_deck_copy_limit: { type: "UpTo", data: 4 },
       uses_commander: false,
       allow_debug_actions: false,
+      allow_experimental_dungeons: false,
     },
     gameStarted: false,
   };
@@ -924,10 +937,14 @@ export class P2PHostAdapter implements EngineAdapter {
    * from already-eliminated guests without a WASM round-trip.
    */
   private eliminatedSeats = new Set<PlayerId>();
+  // Temporary admission fence, never persisted as gameplay elimination.
+  private concedingSeats = new Set<PlayerId>();
   private gameRunState: GameRunState = "running";
   /** Monotonic authority revision for WASM hosts; native hosts replace this
    * with the local phase-server's revision before fan-out. */
   private authoritativeRevision = 0;
+  /** Browser-only fence for pairing an accepted transition with its projection. */
+  private browserMutationGeneration = 0;
   /**
    * How far along each guest seat is, on two different signals — because the
    * two failure directions are not symmetric:
@@ -1438,6 +1455,47 @@ export class P2PHostAdapter implements EngineAdapter {
     return result;
   }
 
+  /**
+   * Single authority for stamping ordinary browser-host gameplay mutations.
+   * The operation is awaited first, so rejected/stale/error calls never move
+   * the browser-only coherence fence.
+   */
+  private async applyBrowserMutation(
+    operation: () => Promise<SubmitResult>,
+  ): Promise<BrowserTransition> {
+    const browserMutation = this.nativeBridge === null;
+    return this.stampBrowserMutation(await operation(), browserMutation);
+  }
+
+  /** Stamp a successful browser-WASM gameplay mutation after the engine accepts it. */
+  private stampBrowserMutation(
+    result: SubmitResult,
+    browserMutation = this.nativeBridge === null,
+  ): BrowserTransition {
+    if (browserMutation) this.browserMutationGeneration += 1;
+    return { result, generation: this.browserMutationGeneration };
+  }
+
+  /**
+   * Project one accepted transition for one recipient. If another browser
+   * mutation overtakes the projection, send a current state-only snapshot so
+   * stale events and logs cannot be paired with newer state.
+   */
+  private async projectTransitionForViewer(
+    viewer: PlayerId,
+    events: GameEvent[],
+    expectedGeneration: number,
+  ): Promise<ProjectedBrowserTransition> {
+    if (expectedGeneration !== this.browserMutationGeneration) {
+      return { snapshot: await this.wasm.getViewerSnapshot(viewer), events: [], fresh: false };
+    }
+    const transition = await this.wasm.getViewerTransitionSnapshot(viewer, events);
+    if (expectedGeneration === this.browserMutationGeneration) {
+      return { snapshot: transition, events: transition.events, fresh: true };
+    }
+    return { snapshot: await this.wasm.getViewerSnapshot(viewer), events: [], fresh: false };
+  }
+
   private rejectSuperseded(session: PeerSession): void {
     void session.send({ type: "reconnect_rejected", reason: "Host session superseded" });
     session.close("Host session superseded");
@@ -1664,9 +1722,9 @@ export class P2PHostAdapter implements EngineAdapter {
         throw actionRejectionError(outcome.rejection);
       }
       staleRetries = 0;
-      const result = outcome.result;
-      await this.publishHostSnapshot(result);
-      await this.broadcastStateUpdate(result.events, result.log_entries);
+      const transition = this.stampBrowserMutation(outcome.result);
+      await this.publishHostSnapshot(transition.result);
+      await this.broadcastStateUpdate(transition);
       void this.persistAuthoritativeState();
     }
   }
@@ -2250,18 +2308,18 @@ export class P2PHostAdapter implements EngineAdapter {
       // would leave a window for a local `initializeGame` to land in between
       // and destroy the hosted game (or be destroyed by it). A refusal arrives
       // as `AdapterErrorCode.ENGINE_OCCUPIED`.
-      let result: SubmitResult;
+      let transition: BrowserTransition;
       const owner = createHostSessionOwner();
       this.wasmHostOwner = owner;
       try {
-        result = await this.wasm.initializeMultiplayerHostGame(
+        transition = await this.applyBrowserMutation(() => this.wasm.initializeMultiplayerHostGame(
           deckPayload,
           this.formatConfig,
           playerCount,
           this.matchConfig,
           undefined,
           owner,
-        );
+        ));
       } catch (err) {
         // Nothing to compensate. The engine claims itself only on a successful
         // install, so a rejection — an occupied-engine refusal, a deck error,
@@ -2308,34 +2366,33 @@ export class P2PHostAdapter implements EngineAdapter {
 
       const revision = ++this.authoritativeRevision;
       let setupFailure: unknown = null;
-      for (const [pid, session] of this.guestSessions) {
-        const token = this.playerTokens.get(pid)!;
-        try {
-          const snapshot = await this.wasm.getViewerSnapshot(pid);
-          void this.send(session, {
-            type: "game_setup",
-            wireProtocolVersion: WIRE_PROTOCOL_VERSION,
-            assignedPlayerId: pid,
-            playerToken: token,
-            revision,
-            state: snapshot.state,
-            events: result.events,
-            playerNames: allNames,
-            ...legalActionsToWire(snapshot),
-          }).then((accepted) => {
+      await this.enqueueDelivery(async () => {
+        for (const [pid, session] of this.guestSessions) {
+          const token = this.playerTokens.get(pid)!;
+          try {
+            const projected = await this.projectTransitionForViewer(
+              pid,
+              transition.result.events,
+              transition.generation,
+            );
+            const accepted = await this.send(session, {
+              type: "game_setup",
+              wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+              assignedPlayerId: pid,
+              playerToken: token,
+              revision,
+              state: projected.snapshot.state,
+              events: projected.events,
+              playerNames: allNames,
+              ...legalActionsToWire(projected.snapshot),
+            });
             if (accepted) this.seedGuestEntry(pid, revision);
-          });
-        } catch (err) {
-          // Isolate per seat. Unisolated, one rejected read left every LATER
-          // seat without its setup frame — and those seats are then stuck for
-          // good: no `game_setup` means no entry to seed, so the sweep skips
-          // them by design, and a second start returns early because
-          // `gameStarted` is already true. The seat whose own read failed
-          // still belongs to the setup/reconnect path, not to the sweep.
-          console.error(`[P2PHost] game_setup for seat ${pid} failed:`, err);
-          setupFailure ??= err;
+          } catch (err) {
+            console.error(`[P2PHost] game_setup for seat ${pid} failed:`, err);
+            setupFailure ??= err;
+          }
         }
-      }
+      });
       // Isolation buys the LATER seats their frame; it must not also buy
       // silence. Before it, the throw reached the host. A seat that never got
       // `game_setup` waits on a promise that never settles (the guest's
@@ -2344,7 +2401,7 @@ export class P2PHostAdapter implements EngineAdapter {
       if (setupFailure !== null) throw setupFailure;
 
       await this.runAiLoop();
-      return result;
+      return transition.result;
   }
 
   async submitAction(action: GameAction, actor: PlayerId): Promise<SubmitResult> {
@@ -2356,6 +2413,9 @@ export class P2PHostAdapter implements EngineAdapter {
     if (!this.ownsAuthority()) {
       throw new AdapterError("P2P_ERROR", "Host session superseded", true);
     }
+    if (this.concedingSeats.has(actor)) {
+      throw new AdapterError("P2P_PAUSED", "Player departure is in progress", true);
+    }
     if (this.gameRunState !== "running") {
       throw new AdapterError(
         "P2P_PAUSED",
@@ -2363,14 +2423,14 @@ export class P2PHostAdapter implements EngineAdapter {
         true,
       );
     }
-    const result = this.nativeBridge
-      ? await this.nativeBridge.submitAction(action, actor)
-      : await this.wasm.submitAction(action, actor);
-    if (isZeroCountDebugCreate(action)) return result;
-    await this.broadcastStateUpdate(result.events, result.log_entries);
+    const transition = await this.applyBrowserMutation(() => this.nativeBridge
+      ? this.nativeBridge.submitAction(action, actor)
+      : this.wasm.submitAction(action, actor));
+    if (isZeroCountDebugCreate(action)) return transition.result;
+    await this.broadcastStateUpdate(transition);
     await this.runAiLoop();
     void this.persistAuthoritativeState();
-    return result;
+    return transition.result;
   }
 
   async submitInteraction(
@@ -2381,6 +2441,9 @@ export class P2PHostAdapter implements EngineAdapter {
     if (!this.ownsAuthority()) {
       throw new AdapterError("P2P_ERROR", "Host session superseded", true);
     }
+    if (this.concedingSeats.has(actor)) {
+      throw new AdapterError("P2P_PAUSED", "Player departure is in progress", true);
+    }
     if (this.gameRunState !== "running") {
       throw new AdapterError(
         "P2P_PAUSED",
@@ -2388,13 +2451,13 @@ export class P2PHostAdapter implements EngineAdapter {
         true,
       );
     }
-    const result = this.nativeBridge
-      ? await this.nativeBridge.submitInteraction(submission, actor)
-      : await this.wasm.submitInteraction(submission, actor);
-    await this.broadcastStateUpdate(result.events, result.log_entries);
+    const transition = await this.applyBrowserMutation(() => this.nativeBridge
+      ? this.nativeBridge.submitInteraction(submission, actor)
+      : this.wasm.submitInteraction(submission, actor));
+    await this.broadcastStateUpdate(transition);
     await this.runAiLoop();
     void this.persistAuthoritativeState();
-    return result;
+    return transition.result;
   }
 
   async previewManaPayment(action: GameAction, actor: PlayerId): Promise<ObjectId[]> {
@@ -2625,10 +2688,12 @@ export class P2PHostAdapter implements EngineAdapter {
 
   /**
    * Fan out a state update to every connected guest. Each guest gets its own
-   * `ViewerSnapshot` via the engine's combined filter+legal-actions call (one
-   * WASM round-trip per guest instead of two). Only the acting guest gets a
-   * populated `legalActions` map; non-acting guests receive empty legal
-   * actions from the engine-side viewer gate (`legal_actions_for_viewer`).
+   * `ViewerTransitionSnapshot` via the engine's combined filter+legal-actions
+   * call (one WASM round-trip per guest instead of two). If the transition was
+   * overtaken, the helper deliberately falls back to a current state-only
+   * `ViewerSnapshot`. Only the acting guest gets a populated `legalActions` map;
+   * non-acting guests receive empty legal actions from the engine-side viewer
+   * gate (`legal_actions_for_viewer`).
    * Skips disconnected seats (their state is delivered via `reconnect_ack`).
    *
    * Delivery contract (#7924): only the recipient's own `state_ack` advances
@@ -2638,16 +2703,14 @@ export class P2PHostAdapter implements EngineAdapter {
    * failure aborts neither the other seats nor the terminal close.
    */
   private async broadcastStateUpdate(
-    events: GameEvent[],
-    logEntries?: GameLogEntry[],
+    transition: BrowserTransition,
     terminalReason?: string,
   ): Promise<void> {
-    return this.enqueueDelivery(() => this.broadcastStateUpdateInner(events, logEntries, terminalReason));
+    return this.enqueueDelivery(() => this.broadcastStateUpdateInner(transition, terminalReason));
   }
 
   private async broadcastStateUpdateInner(
-    events: GameEvent[],
-    logEntries?: GameLogEntry[],
+    transition: BrowserTransition,
     terminalReason?: string,
   ): Promise<void> {
     if (!this.ownsAuthority()) return;
@@ -2657,14 +2720,18 @@ export class P2PHostAdapter implements EngineAdapter {
     for (const [pid, session] of this.guestSessions) {
       if (this.disconnectedSeats.has(pid)) continue;
       try {
-        const snapshot = await this.wasm.getViewerSnapshot(pid);
+        const projected = await this.projectTransitionForViewer(
+          pid,
+          transition.result.events,
+          transition.generation,
+        );
         sends.push(this.send(session, {
           type: "state_update",
           revision,
-          state: snapshot.state,
-          events,
-          logEntries,
-          ...legalActionsToWire(snapshot),
+          state: projected.snapshot.state,
+          events: projected.events,
+          logEntries: projected.fresh ? transition.result.log_entries : undefined,
+          ...legalActionsToWire(projected.snapshot),
         }));
       } catch (err) {
         console.error(`[P2PHost] viewer snapshot for seat ${pid} failed; the redelivery sweep resyncs it:`, err);
@@ -2963,7 +3030,8 @@ export class P2PHostAdapter implements EngineAdapter {
     }
     const outcome = await this.wasm.submitAiActionProposal(proposal);
     if (outcome.status === "applied") {
-      await this.broadcastStateUpdate(outcome.result.events, outcome.result.log_entries);
+      const transition = this.stampBrowserMutation(outcome.result);
+      await this.broadcastStateUpdate(transition);
       await this.runAiLoop();
       void this.persistAuthoritativeState();
     }
@@ -2984,7 +3052,8 @@ export class P2PHostAdapter implements EngineAdapter {
 
   async sendConcede(): Promise<void> {
     if (!this.ownsAuthority()) return;
-    await this.concedePlayer(0, "Host conceded", "conceded");
+    const outcome = await this.concedePlayer(0, "Host conceded", "conceded");
+    if (outcome !== "committed" && outcome !== "unknown") return;
     for (const [, s] of this.guestSessions) {
       void this.send(s, { type: "player_conceded", playerId: 0, reason: "Host conceded" });
     }
@@ -3028,6 +3097,7 @@ export class P2PHostAdapter implements EngineAdapter {
       if (timer !== null) clearTimeout(timer);
     }
     this.disconnectedSeats.clear();
+    this.concedingSeats.clear();
     for (const session of this.pendingReconnectSessions.values()) {
       session.close();
     }
@@ -3155,6 +3225,10 @@ export class P2PHostAdapter implements EngineAdapter {
       if (session) this.rejectSuperseded(session);
       return;
     }
+    if (this.concedingSeats.has(pid) && (msg.type === "action" || msg.type === "interaction")) {
+      void this.send(sourceSession, { type: "action_failed", message: "Player departure is in progress" });
+      return;
+    }
     switch (msg.type) {
       case "action": {
         // Verify sender identity to prevent guest 2 spoofing as guest 3.
@@ -3194,7 +3268,7 @@ export class P2PHostAdapter implements EngineAdapter {
           }
           return;
         }
-        let result: SubmitResult;
+        let transition: BrowserTransition;
         try {
           // CRITICAL: pass `pid` (the session-bound PlayerId), NEVER
           // `msg.senderPlayerId`. The envelope check above already guarantees
@@ -3202,9 +3276,9 @@ export class P2PHostAdapter implements EngineAdapter {
           // tag with the authenticated session identity — the wire payload
           // is untrusted. This is the defense-in-depth that makes the engine
           // guard meaningful for P2P.
-          result = this.nativeBridge
-            ? await this.nativeBridge.submitAction(msg.action, pid)
-            : await this.wasm.submitAction(msg.action, pid);
+          transition = await this.applyBrowserMutation(() => this.nativeBridge
+            ? this.nativeBridge.submitAction(msg.action, pid)
+            : this.wasm.submitAction(msg.action, pid));
         } catch (err) {
           // The engine refused the action: nothing applied, so this — and only
           // this — is an action failure the guest must hear about.
@@ -3223,8 +3297,8 @@ export class P2PHostAdapter implements EngineAdapter {
             break;
           }
           // Host screen first, then the guests (see `publishHostSnapshot`).
-          await this.publishHostSnapshot(result);
-          await this.broadcastStateUpdate(result.events, result.log_entries);
+          await this.publishHostSnapshot(transition.result);
+          await this.broadcastStateUpdate(transition);
           // Wake the AI loop. After a guest's action lands, priority may have
           // shifted to an AI seat — without this, the AI never gets a turn
           // and the game stalls (same pattern as concedePlayer/host submit).
@@ -3250,19 +3324,19 @@ export class P2PHostAdapter implements EngineAdapter {
           });
           return;
         }
-        let result: SubmitResult;
+        let transition: BrowserTransition;
         try {
-          result = this.nativeBridge
-            ? await this.nativeBridge.submitInteraction(msg.submission, pid)
-            : await this.wasm.submitInteraction(msg.submission, pid);
+          transition = await this.applyBrowserMutation(() => this.nativeBridge
+            ? this.nativeBridge.submitInteraction(msg.submission, pid)
+            : this.wasm.submitInteraction(msg.submission, pid));
         } catch (err) {
           void this.send(session, actionFailureFrame(err));
           break;
         }
         // Applied — same delivery contract as the "action" case above (#7924).
         try {
-          await this.publishHostSnapshot(result);
-          await this.broadcastStateUpdate(result.events, result.log_entries);
+          await this.publishHostSnapshot(transition.result);
+          await this.broadcastStateUpdate(transition);
           await this.runAiLoop();
           void this.persistAuthoritativeState();
         } catch (err) {
@@ -3347,7 +3421,8 @@ export class P2PHostAdapter implements EngineAdapter {
       case "concede": {
         // CR 104.3a: Any player may concede at any time. Route through the
         // engine action so the seat is properly eliminated (CR 800.4a).
-        await this.concedePlayer(pid, "Player conceded", "conceded");
+        const outcome = await this.concedePlayer(pid, "Player conceded", "conceded");
+        if (outcome !== "committed" && outcome !== "unknown") break;
         // Notify remaining guests with the "conceded" wire variant (not
         // "kicked") so their log entries read correctly.
         for (const [otherPid, s] of this.guestSessions) {
@@ -3507,6 +3582,12 @@ export class P2PHostAdapter implements EngineAdapter {
       return;
     }
 
+    if (this.concedingSeats.has(pid)) {
+      // A normal close permits retry with the same token after non-commit.
+      session.close("Player departure is in progress");
+      return;
+    }
+
     if (this.pendingReconnectSessions.has(pid)) {
       void this.send(session, { type: "reconnect_rejected", reason: "Reconnect already in progress" });
       session.close("Reconnect already in progress");
@@ -3546,8 +3627,8 @@ export class P2PHostAdapter implements EngineAdapter {
         this.failPendingReconnect(pid, session, "Reconnect acknowledgement could not be delivered");
         return;
       }
-      this.seedGuestEntry(pid, handoff.revision);
       if (this.pendingReconnectSessions.get(pid) !== session || !this.ownsAuthority()) return;
+      this.seedGuestEntry(pid, handoff.revision);
 
       if (this.deliveredNativeAiDriverFault !== null) {
         const faultDelivered = await this.send(session, {
@@ -3668,27 +3749,33 @@ export class P2PHostAdapter implements EngineAdapter {
     pid: PlayerId,
     reason: string,
     origin: "kick" | "conceded",
-  ): Promise<void> {
-    if (!this.ownsAuthority()) return;
-    // Cancel any active grace timer for this seat. `timer` may be null if the
-    // host already called `holdForReconnect`.
-    const grace = this.disconnectedSeats.get(pid);
-    if (grace) {
-      if (grace.timer !== null) clearTimeout(grace.timer);
-      this.disconnectedSeats.delete(pid);
-    }
-    this.closePendingReconnect(pid, "Player conceded");
-    // Remove the session for self-concede / grace-expiry paths. (The kick
-    // path removes its own session before calling concedePlayer so it can
-    // send the `kick` wire message first; double-deletion is a no-op here.)
-    const session = this.guestSessions.get(pid);
-    if (session) {
-      this.guestSessions.delete(pid);
-      try { session.close("Player conceded"); } catch { /* best-effort */ }
-    }
-    this.eliminatedSeats.add(pid);
-    this.saveSession();
+  ): Promise<"committed" | "definite_non_commit" | "unknown" | "in_progress" | "inactive"> {
+    if (this.disposed || !this.ownsAuthority()) return "inactive";
+    if (this.concedingSeats.has(pid)) return "in_progress";
+    this.concedingSeats.add(pid);
+    const retire = () => {
+      // Cancel any active grace timer for this seat. `timer` may be null if the
+      // host already called `holdForReconnect`.
+      const grace = this.disconnectedSeats.get(pid);
+      if (grace) {
+        if (grace.timer !== null) clearTimeout(grace.timer);
+        this.disconnectedSeats.delete(pid);
+      }
+      this.closePendingReconnect(pid, "Player conceded");
+      // Remove the session for self-concede / grace-expiry paths. (The kick
+      // path removes its own session before calling concedePlayer so it can
+      // send the `kick` wire message first; double-deletion is a no-op here.)
+      const session = this.guestSessions.get(pid);
+      if (session) {
+        this.guestSessions.delete(pid);
+        try { session.close("Player conceded"); } catch { /* best-effort */ }
+      }
+      this.eliminatedSeats.add(pid);
+      this.saveSession();
+    };
+    let committed = false;
     try {
+      this.closePendingReconnect(pid, "Player departure is in progress");
       const concedeAction = {
         type: "Concede",
         data: { player_id: pid },
@@ -3696,26 +3783,48 @@ export class P2PHostAdapter implements EngineAdapter {
       // Concede's engine guard requires `actor === player_id`. `pid` is both
       // the seat being conceded and the authenticated identity we're acting
       // on behalf of (e.g. grace-expiry or kick).
-      const result = this.nativeBridge
-        ? await this.nativeBridge.submitAction(concedeAction, pid)
-        : await this.wasm.submitAction(concedeAction, pid);
+      const transition = await this.applyBrowserMutation(() => this.nativeBridge
+        ? this.nativeBridge.submitAction(concedeAction, pid)
+        : this.wasm.submitAction(concedeAction, pid));
+      if (this.disposed || !this.ownsAuthority()) return "inactive";
+      committed = true;
+      retire();
       // Both host emissions precede the fan-out: the concession has applied,
       // and a guest link failure must not hide it from the host's own screen
       // (#7924). Order between them is unchanged — state, then the notice.
-      await this.publishHostSnapshot(result);
+      await this.publishHostSnapshot(transition.result);
       this.emit(
         origin === "kick"
           ? { type: "playerKicked", playerId: pid, reason }
           : { type: "playerConceded", playerId: pid, reason },
       );
-      await this.broadcastStateUpdate(result.events, result.log_entries, reason);
+      await this.broadcastStateUpdate(transition, reason);
       await this.runAiLoop();
       void this.persistAuthoritativeState();
     } catch (err) {
+      if (this.disposed || !this.ownsAuthority()) return "inactive";
       console.error("[P2PHost] concedePlayer failed:", err);
+      if (!committed) {
+        if (
+          err instanceof AdapterError
+          && (
+            err.code === AdapterErrorCode.ACTION_NOT_SENT
+            || isActionRejection(err.rejection)
+          )
+        ) {
+          this.resumeIfUnblocked();
+          return "definite_non_commit";
+        }
+        // Preserve the pre-existing retirement policy for an unknown result;
+        // this slice cannot reconcile whether a sent Action committed.
+        retire();
+      }
+    } finally {
+      this.concedingSeats.delete(pid);
     }
     // A concession may clear the final outstanding reconnect reservation.
     this.resumeIfUnblocked();
+    return committed ? "committed" : "unknown";
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -3728,6 +3837,7 @@ export class P2PHostAdapter implements EngineAdapter {
    */
   async kickPlayer(pid: PlayerId, reason: string = "Kicked by host"): Promise<void> {
     if (!this.ownsAuthority()) return;
+    if (this.concedingSeats.has(pid)) return;
     const token = this.playerTokens.get(pid);
     if (token) this.kickedTokens.add(token);
     this.closePendingReconnect(pid, "Kicked");
@@ -3744,7 +3854,8 @@ export class P2PHostAdapter implements EngineAdapter {
       try { session.close("Kicked"); } catch { /* best-effort */ }
       this.guestSessions.delete(pid);
     }
-    await this.concedePlayer(pid, reason, "kick");
+    const outcome = await this.concedePlayer(pid, reason, "kick");
+    if (outcome !== "committed" && outcome !== "unknown") return;
     // Broadcast kick to remaining guests (concedePlayer emits playerKicked
     // locally; remaining peers need the wire message).
     for (const [otherPid, s] of this.guestSessions) {
@@ -3760,7 +3871,8 @@ export class P2PHostAdapter implements EngineAdapter {
   async concedeDisconnected(pid: PlayerId): Promise<void> {
     if (!this.ownsAuthority()) return;
     const reason = "Host continued without reconnecting player";
-    await this.concedePlayer(pid, reason, "conceded");
+    const outcome = await this.concedePlayer(pid, reason, "conceded");
+    if (outcome !== "committed" && outcome !== "unknown") return;
     for (const [otherPid, s] of this.guestSessions) {
       if (otherPid === pid) continue;
       void this.send(s, { type: "player_conceded", playerId: pid, reason });

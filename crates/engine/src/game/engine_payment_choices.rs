@@ -163,6 +163,7 @@ fn handle_optional_effect_choice_inner(
                 trigger_event: pending_event,
                 trigger_events: pending_events,
                 trigger_match_count: pending_count,
+                return_result_occurrence,
             } = frame;
             let choice = if accept {
                 AutoMayChoice::Accept
@@ -187,8 +188,16 @@ fn handle_optional_effect_choice_inner(
             // resolution would have observed.
             let previous_trigger_match_count = state.current_trigger_match_count;
             state.current_trigger_match_count = pending_count;
+            // CR 608.2c: this choice resumes the same resolving instruction,
+            // including its named-result frame. A nested resolution may have
+            // its own selector; restore that exact prior value afterwards.
+            let previous_return_occurrence = std::mem::replace(
+                &mut state.active_return_result_occurrence,
+                return_result_occurrence,
+            );
             let result =
                 effects::resolve_optional_effect_decision(state, *ability, choice, events, 1);
+            state.active_return_result_occurrence = previous_return_occurrence;
             state.current_trigger_event = previous_trigger_event;
             state.current_trigger_events = previous_trigger_events;
             state.current_trigger_match_count = previous_trigger_match_count;
@@ -1286,6 +1295,14 @@ pub(super) fn handle_unless_payment(
                 // the effect happens.
                 if (hand_cards.len() as u32) < count {
                     payment_failed = true;
+                } else if count == 0 {
+                    // Deliberately class-wide for every Discard unless-cost: a
+                    // resolved count of zero (a whole-hand discard with an empty
+                    // hand, per the Perplex 2005-10-01 ruling) needs no resource
+                    // to discard (cf. CR 118.3), so the cost is
+                    // paid with nothing to discard. Falls through to the paid
+                    // path; prompting `WardDiscardChoice` with no cards would
+                    // soft-lock the payer.
                 } else if selection.is_random() {
                     // CR 701.9b: a RANDOM discard offers the payer no choice —
                     // the game picks. Pay it inline through the shared
@@ -2910,6 +2927,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OpponentMayChoice {
             player: PlayerId(0),
@@ -3000,6 +3018,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
@@ -3033,6 +3052,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
@@ -3072,6 +3092,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
@@ -3108,6 +3129,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
@@ -3142,6 +3164,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
@@ -3175,6 +3198,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
@@ -3208,6 +3232,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),

@@ -4,7 +4,7 @@ use crate::game::combat::AttackTarget;
 use crate::game::planechase::PlanarDieFace;
 use crate::types::ability::{AbilityTag, TargetRef};
 use crate::types::events::{GameEvent, PlayerActionKind};
-use crate::types::game_state::{GameState, ZoneChangeRecord};
+use crate::types::game_state::{GameState, StackObjectClass, ZoneChangeRecord};
 use crate::types::identifiers::ObjectId;
 use crate::types::log::{
     GameLogEntry, LogBoundary, LogCategory, LogImportance, LogPresentation, LogSegment, LogTone,
@@ -48,6 +48,7 @@ pub fn resolve_log_entries(
                 && !is_concealed_move(events, index, &batch, after))
             .then(|| {
                 let mut segments = format_segments(event, after);
+                name_ability_entries_by_source(&mut segments, before, after);
                 name_at_event_time(&mut segments, &batch, index + 1);
                 (!segments.is_empty()).then(|| GameLogEntry {
                     seq: 0, // Assigned by frontend
@@ -402,6 +403,7 @@ fn importance(event: &GameEvent) -> LogImportance {
         | GameEvent::CounterRemoved { .. }
         | GameEvent::ControllerChanged { .. }
         | GameEvent::Transformed { .. }
+        | GameEvent::Melded { .. }
         | GameEvent::Flipped { .. }
         | GameEvent::TurnedFaceUp { .. }
         | GameEvent::TurnedFaceDown { .. }
@@ -491,6 +493,7 @@ fn importance(event: &GameEvent) -> LogImportance {
         | GameEvent::CityBlessingGained { .. }
         | GameEvent::EnduringStoryGained { .. }
         | GameEvent::DieRolled { .. }
+        | GameEvent::DieRollIgnored { .. }
         | GameEvent::StartingPlayerContest { .. }
         | GameEvent::CoinFlipped { .. }
         | GameEvent::RingTemptsYou { .. }
@@ -565,6 +568,7 @@ fn tone(event: &GameEvent) -> LogTone {
         | GameEvent::SpeedChanged { .. }
         | GameEvent::ArmyAmassed { .. }
         | GameEvent::DieRolled { .. }
+        | GameEvent::DieRollIgnored { .. }
         | GameEvent::CoinFlipped { .. }
         | GameEvent::RingTemptsYou { .. }
         | GameEvent::Firebend { .. }
@@ -631,6 +635,7 @@ fn tone(event: &GameEvent) -> LogTone {
         | GameEvent::Saddled { .. }
         | GameEvent::ReplacementApplied { .. }
         | GameEvent::Transformed { .. }
+        | GameEvent::Melded { .. }
         | GameEvent::Flipped { .. }
         | GameEvent::Specialized { .. }
         | GameEvent::DayNightChanged { .. }
@@ -737,6 +742,26 @@ fn should_exclude_event(event: &GameEvent) -> bool {
     }
 }
 
+/// CR 113.7: a segment citing an activated or triggered ability's stack entry
+/// cites that ability's source instead. Read from `before`, because a
+/// countered ability has already left `after`'s stack.
+fn name_ability_entries_by_source(
+    segments: &mut [LogSegment],
+    before: &GameState,
+    after: &GameState,
+) {
+    for segment in segments {
+        let LogSegment::CardName { object_id, .. } = segment else {
+            continue;
+        };
+        if let Some(entry) = before.stack.iter().find(|entry| {
+            entry.id == *object_id && matches!(entry.kind.class(), StackObjectClass::Ability(_))
+        }) {
+            *segment = card_seg(after, entry.source_id);
+        }
+    }
+}
+
 /// Resolve an object's display name from state, falling back to LKI cache.
 fn resolve_object_name(state: &GameState, id: ObjectId) -> String {
     if let Some(obj) = state.objects.get(&id) {
@@ -762,6 +787,18 @@ fn card_seg(state: &GameState, id: ObjectId) -> LogSegment {
     LogSegment::CardName {
         name: resolve_object_name(state, id),
         object_id: id,
+    }
+}
+
+/// A card segment naming the object's printed card rather than its live
+/// characteristics, for events where the two differ (a melded permanent).
+fn printed_card_seg(state: &GameState, id: ObjectId) -> LogSegment {
+    match state.objects.get(&id) {
+        Some(obj) if !obj.base_name.is_empty() => LogSegment::CardName {
+            name: obj.base_name.clone(),
+            object_id: id,
+        },
+        _ => card_seg(state, id),
     }
 }
 
@@ -947,6 +984,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::CounterRemoved { .. }
         | GameEvent::ControllerChanged { .. }
         | GameEvent::Transformed { .. }
+        | GameEvent::Melded { .. }
         // CR 710.4: flipping is an object-status change, grouped with transform
         // and face up/down.
         | GameEvent::Flipped { .. }
@@ -998,6 +1036,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::CityBlessingGained { .. }
         | GameEvent::EnduringStoryGained { .. }
         | GameEvent::DieRolled { .. }
+        | GameEvent::DieRollIgnored { .. }
         | GameEvent::CoinFlipped { .. }
         | GameEvent::RingTemptsYou { .. }
         | GameEvent::CreatureExploited { .. }
@@ -1650,6 +1689,20 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             vec![card_seg(state, *object_id), text(" transforms")]
         }
 
+        // CR 701.42a: name both physical cards by their printed fronts — the
+        // melded permanent's live name is already the combined back face's.
+        GameEvent::Melded {
+            object_id,
+            partner_id,
+            ..
+        } => vec![
+            printed_card_seg(state, *object_id),
+            text(" and "),
+            card_seg(state, *partner_id),
+            text(" meld into "),
+            card_seg(state, *object_id),
+        ],
+
         // CR 710.4: the log names the permanent by its (now alternative,
         // CR 710.1b) characteristics, which `card_seg` reads live.
         GameEvent::Flipped { object_id } => {
@@ -1870,6 +1923,21 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             // CR 901.9d / CR 706.7: the symbolic planar die has no numeric face.
             None => vec![player_seg(state, *player_id), text(" rolls the planar die")],
         },
+
+        // CR 706.6: the ignored roll's natural value, for display only. The
+        // ignored roll never happened rules-wise; this line narrates what the
+        // lowest roll was so the replacement is visible.
+        GameEvent::DieRollIgnored {
+            player_id,
+            sides,
+            result,
+        } => vec![
+            player_seg(state, *player_id),
+            text(" ignores the lowest d"),
+            num(*sides as i32),
+            text(" roll: "),
+            num(*result as i32),
+        ],
 
         GameEvent::CoinFlipped { player_id, won } => vec![
             player_seg(state, *player_id),
@@ -2249,6 +2317,7 @@ mod tests {
         start_game, start_game_skip_mulligan, start_game_with_starting_player,
     };
     use crate::game::zones::create_object;
+    use crate::types::game_state::StackEntryKind;
     use crate::types::identifiers::CardId;
 
     /// CR 701.17a + CR 701.17c: the paired `ZoneChanged` names the milled card, so the
@@ -2662,6 +2731,153 @@ mod tests {
             excess: 0,
         };
         assert_eq!(categorize(&event), LogCategory::Combat);
+    }
+
+    /// A segment citing an ability's stack entry that was on the stack when the
+    /// batch began names the ability's source.
+    #[test]
+    fn stack_ability_segments_name_the_ability_source() {
+        use crate::types::ability::{Effect, ResolvedAbility};
+        use crate::types::game_state::StackEntry;
+        let mut after = GameState::new_two_player(42);
+        let pinger = create_object(
+            &mut after,
+            CardId(1),
+            PlayerId(0),
+            "Pinger".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let countered_by = create_object(
+            &mut after,
+            CardId(2),
+            PlayerId(1),
+            "Stifle".to_string(),
+            crate::types::zones::Zone::Graveyard,
+        );
+        let entry = ObjectId(after.next_object_id);
+        after.next_object_id += 1;
+        let mut before = after.clone();
+        before.stack.push_back(StackEntry {
+            id: entry,
+            source_id: pinger,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: pinger,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    pinger,
+                    PlayerId(0),
+                )),
+            },
+        });
+        let events = [
+            GameEvent::BecomesTarget {
+                target: TargetRef::Object(entry),
+                source_id: countered_by,
+                source_controller: PlayerId(1),
+            },
+            GameEvent::SpellCountered {
+                object_id: entry,
+                countered_by,
+                countered_by_controller: PlayerId(1),
+            },
+        ];
+        let entries = resolve_log_entries(&events, &before, &after);
+        let cards: Vec<Vec<(&str, ObjectId)>> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .segments
+                    .iter()
+                    .filter_map(|segment| match segment {
+                        LogSegment::CardName { name, object_id } => {
+                            Some((name.as_str(), *object_id))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            cards,
+            vec![
+                vec![("Pinger", pinger), ("Stifle", countered_by)],
+                vec![("Stifle", countered_by), ("Pinger", pinger)],
+            ]
+        );
+    }
+
+    /// Only an ability's entry is renamed to its source: an entry that is
+    /// neither a spell nor an ability keeps the id the segment cites.
+    #[test]
+    fn combat_damage_entry_segment_is_not_renamed_to_a_source() {
+        use crate::types::ability::{Effect, ResolvedAbility};
+        use crate::types::game_state::{CombatDamageSubStep, StackEntry};
+        let mut state = GameState::new_two_player(42);
+        let pinger = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pinger".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let attacker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Attacker".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let ability_entry = ObjectId(state.next_object_id);
+        let damage_entry = ObjectId(state.next_object_id + 1);
+        state.next_object_id += 2;
+        state.stack.push_back(StackEntry {
+            id: ability_entry,
+            source_id: pinger,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: pinger,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    pinger,
+                    PlayerId(0),
+                )),
+            },
+        });
+        state.stack.push_back(StackEntry {
+            id: damage_entry,
+            source_id: attacker,
+            controller: PlayerId(0),
+            kind: StackEntryKind::CombatDamage {
+                sub_step: CombatDamageSubStep::Regular,
+                assignments: vec![],
+            },
+        });
+        let mut segments = [
+            LogSegment::CardName {
+                name: "ability entry".to_string(),
+                object_id: ability_entry,
+            },
+            LogSegment::CardName {
+                name: "damage entry".to_string(),
+                object_id: damage_entry,
+            },
+        ];
+        name_ability_entries_by_source(&mut segments, &state, &state);
+        assert!(
+            matches!(&segments[0], LogSegment::CardName { name, object_id }
+                if name == "Pinger" && *object_id == pinger),
+            "the ability entry names its source: {:?}",
+            segments[0]
+        );
+        assert!(
+            matches!(&segments[1], LogSegment::CardName { name, object_id }
+                if name == "damage entry" && *object_id == damage_entry),
+            "the combat-damage entry is left as cited: {:?}",
+            segments[1]
+        );
     }
 
     #[test]

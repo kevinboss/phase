@@ -48,8 +48,9 @@ fn is_zero_u32(value: &u32) -> bool {
 /// one: the day a printed Affinity-shaped or one-shot reduction carries a shard,
 /// the entry needs a name that is not a fabricated `ObjectId`. Every other
 /// variant is constructed: `Static`, `Defiler` and `CastingPermission` by the
-/// spell election, `Static`, `AbilityCostRider` and `TransientEffect` by the
-/// activation election.
+/// spell election, `SacrificedForCost` by an Emerge or Offering sacrifice
+/// chosen before a deferred target declaration, and `Static`,
+/// `AbilityCostRider` and `TransientEffect` by the activation election.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ReductionProvenance {
@@ -88,6 +89,11 @@ pub enum ReductionProvenance {
     /// `effect` is the installing `TransientContinuousEffect::id`; `ordinal`
     /// is the reducer's index among that effect's `AddStaticMode` reducers.
     TransientEffect { effect: u64, ordinal: u8 },
+    /// CR 601.2f + CR 702.119a + CR 702.48c: the reduction an Emerge or
+    /// Offering cost earns from the permanent sacrificed to pay it, recorded
+    /// when that cost is taken before the spell's deferred target declaration
+    /// so the total is locked with it exactly once.
+    SacrificedForCost(crate::types::game_state::SpellCostSource),
 }
 
 /// CR 601.2b + CR 601.2f: everything the caster elects at the cost-determination
@@ -262,7 +268,44 @@ pub struct ActivationCostSnapshot {
     /// then duration-scoped continuous effects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reductions: Vec<CostReductionEntry>,
+    /// Which `PendingCast` field holds the activation's unpaid mana while the
+    /// lock waits for committed targets.
+    #[serde(default, skip_serializing_if = "ManaCarrier::is_whole")]
+    pub mana_carrier: ManaCarrier,
+    /// Set only while an `Open` carrier awaits the caster's CR 601.2f election
+    /// at target settlement: the continuation its lock resumes into. An
+    /// announcement election leaves it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_tail: Option<SettledTail>,
     pub lock: ActivationCostLock,
+}
+
+/// Which `PendingCast` field holds an activation's mana obligation while its
+/// cost lock waits for committed targets (CR 601.2c + CR 602.2b).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ManaCarrier {
+    /// `activation_cost` holds the whole cost and `pending.cost` is `NoCost`.
+    #[default]
+    Whole,
+    /// `pending.cost` holds the concretized mana leg and `activation_cost` holds
+    /// only the non-mana residual (the `{X}` and hoisted-mana-leg paths).
+    Split,
+}
+
+impl ManaCarrier {
+    pub fn is_whole(&self) -> bool {
+        matches!(self, Self::Whole)
+    }
+}
+
+/// The continuation a target-settlement cost lock resumes into once the
+/// caster answers its CR 601.2f election.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SettledTail {
+    /// Surface the next unpaid interactive cost, else go to the payment boundary.
+    SurfaceThenBoundary,
+    /// Go straight to the payment boundary.
+    Boundary,
 }
 
 /// CR 601.2f: whether an activation's total cost has been "locked in".
@@ -306,4 +349,10 @@ pub enum ActivationCostLockPoint {
     /// is determined, so its reductions (and their floors, which count the
     /// cost's mana) are folded and locked once X is chosen.
     XAnnounced,
+    /// CR 601.2c + CR 602.2b: target settlement. An activation whose cost may
+    /// depend on its targets (Professor Hojo, Kopala) locks once they are
+    /// committed. Where it continues depends on the settling route, so an
+    /// election prompt raised here records that in the snapshot's
+    /// `settlement_tail`.
+    TargetSettlement,
 }

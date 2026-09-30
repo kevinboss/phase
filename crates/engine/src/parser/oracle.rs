@@ -2,7 +2,7 @@ use std::{borrow::Cow, ops::ControlFlow};
 
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_until, take_while};
+use nom::bytes::complete::{tag, take_till, take_until, take_while};
 use nom::character::complete::multispace0;
 use nom::combinator::{all_consuming, map, opt, value};
 use nom::sequence::{preceded, terminated};
@@ -67,6 +67,7 @@ use super::oracle_condition::parse_restriction_condition;
 use super::oracle_cost::{parse_oracle_cost, parse_single_cost, try_parse_cost_reduction};
 use super::oracle_dispatch::{dispatch_line_nom, NomDispatchIr};
 use super::oracle_effect::gap_diagnosis;
+use super::oracle_effect::imperative::PREVENT_DEALT_BY_TARGET_GAP;
 use super::oracle_effect::sequence::try_parse_same_is_true_continuation;
 use super::oracle_effect::{
     ability_chain_grants_chosen_color_keyword, lower_ability_ir, parse_ability_ir_standalone,
@@ -109,11 +110,12 @@ use super::oracle_modal::{
     strip_flavor_word_with_name, AnchorModeIr, OracleBlockIr, FLAVOR_WORD_COST_LABEL_MAX_WORDS,
 };
 use super::oracle_replacement::{
-    find_copy_verb_present, lower_as_enters_becomes_choice_modal,
+    find_copy_verb_present, is_as_self_enters_frame, lower_as_enters_becomes_choice_modal,
     lower_as_enters_or_face_up_counters, lower_replacement_ir,
-    parse_bidirectional_damage_prevention, parse_oneshot_damage_replacement,
-    parse_replacement_line, parse_replacement_line_ir, parse_whenever_you_cast_enters_with_outcome,
-    parse_windowed_graveyard_redirect_install, CastEntersWithOutcome,
+    parse_as_enters_one_shot_replacement, parse_bidirectional_damage_prevention,
+    parse_oneshot_damage_replacement, parse_replacement_line, parse_replacement_line_ir,
+    parse_whenever_you_cast_enters_with_outcome, parse_windowed_graveyard_redirect_install,
+    CastEntersWithOutcome,
 };
 use super::oracle_saga::{is_saga_chapter, parse_saga_chapters};
 use super::oracle_spacecraft::parse_spacecraft_threshold_lines;
@@ -514,6 +516,26 @@ fn try_parse_mulligan_time_ability(line: &str, lower: &str) -> Option<AbilityIr>
     ir.shell.optional = true;
     ir.shell.description = Some(line.to_string());
     Some(ir)
+}
+
+/// CR 614.1c + CR 603.6d: emit the "As ~ enters, <one-shot>" replacement for
+/// `line` when the gated arm accepts it. Shared by the two routing sites (the
+/// Priority-7 static-shaped reroute and the post-Priority-8 last resort).
+fn emit_as_enters_one_shot(
+    emitter: &mut DocEmitter<'_>,
+    item_line: usize,
+    line: &str,
+    card_name: &str,
+) -> bool {
+    let Some(definition) = parse_as_enters_one_shot_replacement(line, card_name) else {
+        return false;
+    };
+    emitter.emit_at(
+        item_line,
+        OracleNodeIr::Replacement(ReplacementIr::from_definition(line, definition)),
+        OuterRoute::Replacement,
+    );
+    true
 }
 
 fn try_parse_opening_hand_reveal_delayed_trigger(
@@ -2311,9 +2333,19 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
     );
 
     if head_is_refused_land_play {
+        // CR 601.3 + CR 611.2a: rebuild the grant only when the printed sentence
+        // ENDS at its graveyard anchor. A trailing gate the lowering dropped
+        // ("… from your graveyard as long as you control a Zombie") would
+        // otherwise become an ungated grant. Keep the refused fragment (an
+        // honest Unimplemented) instead.
+        let sentence_is_fully_modelled = def
+            .description
+            .as_deref()
+            .is_some_and(coordinated_permission_sentence_ends_at_anchor);
         let recovered = def
             .sub_ability
             .as_deref()
+            .filter(|_| sentence_is_fully_modelled)
             .and_then(|sub| match &*sub.effect {
                 Effect::CastFromZone {
                     target, duration, ..
@@ -2409,6 +2441,24 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
     }
 }
 
+/// CR 601.3 + CR 611.2a: true when the sentence carrying the coordinated
+/// permission's graveyard anchor ends there, i.e. the text between
+/// " from your graveyard" and the next sentence boundary is empty. Any gate
+/// after the anchor ("as long as …", "if …", "unless …") was not lowered into
+/// the recovered grant, so a remainder means the grant must not be synthesized.
+/// A missing anchor fails closed too.
+fn coordinated_permission_sentence_ends_at_anchor(description: &str) -> bool {
+    let lower = description.to_lowercase();
+    parse_graveyard_anchor_sentence_tail(&lower).is_ok_and(|(_, tail)| tail.trim().is_empty())
+}
+
+/// The text after the first " from your graveyard" up to the next `.`.
+fn parse_graveyard_anchor_sentence_tail(input: &str) -> OracleResult<'_, &str> {
+    let (rest, _) = take_until(" from your graveyard").parse(input)?;
+    let (rest, _) = tag(" from your graveyard").parse(rest)?;
+    take_till(|c: char| c == '.').parse(rest)
+}
+
 /// CR 116.2a + CR 601.2a: build the two-part permission from the cast half of the
 /// sentence -- the land axis and the card axis under ONE grant, because the
 /// printed sentence is one permission naming two actions.
@@ -2465,6 +2515,7 @@ fn coordinated_graveyard_permission(cast_target: &TargetFilter) -> Option<Static
             graveyard_destination_replacement: None,
             extra_cost: None,
             enters_with_counter: None,
+            required_cast_keyword: None,
         })
         // CR 611.2c: class-wide and re-evaluated live, so cards that reach the
         // graveyard later this turn are covered.
@@ -6748,6 +6799,19 @@ fn parse_normalized_oracle_ir(
                     i += 1;
                     continue;
                 }
+            } else if is_as_self_enters_frame(&lower) {
+                // CR 614.1c + CR 603.6d: "As ~ enters, <one-shot>" is a
+                // replacement effect. Static-shaped frame lines — Tibalt's quoted
+                // "you may spend mana as though" — would otherwise be claimed by
+                // the static parser. This site runs before Priority 8, so it also
+                // sees static-shaped frame lines that a Priority-8 arm claims
+                // (Thief of Blood, Arsenal Thresher). The gate declines those, and
+                // on `None` the line falls through to the static parser and then
+                // to Priority 8, exactly as before.
+                if emit_as_enters_one_shot(&mut emitter, item_line, &line, card_name) {
+                    i += 1;
+                    continue;
+                }
             }
             // Guard: ability-word-prefixed trigger lines (e.g., "Flurry — Whenever...")
             // handled above at Priority 6b. The check below is kept as a defensive
@@ -6965,7 +7029,13 @@ fn parse_normalized_oracle_ir(
             // again in `ability_ir_at` repeats one computation rather than
             // performing two different ones.
             let ir = parse_ability_ir_with_context(&line, AbilityKind::Spell, &mut ctx);
-            if !has_unimplemented(&lower_ability_ir(&ir)) {
+            let lowered = lower_ability_ir(&ir);
+            // A "dealt by target <source>" prevention that cannot lower faithfully
+            // stays on this route as its gap: falling through would let Priority 8
+            // read it as a blanket, card-wide prevention replacement.
+            let is_dealt_by_target_gap =
+                any_unimplemented(&lowered, &|name| name == PREVENT_DEALT_BY_TARGET_GAP);
+            if !has_unimplemented(&lowered) || is_dealt_by_target_gap {
                 emitter.ability_ir_at(item_line, ir);
                 i += 1;
                 continue;
@@ -7162,6 +7232,16 @@ fn parse_normalized_oracle_ir(
                 i += 1;
                 continue;
             }
+        }
+
+        // CR 614.1c: replacement-tier last resort for "As ~ enters, <one-shot>"
+        // frame lines no earlier route claimed; runs after Priority 8 so every
+        // specific as-enters arm keeps its lines.
+        if is_as_self_enters_frame(&lower)
+            && emit_as_enters_one_shot(&mut emitter, item_line, &line, card_name)
+        {
+            i += 1;
+            continue;
         }
 
         if let Some(def) = try_parse_opening_hand_reveal_delayed_trigger(&line, &lower) {
@@ -9057,6 +9137,7 @@ fn parse_oracle_pipeline(
     render_granting_self_descriptions(&mut parsed, card_name);
     demote_unbound_delayed_sweeps(&mut parsed);
     demote_unenforceable_replacement_lifetimes(&mut parsed);
+    demote_unsupported_composite_counter_choice_costs(&mut parsed);
     #[cfg(debug_assertions)]
     crate::parser::oracle_effect::debug_assert_exile_top_opponent_sentinel_lifted(
         &parsed, card_name,
@@ -9171,6 +9252,45 @@ fn demote_unenforceable_replacement_lifetimes(parsed: &mut ParsedAbilities) {
     }
     for replacement in &mut parsed.replacements {
         demote_lifetimes_in_replacement(replacement);
+    }
+}
+
+/// CR 118.3 + CR 601.2h: an activated ability whose cost mixes an `Any`-type
+/// chosen-count `RemoveCounter` leaf with a typed (`OfType`) chosen-count
+/// leaf has no sound reservation model at runtime —
+/// `mana_abilities::advance_mana_ability_activation` refuses to activate it
+/// outright, rather than risk either wrongly refusing a legal payment or
+/// silently misallocating counters a later leaf needed. See
+/// `types::ability::chosen_count_remove_counter_leaves_mix_any_with_typed`'s
+/// doc comment for the full bin-packing rationale; it is the single shared
+/// authority both this parser demotion and that runtime refusal call, so the
+/// two layers can never disagree about which shape is unsupported.
+///
+/// Demoting the ability's EFFECT to `Effect::unimplemented` here — rather
+/// than leaving the ordinarily-parsed effect in place — keeps the parser and
+/// the coverage report honest: this specific composite-cost shape must not
+/// present as an ordinary supported mana ability when the runtime
+/// deliberately refuses to activate it. Only the top-level cost is checked:
+/// `AbilityCost::RemoveCounter` is a leaf/activation-cost shape, never nested
+/// inside a sub-ability's own effect chain the way `AbilityCost::EffectCost`
+/// can carry one (see `demote_lifetimes_in_cost` above), so `def.sub_ability`
+/// / `def.mode_abilities` need no parallel walk here.
+///
+/// The gap key is a stable snake_case pattern-class key (CLAUDE.md), distinct
+/// from every previously-supported handler so the resulting coverage flip
+/// lands in `coverage-regression-check.sh`'s non-fatal "coverage honesty"
+/// bucket.
+fn demote_unsupported_composite_counter_choice_costs(parsed: &mut ParsedAbilities) {
+    for def in &mut parsed.abilities {
+        let Some(cost) = def.cost.as_ref() else {
+            continue;
+        };
+        if crate::types::ability::chosen_count_remove_counter_leaves_mix_any_with_typed(cost) {
+            let fragment = def.description.clone().unwrap_or_default();
+            // Replace in place rather than reallocating the Box (clippy::replace_box).
+            *def.effect =
+                Effect::unimplemented("counter_choice_cost_mixes_any_with_typed", &fragment);
+        }
     }
 }
 
@@ -11987,7 +12107,14 @@ pub(super) fn lower_unsupported_node(
 /// and wildcard-free, a newly added definition-carrying `Effect` variant is now
 /// a compile error there rather than a silent miss here.
 pub(super) fn has_unimplemented(def: &AbilityDefinition) -> bool {
-    if matches!(*def.effect, Effect::Unimplemented { .. }) {
+    any_unimplemented(def, &|_| true)
+}
+
+/// True when any `Effect::Unimplemented` reachable from `def` (root, nested
+/// definitions, `sub_ability`, `else_ability`) has a gap `name` accepted by
+/// `matches_name`. `has_unimplemented` is the accept-everything instance.
+fn any_unimplemented(def: &AbilityDefinition, matches_name: &dyn Fn(&str) -> bool) -> bool {
+    if matches!(&*def.effect, Effect::Unimplemented { name, .. } if matches_name(name)) {
         return true;
     }
     // `||` rather than `|=`: once a nested failure is found the remaining
@@ -11995,11 +12122,18 @@ pub(super) fn has_unimplemented(def: &AbilityDefinition) -> bool {
     // walk the `.any()`/`||` chain it replaced was.
     let mut nested_has_unimplemented = false;
     def.effect.for_each_nested_definition(&mut |_, nested| {
-        nested_has_unimplemented = nested_has_unimplemented || has_unimplemented(nested);
+        nested_has_unimplemented =
+            nested_has_unimplemented || any_unimplemented(nested, matches_name);
     });
     nested_has_unimplemented
-        || def.sub_ability.as_deref().is_some_and(has_unimplemented)
-        || def.else_ability.as_deref().is_some_and(has_unimplemented)
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(|d| any_unimplemented(d, matches_name))
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(|d| any_unimplemented(d, matches_name))
 }
 
 /// Parse an activated-ability effect chain with self-reference fallback.

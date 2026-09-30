@@ -10,11 +10,12 @@ use crate::types::events::GameEvent;
 #[cfg(test)]
 use crate::types::game_state::MayTriggerOrigin;
 use crate::types::game_state::{
-    AutoMayChoice, CastOfferKind, CastingVariant, ExileLink, ExileLinkKind, GameState,
-    MayTriggerAutoChoiceKey, PendingCounterPostAction, PendingSpellResolution, StackEntry,
-    StackEntryKind, StackPaidSnapshot, StackResolutionPolicy, TriggerSourceContext, WaitingFor,
+    AutoMayChoice, CastOfferKind, CastingVariant, DepartedStackSpell, ExileLink, ExileLinkKind,
+    GameState, MayTriggerAutoChoiceKey, PendingCounterPostAction, PendingSpellResolution,
+    StackEntry, StackEntryKind, StackPaidSnapshot, StackResolutionPolicy, TriggerSourceContext,
+    WaitingFor,
 };
-use crate::types::identifiers::{ObjectId, TriggerFiring};
+use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TriggerFiring};
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::{
     ResolvedStackEntryFinalizeCommand, ResolvedStackEntryFinalizeReplayInvariantError,
@@ -24,6 +25,7 @@ use crate::types::resolved_commands::{
     ResolvedUncommittedTriggerRemovalReplayInvariantError,
 };
 use crate::types::zones::Zone;
+use std::collections::BTreeMap;
 
 use super::ability_utils::{
     build_target_slots, flatten_specified_targets_in_chain, flatten_targets_in_chain,
@@ -56,6 +58,10 @@ pub(super) fn finish_resolving_stack_entry(
 ) {
     let entry = state.resolving_stack_entry.take();
     let firing = state.resolving_trigger_firing.take();
+    // CR 608.2c: the resolving stack entry owns every nested instruction-result
+    // occurrence, including ones parked across replacement choices.
+    state.return_result_frames.clear();
+    state.active_return_result_occurrence = None;
     debug_assert!(
         firing.is_none()
             || entry
@@ -532,6 +538,11 @@ fn remove_stack_entry_at_unobserved(
             cause,
         })
         .expect("resolved stack removal must have a live journal cause");
+    // CR 701.20a: a triggered ability caused by revealing a card keeps that
+    // card revealed only until it leaves the stack — resolved, countered,
+    // fizzled, or drained. The release is its own journaled information edit,
+    // so replay applies it after this removal without re-deriving it.
+    state.release_stack_bound_reveals(entry.id);
 
     Some(PoppedStackEntry {
         entry,
@@ -539,6 +550,38 @@ fn remove_stack_entry_at_unobserved(
         trigger_event_batch,
         trigger_firing,
     })
+}
+
+/// CR 608.2h + CR 707.2: Record a spell's stack entry and object as it last
+/// existed on the stack, before a non-resolving departure. Only for a spell
+/// entry (`StackEntryKind::Spell`) whose cast finished
+/// (`obj.cast_occurrence` is `Some` —
+/// `casting_costs.rs::stamp_cast_occurrence_on_stack_spell`); a rolled-back
+/// cast was never finalized and has no CR 707.2 choices to remember. Called
+/// from the zone-exit path
+/// (`zones.rs::apply_zone_exit_cleanup`, before the `cast_occurrence` clear
+/// that would make this guard vacuous) and `remove_nonresolving_stack_entry_at`
+/// below — a resolution pop (`pop_top_stack_entry`) calls neither.
+pub(crate) fn record_departed_stack_spell(state: &mut GameState, entry: &StackEntry) {
+    let StackEntryKind::Spell { .. } = &entry.kind else {
+        return;
+    };
+    let Some(obj) = state.objects.get(&entry.id) else {
+        return;
+    };
+    if obj.cast_occurrence.is_none() {
+        return;
+    }
+    let incarnation = obj.incarnation;
+    let record = DepartedStackSpell {
+        entry: entry.clone(),
+        object: Box::new(obj.clone()),
+    };
+    state
+        .departed_stack_spells
+        .entry(entry.id)
+        .or_default()
+        .insert(incarnation, record);
 }
 
 /// Removes a stack entry for a non-resolution reason and observes the exact
@@ -549,6 +592,7 @@ pub(super) fn remove_nonresolving_stack_entry_at(
     disposition: super::lifecycle::DelayedTerminalDisposition,
 ) -> Option<PoppedStackEntry> {
     let popped = remove_stack_entry_at_unobserved(state, index)?;
+    record_departed_stack_spell(state, &popped.entry);
     if let Some(firing) = popped.trigger_firing {
         super::lifecycle::record_delayed_terminal(firing, disposition);
     }
@@ -693,6 +737,11 @@ pub(super) fn pop_uncommitted_pending_trigger_entry(
         .resolved_rules_journal
         .record_uncommitted_trigger_removal(command)
         .expect("resolved uncommitted trigger removal must have a live journal cause");
+    // CR 603.3d + CR 701.20a: only an ability actually removed from the stack
+    // ends its reveal lease; a cursor consumed without a pop leaves nothing.
+    if let Some(removed) = removed.as_ref() {
+        state.release_stack_bound_reveals(removed.entry.id);
+    }
     if let Some(firing) = removed.and_then(|removed| removed.trigger_firing) {
         super::lifecycle::record_delayed_terminal(firing, disposition);
     }
@@ -2144,12 +2193,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                     *enter_tapped = crate::types::proposed_event::EtbTapState::Tapped;
                 }
             }
-            // CR 712.14a + CR 310.12b: If this spell was finalized from an
-            // ExileWithAltCost permission with `cast_transformed`, the permanent
-            // enters the battlefield transformed (resolving to its back face).
-            // The finalized stack-paid snapshot is authoritative here; the
-            // mutable permission list is casting-time authorization, not
-            // resolution-time cast metadata.
+            // CR 712.8c + CR 712.11a + CR 712.13 + CR 310.12b: if this spell was
+            // finalized from an ExileWithAltCost permission with
+            // `cast_transformed`, the permanent enters the battlefield
+            // transformed (resolving to its back face) — a spell cast
+            // transformed has its back face up with only its back face's
+            // characteristics and resolves onto the battlefield with that face
+            // up; the engine keeps the front face up on the stack and swaps to
+            // the back face at entry. The finalized stack-paid snapshot is
+            // authoritative here; the mutable permission list is casting-time
+            // authorization, not resolution-time cast metadata.
             if let Some(obj) = state.objects.get(&entry.id) {
                 // CR 107.3m + CR 707.10: a resolving copied spell has no new
                 // payment snapshot, but inherits the original spell's chosen
@@ -2176,17 +2229,22 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 // the ZoneChange ProposedEvent so Doubling-Season-class
                 // AddCounter replacements (CR 614.1a) see and modify them as
                 // the replacement pipeline runs.
-                // CR 712.14a: For cast_transformed (Craft / ExileWithAltCost) the
-                // spell is on the stack with the front face but enters as the back
-                // face — read loyalty/defense from the back face directly so the
-                // replacement pipeline sees the correct counter count.
+                // CR 712.8c + CR 712.11a + CR 712.13: for cast_transformed (Craft /
+                // ExileWithAltCost / a Siege's victory cast), a spell cast
+                // transformed has its back face up with only its back face's
+                // characteristics and resolves onto the battlefield with that
+                // face up; the engine keeps the front face up on the stack and
+                // swaps to the back face at entry — read loyalty/defense from
+                // the back face directly so the replacement pipeline sees the
+                // correct counter count. Lore is not seeded — the back face's
+                // own CR 714.3a replacement applies through the CR 614.12
+                // projection (`replacement::stage_transformed_entry_projection`).
                 let intrinsic = match (cast_transformed, obj.back_face.as_ref()) {
-                    (true, Some(back)) => super::printed_cards::intrinsic_entry_counters_for_face(
+                    (true, Some(back)) => super::printed_cards::intrinsic_face_entry_counters(
                         back.printed_loyalty,
                         back.loyalty,
                         resolving_spell_x,
                         back.defense,
-                        &back.card_types,
                     ),
                     _ => super::printed_cards::intrinsic_etb_counters(obj, resolving_spell_x),
                 };
@@ -3732,6 +3790,10 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
     let ResolvedAbility {
         effect,
         targets,
+        declares_chosen_group,
+        reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
         source_id: _,
         cast_occurrence,
         source_incarnation,
@@ -3740,6 +3802,8 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        activation_cost_reduction: _,
+        activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller,
@@ -3803,6 +3867,10 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
 
     self_counter
         && targets.is_empty()
+        && declares_chosen_group.is_none()
+        && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
         && cast_occurrence.is_none()
         && source_incarnation.is_none()
         && trigger_source.is_none()
@@ -3963,6 +4031,10 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
     let ResolvedAbility {
         effect,
         targets,
+        declares_chosen_group,
+        reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
         source_id: _,
         cast_occurrence,
         source_incarnation: _,
@@ -3971,6 +4043,8 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        activation_cost_reduction: _,
+        activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
@@ -4033,6 +4107,10 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
 
     fixed_controller_gain_life
         && targets.is_empty()
+        && declares_chosen_group.is_none()
+        && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
         && cast_occurrence.is_none()
         && scoped_player.is_none()
         && matches!(kind, AbilityKind::Spell | AbilityKind::Database)
@@ -4174,6 +4252,10 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
     let ResolvedAbility {
         effect,
         targets,
+        declares_chosen_group,
+        reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
         source_id: _,
         cast_occurrence,
         source_incarnation: _,
@@ -4182,6 +4264,8 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        activation_cost_reduction: _,
+        activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
@@ -4248,6 +4332,10 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
 
     fixed_opponent_effect
         && targets.is_empty()
+        && declares_chosen_group.is_none()
+        && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
         && cast_occurrence.is_none()
         && scoped_player.is_none()
         && matches!(kind, AbilityKind::Spell | AbilityKind::Database)
@@ -4646,6 +4734,10 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
     let ResolvedAbility {
         effect: a_effect,
         targets: a_targets,
+        declares_chosen_group: a_declares_chosen_group,
+        reads_chosen_group: a_reads_chosen_group,
+        declares_return_result: a_declares_return_result,
+        reads_return_result: a_reads_return_result,
         source_id: _,
         cast_occurrence: _,
         source_incarnation: _,
@@ -4715,11 +4807,17 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         mode_abilities: a_mode_abilities,
         parent_target_missing_reason: a_parent_target_missing_reason,
         selected_target_incarnations: a_selected_target_incarnations,
+        activation_cost_reduction: a_activation_cost_reduction,
+        activation_record: a_activation_record,
         illegal_target_slots: a_illegal_target_slots,
     } = a;
     let ResolvedAbility {
         effect: b_effect,
         targets: b_targets,
+        declares_chosen_group: b_declares_chosen_group,
+        reads_chosen_group: b_reads_chosen_group,
+        declares_return_result: b_declares_return_result,
+        reads_return_result: b_reads_return_result,
         source_id: _,
         cast_occurrence: _,
         source_incarnation: _,
@@ -4789,11 +4887,17 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         mode_abilities: b_mode_abilities,
         parent_target_missing_reason: b_parent_target_missing_reason,
         selected_target_incarnations: b_selected_target_incarnations,
+        activation_cost_reduction: b_activation_cost_reduction,
+        activation_record: b_activation_record,
         illegal_target_slots: b_illegal_target_slots,
     } = b;
 
     a_effect == b_effect
         && a_targets == b_targets
+        && a_declares_chosen_group == b_declares_chosen_group
+        && a_reads_chosen_group == b_reads_chosen_group
+        && a_declares_return_result == b_declares_return_result
+        && a_reads_return_result == b_reads_return_result
         && a_force_block_attacker == b_force_block_attacker
         // CR 400.7 + CR 603.7c: two otherwise-identical abilities pinned to
         // DIFFERENT incarnations are not the same ability. Participating here
@@ -4803,6 +4907,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         && a_selected_target_incarnations == b_selected_target_incarnations
         // CR 608.2b: the resolution legality stamp participates for the same
         // reason — agreement with the derived `PartialEq`.
+        && a_activation_cost_reduction == b_activation_cost_reduction
+        && a_activation_record == b_activation_record
         && a_illegal_target_slots == b_illegal_target_slots
         && a_controller == b_controller
         && a_scoped_player == b_scoped_player
@@ -5057,6 +5163,40 @@ pub struct StackDisplayGroup {
 /// adjacent entries preserves the actual resolution order for cases like
 /// stacked triggers from different sources interleaving.
 pub fn stack_display_groups(state: &GameState) -> Vec<StackDisplayGroup> {
+    stack_display_groups_revealing(state, &stack_revealed_card_names(state))
+}
+
+/// CR 701.20a: for each stack entry holding stack-bound reveal leases, the
+/// names of the leased occurrences that are still current (CR 400.7: a lease
+/// on an occurrence that has since changed zones names nothing). This is the
+/// public, unindexed presentation of the lease map; read it from rules state.
+pub(crate) fn stack_revealed_card_names(state: &GameState) -> BTreeMap<ObjectId, Vec<String>> {
+    state
+        .stack_bound_reveals
+        .iter()
+        .filter_map(|(entry, occurrences)| {
+            let names: Vec<String> = occurrences
+                .iter()
+                .filter_map(|occurrence| {
+                    state.objects.get(&occurrence.object_id).and_then(|object| {
+                        (ObjectIncarnationRef::from_object(object) == *occurrence)
+                            .then(|| object.name.clone())
+                    })
+                })
+                .collect();
+            (!names.is_empty()).then_some((*entry, names))
+        })
+        .collect()
+}
+
+/// [`stack_display_groups`] over a viewer projection, with the public reveal
+/// presentation (`revealed`, built from rules state because a projection
+/// carries no lease map) as part of each entry's grouping signature: two
+/// entries that keep different cards revealed are not the same thing twice.
+pub fn stack_display_groups_revealing(
+    state: &GameState,
+    revealed: &BTreeMap<ObjectId, Vec<String>>,
+) -> Vec<StackDisplayGroup> {
     let mut out: Vec<StackDisplayGroup> = Vec::new();
     // Track the previous entry's key alongside the output vector so we can
     // decide "merge or push" in O(1) per entry instead of re-scanning the
@@ -5085,7 +5225,7 @@ pub fn stack_display_groups(state: &GameState) -> Vec<StackDisplayGroup> {
             last_key = None;
             continue;
         }
-        let key = group_key(state, entry);
+        let key = group_key(state, entry, revealed);
         if last_key.as_ref() == Some(&key) {
             let last = out.last_mut().unwrap();
             last.count += 1;
@@ -5112,6 +5252,8 @@ struct StackGroupKey {
     paid: Option<StackPaidSnapshot>,
     is_pending: bool,
     provenance: Option<crate::types::game_state::SyntheticTriggerProvenance>,
+    /// CR 701.20a: the public names of the cards this entry keeps revealed.
+    revealed: Vec<String>,
 }
 
 /// Grouping signature for `stack_display_groups`. Two entries coalesce iff
@@ -5119,7 +5261,11 @@ struct StackGroupKey {
 /// visually-identical triggers that fire against different targets (e.g.
 /// N copies of "target player loses 1 life" picking different players)
 /// remain separate — coalescing them would misrepresent the resolution.
-fn group_key(state: &GameState, entry: &StackEntry) -> StackGroupKey {
+fn group_key(
+    state: &GameState,
+    entry: &StackEntry,
+    revealed: &BTreeMap<ObjectId, Vec<String>>,
+) -> StackGroupKey {
     let source_name = state
         .objects
         .get(&entry.source_id)
@@ -5160,6 +5306,7 @@ fn group_key(state: &GameState, entry: &StackEntry) -> StackGroupKey {
         paid,
         is_pending: effective_ability.is_pending,
         provenance,
+        revealed: revealed.get(&entry.id).cloned().unwrap_or_default(),
     }
 }
 
@@ -5518,6 +5665,23 @@ mod tests {
         assert!(!inert_trigger_abilities_eq_ignoring_provenance(
             &a,
             &same_shape_different_provenance
+        ));
+    }
+
+    #[test]
+    fn chosen_group_identity_prevents_inert_trigger_batch_equivalence() {
+        let mut first = ResolvedAbility::new(Effect::NoOp, Vec::new(), ObjectId(10), PlayerId(0));
+        first.declares_chosen_group = Some(crate::types::ability::ChosenGroupId(1));
+        let mut second = first.clone();
+        second.declares_chosen_group = Some(crate::types::ability::ChosenGroupId(2));
+        assert!(!inert_trigger_abilities_eq_ignoring_provenance(
+            &first, &second
+        ));
+
+        second.declares_chosen_group = first.declares_chosen_group;
+        second.reads_chosen_group = Some(crate::types::ability::ChosenGroupId(2));
+        assert!(!inert_trigger_abilities_eq_ignoring_provenance(
+            &first, &second
         ));
     }
 
@@ -9258,6 +9422,94 @@ mod tests {
                 Some(3),
                 "SourceIndependent fixed GainLife run should ignore distinct sources"
             );
+
+            let life_before = state.players[0].life;
+            let mut events = Vec::new();
+            let consumed = resolve_next_committed(&mut state, &mut events);
+
+            assert_eq!(consumed, 3);
+            assert_eq!(state.players[0].life, life_before + 3);
+            assert!(state.stack.is_empty());
+            assert_eq!(
+                crate::game::perf_counters::snapshot().stack_batched_entries,
+                3
+            );
+        }
+
+        /// CR 607.1: a triggered ability's provenance is derived from
+        /// its definition occurrence when read, never latched into its
+        /// `SpellContext` — so printed gain-life triggers carrying a definition
+        /// ref, put on the stack through the production authority, still batch.
+        #[test]
+        fn fixed_controller_gain_life_printed_triggers_with_definition_ref_still_batch() {
+            use crate::types::ability::{
+                SpellContext, TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
+                TriggerDefinitionRef,
+            };
+            use crate::types::identifiers::ObjectIncarnationRef;
+
+            fn push_printed_gain_life_trigger(
+                state: &mut GameState,
+                source: ObjectId,
+                trigger_event: GameEvent,
+            ) {
+                let entry_id = ObjectId(state.next_object_id);
+                state.next_object_id += 1;
+                let mut ability = ResolvedAbility::new(
+                    fixed_controller_gain_life_effect(),
+                    vec![],
+                    source,
+                    PlayerId(0),
+                );
+                ability.description = Some("you gain 1 life".to_string());
+                ability.ability_index = Some(0);
+                ability.trigger_definition_ref = Some(TriggerDefinitionRef {
+                    source: ObjectIncarnationRef::from_object(&state.objects[&source]),
+                    occurrence: TriggerDefinitionOccurrenceRef::Printed {
+                        base_set: TriggerBaseSetInstanceRef::INITIAL,
+                        printed_index: 0,
+                    },
+                });
+                let entry = StackEntry {
+                    id: entry_id,
+                    source_id: source,
+                    controller: PlayerId(0),
+                    kind: StackEntryKind::TriggeredAbility {
+                        source_id: source,
+                        ability: Box::new(ability),
+                        condition: None,
+                        trigger_event: Some(trigger_event),
+                        description: Some(
+                            "Whenever a creature enters, you gain 1 life.".to_string(),
+                        ),
+                        source_name: state.objects[&source].name.clone(),
+                        subject_match_count: None,
+                        die_result: None,
+                        provenance: None,
+                    },
+                };
+                let mut events = Vec::new();
+                super::super::push_to_stack(state, entry, &mut events);
+            }
+
+            crate::game::perf_counters::reset();
+            let mut state = setup();
+            let source_a = add_self_counter_source(&mut state, "Bogwater Lumaret A");
+            let source_b = add_self_counter_source(&mut state, "Bogwater Lumaret B");
+            let etb = life_event(PlayerId(0), 0);
+            push_printed_gain_life_trigger(&mut state, source_a, etb.clone());
+            push_printed_gain_life_trigger(&mut state, source_b, etb.clone());
+            push_printed_gain_life_trigger(&mut state, source_b, etb);
+
+            for entry in &state.stack {
+                let ability = entry.ability().expect("a triggered ability");
+                // Reach: the production stamps ran and the occurrence is attributable.
+                assert!(ability.trigger_definition_ref.is_some());
+                assert!(ability.source_incarnation.is_some());
+                assert!(ability.source_ability_provenance().is_some());
+                assert_eq!(ability.context, SpellContext::default(), "no latch");
+            }
+            assert_eq!(fixed_controller_gain_life_run_len(&state), Some(3));
 
             let life_before = state.players[0].life;
             let mut events = Vec::new();
@@ -15275,5 +15527,91 @@ mod tests {
             exile_moves, 1,
             "flashback must be exiled exactly once — RIP must not double-apply on a stack→exile move"
         );
+    }
+}
+
+#[cfg(test)]
+mod stack_bound_reveal_release_tests {
+    //! CR 603.3d + CR 701.20a: the uncommitted-trigger pop releases the popped
+    //! entry's reveal lease, and only when it actually popped.
+    use super::pop_uncommitted_pending_trigger_entry;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{Effect, ResolvedAbility, TargetFilter};
+    use crate::types::game_state::{GameState, StackEntry, StackEntryKind};
+    use crate::types::identifiers::{CardId, ObjectId, TriggerFiring};
+    use crate::types::player::PlayerId;
+    use crate::types::zones::Zone;
+
+    fn trigger_entry(state: &mut GameState, source: ObjectId) -> ObjectId {
+        let entry_id = ObjectId(state.next_object_id);
+        state.next_object_id += 1;
+        state.stack.push_back(StackEntry {
+            id: entry_id,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::GainLife {
+                        amount: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                    vec![],
+                    source,
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: "Source".to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+        state
+            .stack_trigger_firings
+            .insert(entry_id, TriggerFiring::Ordinary);
+        entry_id
+    }
+
+    #[test]
+    fn the_603_3d_pop_releases_the_popped_entry_lease_only() {
+        let mut state = GameState::new_two_player(3);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Leased".into(),
+            Zone::Hand,
+        );
+        let entry = trigger_entry(&mut state, source);
+        state.grant_stack_bound_reveal(entry, &[card]);
+        assert!(state.holds_stack_bound_reveal(card), "reach guard: leased");
+
+        // A cursor that does not name the top entry consumes without popping.
+        state.pending_trigger_entry = Some(ObjectId(99_999));
+        pop_uncommitted_pending_trigger_entry(
+            &mut state,
+            crate::game::lifecycle::DelayedTerminalDisposition::NoLegalChoice,
+        );
+        assert!(state.holds_stack_bound_reveal(card), "no pop, no release");
+
+        state.pending_trigger_entry = Some(entry);
+        state.pending_trigger_firing = Some(TriggerFiring::Ordinary);
+        pop_uncommitted_pending_trigger_entry(
+            &mut state,
+            crate::game::lifecycle::DelayedTerminalDisposition::NoLegalChoice,
+        );
+        assert!(state.stack.is_empty(), "reach guard: popped");
+        assert!(!state.holds_stack_bound_reveal(card));
+        assert!(state.stack_bound_reveals.is_empty());
     }
 }

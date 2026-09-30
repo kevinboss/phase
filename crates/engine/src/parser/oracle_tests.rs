@@ -132,6 +132,234 @@ fn unsupported_ability_ir_lowering_preserves_generic_and_structural_payloads() {
     assert_eq!(structural.description.as_deref(), Some("unsupported line"));
 }
 
+/// CR 118.3 + CR 601.2h review follow-up (PR #9207): a composite mana-ability
+/// cost mixing an `Any`-type chosen-count `RemoveCounter` leaf with a typed
+/// (`OfType`) chosen-count leaf has no sound reservation model at runtime —
+/// `mana_abilities::advance_mana_ability_activation` refuses to activate it.
+/// The parser must not silently present this shape as an ordinary supported
+/// ability: `demote_unsupported_composite_counter_choice_costs` must demote
+/// its effect to `Effect::unimplemented`, keeping the coverage report and the
+/// runtime behavior in agreement. An ability with only ONE such leaf, or two
+/// leaves of the SAME kind (both `OfType` of the same type, or both `Any`),
+/// must be left untouched — those shapes remain fully supported.
+#[test]
+fn composite_counter_choice_cost_mixing_any_and_typed_leaves_is_demoted_to_unimplemented() {
+    fn mana_ability(cost: AbilityCost) -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: crate::types::ability::ManaProduction::Fixed {
+                    colors: vec![crate::types::mana::ManaColor::Green],
+                    contribution: crate::types::ability::ManaContribution::Base,
+                },
+                restrictions: Vec::new(),
+                grants: Vec::new(),
+                expiry: None,
+                target: None,
+            },
+        )
+        .cost(cost)
+    }
+    fn remove_counter_leaf(count: u32, counter_type: CounterMatch) -> AbilityCost {
+        AbilityCost::RemoveCounter {
+            count,
+            counter_type,
+            target: None,
+            selection: crate::types::ability::CounterCostSelection::SingleObject,
+        }
+    }
+
+    let storage = CounterMatch::OfType(CounterType::Generic("storage".to_string()));
+    let charge = CounterMatch::OfType(CounterType::Generic("charge".to_string()));
+
+    let mut parsed = parse_oracle_text("", "Counter Choice Fixture", &[], &[], &[]);
+    // 0 — the shape under test: Any mixed with a typed leaf. Must be demoted.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_X,
+                CounterMatch::Any,
+            ),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                storage.clone(),
+            ),
+        ],
+    }));
+    // 1 — reach guard: a single Any leaf alone must NOT be demoted.
+    parsed.abilities.push(mana_ability(remove_counter_leaf(
+        crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+        CounterMatch::Any,
+    )));
+    // 2 — reach guard: a single typed leaf alone must NOT be demoted.
+    parsed.abilities.push(mana_ability(remove_counter_leaf(
+        crate::types::ability::REMOVE_COUNTER_COST_X,
+        storage.clone(),
+    )));
+    // 3 — reach guard: two SAME-type typed leaves (Saltcrusted-Steppe-adjacent
+    // shape from the sibling regression in mana_abilities.rs) must NOT be
+    // demoted — this composite has a sound exact reservation.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_X,
+                storage.clone(),
+            ),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                storage.clone(),
+            ),
+        ],
+    }));
+    // 4 — reach guard: two DIFFERENT-type typed leaves must NOT be demoted —
+    // no ambiguity, they draw from disjoint pools.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(crate::types::ability::REMOVE_COUNTER_COST_X, storage),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                charge,
+            ),
+        ],
+    }));
+    // 5 — reach guard: two Any leaves must NOT be demoted — an exact
+    // aggregate reservation is sound for this pair.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_X,
+                CounterMatch::Any,
+            ),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                CounterMatch::Any,
+            ),
+        ],
+    }));
+
+    demote_unsupported_composite_counter_choice_costs(&mut parsed);
+
+    assert!(
+        matches!(
+            parsed.abilities[0].effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "counter_choice_cost_mixes_any_with_typed"
+        ),
+        "an Any-plus-typed composite must be demoted, got {:?}",
+        parsed.abilities[0].effect
+    );
+    for (index, label) in [
+        (1, "a lone Any leaf"),
+        (2, "a lone typed leaf"),
+        (3, "two same-type typed leaves"),
+        (4, "two different-type typed leaves"),
+        (5, "two Any leaves"),
+    ] {
+        assert!(
+            matches!(parsed.abilities[index].effect.as_ref(), Effect::Mana { .. }),
+            "{label} must NOT be demoted, got {:?}",
+            parsed.abilities[index].effect
+        );
+    }
+}
+
+/// Companion to the reach-guard matrix above, through the PRODUCTION pipeline
+/// rather than a hand-built `ParsedAbilities`: proves real Oracle text
+/// actually lowers to the mixed Any + typed `RemoveCounter` composite this
+/// demotion targets, and that `parse_oracle_text` — which runs
+/// `demote_unsupported_composite_counter_choice_costs` internally, alongside
+/// every other post-lowering demotion pass — retains the
+/// `Effect::unimplemented("counter_choice_cost_mixes_any_with_typed", ..)`
+/// marker on the resulting ability. The unit test above proves the demoter's
+/// OWN matching logic against six planted shapes without depending on cost
+/// parsing at all; this test is the missing link that a parser or lowering
+/// regression could otherwise leave real Oracle input silently "supported"
+/// while that unit test stays green, since it never calls `parse_oracle_cost`
+/// or `parse_oracle_pipeline`.
+///
+/// No real printed card uses this cost shape — it does not correspond to any
+/// class of Magic card, only to the synthetic combination the review
+/// identified as structurally ambiguous — so the Oracle text below is
+/// invented to exercise the parser on the two sub-costs, not transcribed
+/// from a printed card.
+#[test]
+fn oracle_text_mixing_any_and_typed_counter_choice_costs_parses_to_demoted_ability() {
+    let oracle = "{T}: Add {C}.\n\
+{T}, Remove X counters from ~, Remove any number of storage counters from ~: Add {C}.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Counter Choice Fixture Land",
+        &[],
+        &["Land".to_string()],
+        &[],
+    );
+
+    let mixed = parsed
+        .abilities
+        .iter()
+        .find(|ability| {
+            matches!(
+                &ability.cost,
+                Some(AbilityCost::Composite { costs })
+                    if costs.iter().any(|cost| matches!(cost, AbilityCost::RemoveCounter { .. }))
+            )
+        })
+        .expect("the second line's composite cost must parse as an activated ability");
+
+    // Confirm the parser actually built the shape under test — a lone-`Any`
+    // or lone-typed misparse of either clause would make the demotion
+    // assertion below vacuous.
+    match mixed.cost.as_ref().expect("composite cost") {
+        AbilityCost::Composite { costs } => {
+            assert!(
+                costs.iter().any(|cost| matches!(
+                    cost,
+                    AbilityCost::RemoveCounter {
+                        counter_type: CounterMatch::Any,
+                        target: None,
+                        ..
+                    }
+                )),
+                "expected an untyped self-RemoveCounter leaf, got {costs:?}"
+            );
+            assert!(
+                costs.iter().any(|cost| matches!(
+                    cost,
+                    AbilityCost::RemoveCounter {
+                        counter_type: CounterMatch::OfType(counter_type),
+                        target: None,
+                        ..
+                    } if *counter_type == CounterType::Generic("storage".to_string())
+                )),
+                "expected a storage-typed self-RemoveCounter leaf, got {costs:?}"
+            );
+        }
+        other => panic!("expected Composite cost, got {other:?}"),
+    }
+
+    assert!(
+        matches!(
+            mixed.effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "counter_choice_cost_mixes_any_with_typed"
+        ),
+        "production parsing of the mixed Any+typed composite must demote to \
+         the shared strict-failure marker, got {:?}",
+        mixed.effect
+    );
+
+    // Reach guard: the sibling `{T}: Add {C}.` mana ability (a single `Tap`
+    // cost, no `RemoveCounter` at all) must be untouched by this pass.
+    let tap_only = parsed
+        .abilities
+        .iter()
+        .find(|ability| matches!(&ability.cost, Some(AbilityCost::Tap)))
+        .expect("the first line's plain tap ability must also parse");
+    assert!(
+        matches!(tap_only.effect.as_ref(), Effect::Mana { .. }),
+        "an unrelated tap-only mana ability must not be demoted, got {:?}",
+        tap_only.effect
+    );
+}
+
 /// A forced diagonal for CopyChosenHost provenance. Two eligible chooser gaps
 /// and two CopyChosen statics prove the document relation binds the first
 /// source-order pair exactly once; the later copy ability proves the transformed
@@ -13337,6 +13565,266 @@ fn put_up_to_two_name_stickers_parses() {
         ),
         "expected up-to-two name-sticker effect, got {:?}",
         effect,
+    );
+}
+
+/// Parse a census face with verbatim Oracle text and return its "When this
+/// creature enters, you may put a name sticker on it" trigger's PutSticker and
+/// the clause chained after it. Reach-guard for every row: the whole card
+/// parses with zero `Effect::Unimplemented`.
+fn census_sticker_chain(
+    oracle: &str,
+    name: &str,
+    keywords: &[&str],
+    subtypes: &[&str],
+) -> (AbilityDefinition, AbilityDefinition) {
+    let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+    let subtypes: Vec<String> = subtypes.iter().map(|s| s.to_string()).collect();
+    let parsed = parse_oracle_text(oracle, name, &keywords, &["Creature".into()], &subtypes);
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "{name} must parse with zero Unimplemented effects: {parsed:#?}"
+    );
+    let execute = parsed
+        .triggers
+        .iter()
+        .find_map(|trigger| trigger.execute.as_deref())
+        .expect("enters trigger")
+        .clone();
+    assert!(
+        matches!(
+            execute.effect.as_ref(),
+            Effect::PutSticker {
+                target: TargetFilter::ParentTarget,
+                kind: Some(crate::types::stickers::StickerKind::Name),
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ),
+        "{name}: expected the PutSticker head, got {:?}",
+        execute.effect
+    );
+    let sub = execute
+        .sub_ability
+        .as_deref()
+        .expect("clause after the PutSticker")
+        .clone();
+    (execute, sub)
+}
+
+/// CR 123.6e + CR 608.2c: "for each unique vowel on that sticker".
+fn that_sticker_unique_vowels() -> QuantityExpr {
+    QuantityExpr::Ref {
+        qty: QuantityRef::NameStickerLetterCount {
+            stickers: crate::types::ability::NameStickerSet::ThatSticker,
+            letters: crate::types::ability::LetterQuery::UniqueVowels,
+        },
+    }
+}
+
+/// SHAPE: _____ Goblin — "Add {R} for each unique vowel on that sticker" is a
+/// red mana effect counted by the sticker the PutSticker put (CR 123.6e).
+#[test]
+fn blank_goblin_mana_counts_unique_vowels_on_that_sticker() {
+    let (execute, sub) = census_sticker_chain(
+        "When this creature enters, you may put a name sticker on it. Add {R} for each unique vowel on that sticker. (The vowels are A, E, I, O, U, and Y.)",
+        "_____ Goblin",
+        &[],
+        &["Goblin", "Guest"],
+    );
+    assert!(execute.optional, "CR 603.5: the put is optional");
+    let Effect::Mana {
+        produced:
+            ManaProduction::AnyOneColor {
+                count,
+                color_options,
+                ..
+            },
+        ..
+    } = sub.effect.as_ref()
+    else {
+        panic!("expected red mana, got {:?}", sub.effect);
+    };
+    assert_eq!(count, &that_sticker_unique_vowels());
+    assert_eq!(color_options, &vec![ManaColor::Red]);
+}
+
+/// SHAPE: _____-o-saurus — one +1/+1 counter on itself for each unique vowel
+/// on that sticker (the "for each" is no longer dropped).
+#[test]
+fn o_saurus_counters_count_unique_vowels_on_that_sticker() {
+    let (_, sub) = census_sticker_chain(
+        "Trample\nWhen this creature enters, you may put a name sticker on it. Put a +1/+1 counter on it for each unique vowel on that sticker. (The vowels are A, E, I, O, U, and Y.)",
+        "_____-o-saurus",
+        &["Trample"],
+        &["Alien", "Dinosaur"],
+    );
+    let Effect::PutCounter {
+        counter_type,
+        count,
+        target,
+    } = sub.effect.as_ref()
+    else {
+        panic!("expected PutCounter, got {:?}", sub.effect);
+    };
+    assert_eq!(*counter_type, CounterType::Plus1Plus1);
+    assert_eq!(count, &that_sticker_unique_vowels());
+    assert_eq!(target, &TargetFilter::SelfRef);
+}
+
+/// SHAPE: _____ Bird Gets the Worm — "You gain X life, where X is the number
+/// of unique vowels on that sticker" (CR 107.3i binds X).
+#[test]
+fn bird_gets_the_worm_life_counts_unique_vowels_on_that_sticker() {
+    let (_, sub) = census_sticker_chain(
+        "Flying\nWhen this creature enters, you may put a name sticker on it. You gain X life, where X is the number of unique vowels on that sticker. (The vowels are A, E, I, O, U, and Y.)",
+        "_____ Bird Gets the Worm",
+        &["Flying"],
+        &["Bird", "Guest"],
+    );
+    let Effect::GainLife { amount, player } = sub.effect.as_ref() else {
+        panic!("expected GainLife, got {:?}", sub.effect);
+    };
+    assert_eq!(amount, &that_sticker_unique_vowels());
+    assert_eq!(player, &TargetFilter::Controller);
+}
+
+/// SHAPE: Wizards of the _____ — "look at the top X cards …, where X is the
+/// number of unique vowels on that sticker. Put one of those cards into your
+/// hand and the rest on the bottom" is one Dig counted by that sticker.
+#[test]
+fn wizards_of_the_blank_dig_counts_unique_vowels_on_that_sticker() {
+    let (_, sub) = census_sticker_chain(
+        "When this creature enters, you may put a name sticker on it, then look at the top X cards of your library, where X is the number of unique vowels on that sticker. Put one of those cards into your hand and the rest on the bottom of your library in any order. (The vowels are A, E, I, O, U, and Y.)",
+        "Wizards of the _____",
+        &[],
+        &["Human", "Wizard", "Performer"],
+    );
+    let Effect::Dig {
+        count,
+        keep_count,
+        destination,
+        rest_destination,
+        ..
+    } = sub.effect.as_ref()
+    else {
+        panic!("expected Dig, got {:?}", sub.effect);
+    };
+    assert_eq!(count, &that_sticker_unique_vowels());
+    assert_eq!(*keep_count, Some(1));
+    assert_eq!(*destination, Some(Zone::Hand));
+    assert_eq!(*rest_destination, Some(Zone::Library));
+}
+
+/// SHAPE: Wolf in _____ Clothing — CR 603.12: "When you do, up to X target
+/// creatures each get -1/-1 until end of turn", X the unique vowels on that
+/// sticker.
+#[test]
+fn wolf_in_blank_clothing_reflexive_cap_counts_unique_vowels_on_that_sticker() {
+    let (_, sub) = census_sticker_chain(
+        "When this creature enters, you may put a name sticker on it. When you do, up to X target creatures each get -1/-1 until end of turn, where X is the number of unique vowels on that sticker. (The vowels are A, E, I, O, U, and Y.)",
+        "Wolf in _____ Clothing",
+        &[],
+        &["Wolf", "Guest"],
+    );
+    assert!(
+        matches!(sub.condition, Some(AbilityCondition::WhenYouDo)),
+        "{:?}",
+        sub.condition
+    );
+    assert!(
+        matches!(sub.effect.as_ref(), Effect::Pump { .. }),
+        "{:?}",
+        sub.effect
+    );
+    let spec = sub.multi_target.as_ref().expect("up to X targets");
+    assert_eq!(spec.min, QuantityExpr::Fixed { value: 0 });
+    assert_eq!(spec.max, Some(that_sticker_unique_vowels()));
+}
+
+/// The "Whenever you put a sticker on this enchantment" trigger of an
+/// enchantment census face: its mode stays `Unknown` (the face stays
+/// unsupported) and its execute is returned.
+fn sticker_enchantment_trigger(oracle: &str, name: &str, keywords: &[&str]) -> AbilityDefinition {
+    let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+    let parsed = parse_oracle_text(oracle, name, &keywords, &["Enchantment".into()], &[]);
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|trigger| matches!(trigger.mode, TriggerMode::Unknown(_)))
+        .expect("the put-a-sticker trigger mode is still unrecognized");
+    trigger.execute.as_deref().expect("trigger execute").clone()
+}
+
+/// CR 123.6d: "the number of <letter>'s in name stickers on this enchantment".
+fn letters_in_name_stickers_on_self(letter: char) -> QuantityExpr {
+    QuantityExpr::Ref {
+        qty: QuantityRef::NameStickerLetterCount {
+            stickers: crate::types::ability::NameStickerSet::OnObject {
+                scope: ObjectScope::Source,
+            },
+            letters: crate::types::ability::LetterQuery::Letter { letter },
+        },
+    }
+}
+
+/// SHAPE (honesty): _____ Balls of Fire's damage now reads the o's in its name
+/// stickers, while its "Whenever you put a sticker" trigger mode stays unknown.
+#[test]
+fn balls_of_fire_damage_counts_os_in_name_stickers_on_self() {
+    let execute = sticker_enchantment_trigger(
+        "When this enchantment enters, you may put a name sticker on it.\nWhenever you put a sticker on this enchantment, it deals damage equal to the number of o's in name stickers on this enchantment to any target.",
+        "_____ Balls of Fire",
+        &[],
+    );
+    let Effect::DealDamage { amount, .. } = execute.effect.as_ref() else {
+        panic!("expected DealDamage, got {:?}", execute.effect);
+    };
+    assert_eq!(amount, &letters_in_name_stickers_on_self('o'));
+}
+
+/// SHAPE (honesty): Make a _____ Splash taps up to X creatures, X the u's in
+/// its name stickers, while its trigger mode stays unknown.
+#[test]
+fn make_a_splash_tap_cap_counts_us_in_name_stickers_on_self() {
+    let execute = sticker_enchantment_trigger(
+        "Flash\nWhen this enchantment enters, you may put a name sticker on it.\nWhenever you put a sticker on this enchantment, tap up to X target creatures, where X is the number of u's in name stickers on this enchantment.",
+        "Make a _____ Splash",
+        &["Flash"],
+    );
+    let spec = execute.multi_target.as_ref().expect("up to X targets");
+    assert_eq!(spec.max, Some(letters_in_name_stickers_on_self('u')));
+}
+
+/// SHAPE (negative): Disemvowel counts vowels in the creature's *name* (CR
+/// 201), not on a name sticker (CR 123.6), so it keeps its base parse.
+#[test]
+fn disemvowel_is_not_a_name_sticker_count() {
+    let parsed = parse_oracle_text(
+        "Destroy target creature. That creature's controller loses 1 life for each unique vowel in the creature's name. (The vowels are A, E, I, O, U, and Y.)",
+        "Disemvowel",
+        &[],
+        &["Sorcery".into()],
+        &[],
+    );
+    let spell = parsed.abilities.first().expect("spell ability");
+    // Reach-guard: the Destroy head parsed.
+    assert!(
+        matches!(spell.effect.as_ref(), Effect::Destroy { .. }),
+        "{:?}",
+        spell.effect
+    );
+    let sub = spell.sub_ability.as_deref().expect("life-loss clause");
+    assert!(
+        matches!(
+            sub.effect.as_ref(),
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: Some(TargetFilter::ParentTargetController),
+            }
+        ),
+        "{:?}",
+        sub.effect
     );
 }
 
@@ -31597,4 +32085,219 @@ fn owner_subject_shuffle_them_into_their_libraries_moves_the_objects() {
             .any(|d| matches!(&*d.effect, Effect::Unimplemented { .. })),
         "{defs:?}"
     );
+}
+
+// ── "As ~ enters, <one-shot>" replacement arm (CR 614.1c + CR 603.6d) ─────────
+
+/// Tibalt, Cosmic Impostor (Kaldheim MDFC back face), verbatim Oracle text.
+const TIBALT_FULL: &str = "As Tibalt enters, you get an emblem with \"You may play cards exiled with Tibalt, Cosmic Impostor, and you may spend mana as though it were mana of any color to cast those spells.\"\n[+2]: Exile the top card of each player's library.\n[−3]: Exile target artifact or creature.\n[−8]: Exile all graveyards. Add {R}{R}{R}.";
+
+/// Positive twin shared by the gate-negative reach-guards below.
+const AS_ENTERS_LOSE_TWO: &str = "As ~ enters, you lose 2 life.";
+
+/// `line`, self-reference-normalized and lowercased, as the routing sites see it.
+fn normalized_lower_frame_line(line: &str, card_name: &str) -> String {
+    crate::parser::oracle_util::normalize_card_name_refs(line, card_name).to_lowercase()
+}
+
+/// SHAPE (CR 614.1c + CR 603.6d + CR 114.2): Tibalt's "As Tibalt enters" line is
+/// a mandatory `Moved` self-to-battlefield replacement whose execute creates the
+/// emblem hosting the persistent any-color exile-play permission — no static,
+/// no swallowed clause.
+#[test]
+fn tibalt_as_enters_emblem_parses_as_moved_self_replacement() {
+    let parsed = parse_oracle_text(
+        TIBALT_FULL,
+        "Tibalt, Cosmic Impostor",
+        &[],
+        &["Planeswalker".into()],
+        &["Tibalt".into()],
+    );
+    // Reach-guard: the three loyalty lines parsed.
+    assert_eq!(parsed.abilities.len(), 3, "{:?}", parsed.abilities);
+    assert!(parsed.statics.is_empty(), "{:?}", parsed.statics);
+    assert_eq!(parsed.replacements.len(), 1, "{:?}", parsed.replacements);
+    let repl = &parsed.replacements[0];
+    assert_eq!(repl.event, ReplacementEvent::Moved);
+    assert_eq!(repl.valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(repl.destination_zone, Some(Zone::Battlefield));
+    assert_eq!(repl.mode, ReplacementMode::Mandatory);
+    let execute = repl.execute.as_deref().expect("the replacement executes");
+    assert!(execute.sub_ability.is_none(), "{execute:?}");
+    let Effect::CreateEmblem { statics, triggers } = &*execute.effect else {
+        panic!("expected CreateEmblem, got {:?}", execute.effect);
+    };
+    assert!(triggers.is_empty(), "{triggers:?}");
+    assert_eq!(statics.len(), 1, "{statics:?}");
+    assert_eq!(
+        statics[0].mode,
+        StaticMode::ExileCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Play,
+            cost: crate::types::statics::ExileCastCost::PayNormalCost,
+            pool: crate::types::statics::ExileCardPool::Persistent,
+            timing: crate::types::statics::ExileCastTiming::AnyTime,
+            mana_spend_permission: Some(crate::types::ability::ManaSpendPermission::AnyColor),
+            grants_flash: false,
+            extra_cost: None,
+            enters_with_counter: None,
+            grantee: crate::types::statics::ExileCastGrantee::SourceController,
+        }
+    );
+    assert!(
+        !parsed
+            .parse_warnings
+            .iter()
+            .any(|warning| matches!(warning, OracleDiagnostic::SwallowedClause { .. })),
+        "{:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// Gate negative (CR 614.12a): Phylactery Lich's as-enters body puts a counter
+/// on an artifact you control — an object effect outside the kind allowlist — so
+/// its frame line keeps its prior `replacement_structure` gap.
+#[test]
+fn phylactery_lich_as_enters_object_effect_body_keeps_prior_shape() {
+    let oracle = "Indestructible\nAs this creature enters, put a phylactery counter on an artifact you control.\nWhen you control no permanents with phylactery counters on them, sacrifice this creature.";
+    let line = "As this creature enters, put a phylactery counter on an artifact you control.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Phylactery Lich",
+        &["Indestructible".into()],
+        &["Creature".into()],
+        &["Zombie".into()],
+    );
+    assert!(
+        !parsed
+            .replacements
+            .iter()
+            .any(|repl| repl.event == ReplacementEvent::Moved),
+        "{:?}",
+        parsed.replacements
+    );
+    assert!(
+        parsed.abilities.iter().any(|ability| matches!(
+            &*ability.effect,
+            Effect::Unimplemented { name, .. } if name == "replacement_structure"
+        )),
+        "{:?}",
+        parsed.abilities
+    );
+    // Reach-guard: the frame is recognized and the arm itself declines the body,
+    // while the admitted twin is accepted.
+    assert!(is_as_self_enters_frame(&normalized_lower_frame_line(
+        line,
+        "Phylactery Lich"
+    )));
+    assert!(parse_as_enters_one_shot_replacement(line, "Phylactery Lich").is_none());
+    assert!(parse_as_enters_one_shot_replacement(AS_ENTERS_LOSE_TWO, "Phylactery Lich").is_some());
+}
+
+/// The static-shaped routing site runs before Priority 8. Static-shaped frame
+/// lines that a Priority-8 arm claims today (Thief of Blood's population
+/// counter removal, Arsenal Thresher's optional reveal) are declined by the
+/// gate and keep their Priority-8 replacement.
+#[test]
+fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
+    for (name, oracle, line, description, keywords, types, subtypes) in [
+        (
+            "Thief of Blood",
+            "Flying\nAs this creature enters, remove all counters from all permanents. This creature enters with a +1/+1 counter on it for each counter removed this way.",
+            "As this creature enters, remove all counters from all permanents. This creature enters with a +1/+1 counter on it for each counter removed this way.",
+            "As ~ enters, remove all counters from all permanents. ~ enters with a +1/+1 counter on it for each counter removed this way.",
+            vec!["Flying".to_string()],
+            vec!["Creature".to_string()],
+            vec!["Vampire".to_string()],
+        ),
+        (
+            "Arsenal Thresher",
+            "As this creature enters, you may reveal any number of other artifact cards from your hand. This creature enters with a +1/+1 counter on it for each card revealed this way.",
+            "As this creature enters, you may reveal any number of other artifact cards from your hand. This creature enters with a +1/+1 counter on it for each card revealed this way.",
+            "As ~ enters, you may reveal any number of other artifact cards from your hand. ~ enters with a +1/+1 counter on it for each card revealed this way.",
+            vec![],
+            vec!["Artifact".to_string(), "Creature".to_string()],
+            vec!["Construct".to_string()],
+        ),
+    ] {
+        let parsed = parse_oracle_text(oracle, name, &keywords, &types, &subtypes);
+        let moved: Vec<&ReplacementDefinition> = parsed
+            .replacements
+            .iter()
+            .filter(|repl| repl.event == ReplacementEvent::Moved)
+            .collect();
+        assert_eq!(moved.len(), 1, "{name}: {:?}", parsed.replacements);
+        assert_eq!(moved[0].description.as_deref(), Some(description), "{name}");
+        assert!(
+            matches!(
+                moved[0].execute.as_deref().map(|e| &*e.effect),
+                Some(Effect::PutCounter { .. })
+            ),
+            "{name}: {:?}",
+            moved[0].execute
+        );
+        // Reach-guard: the static-shaped routing site sees the frame and the gate declines the body.
+        assert!(
+            is_as_self_enters_frame(&normalized_lower_frame_line(line, name)),
+            "{name}"
+        );
+        assert!(
+            parse_as_enters_one_shot_replacement(line, name).is_none(),
+            "{name}"
+        );
+        assert!(parse_as_enters_one_shot_replacement(AS_ENTERS_LOSE_TWO, name).is_some());
+    }
+}
+
+/// Admitted class face (CR 614.1c + CR 603.6d + CR 119.3): Lich's "As this
+/// enchantment enters, you lose life equal to your life total." is a mandatory
+/// `Moved` self replacement losing the controller's life total.
+#[test]
+fn lich_as_enters_life_loss_parses_as_moved_self_replacement() {
+    let oracle = "As this enchantment enters, you lose life equal to your life total.\nYou don't lose the game for having 0 or less life.\nIf you would gain life, draw that many cards instead.\nWhenever you're dealt damage, sacrifice that many nontoken permanents. If you can't, you lose the game.\nWhen this enchantment is put into a graveyard from the battlefield, you lose the game.";
+    let parsed = parse_oracle_text(oracle, "Lich", &[], &["Enchantment".into()], &[]);
+    let moved: Vec<&ReplacementDefinition> = parsed
+        .replacements
+        .iter()
+        .filter(|repl| repl.event == ReplacementEvent::Moved)
+        .collect();
+    assert_eq!(moved.len(), 1, "{:?}", parsed.replacements);
+    let repl = moved[0];
+    assert_eq!(repl.valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(repl.destination_zone, Some(Zone::Battlefield));
+    assert_eq!(repl.mode, ReplacementMode::Mandatory);
+    assert_eq!(
+        repl.description.as_deref(),
+        Some("As ~ enters, you lose life equal to your life total.")
+    );
+    let execute = repl.execute.as_deref().expect("the replacement executes");
+    assert!(execute.sub_ability.is_none(), "{execute:?}");
+    assert_eq!(
+        *execute.effect,
+        Effect::LoseLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: crate::types::ability::PlayerScope::Controller
+                }
+            },
+            target: Some(TargetFilter::Controller),
+        }
+    );
+    assert!(
+        !parsed.abilities.iter().any(|ability| ability
+            .description
+            .as_deref()
+            .is_some_and(|d| d == "As ~ enters, you lose life equal to your life total.")),
+        "the frame line is no longer an ability: {:?}",
+        parsed.abilities
+    );
+    // Reach-guards: Lich's other lines are unchanged.
+    assert!(parsed
+        .replacements
+        .iter()
+        .any(|repl| repl.event == ReplacementEvent::GainLife));
+    assert!(parsed
+        .statics
+        .iter()
+        .any(|def| matches!(def.mode, StaticMode::CantLoseTheGame)));
 }

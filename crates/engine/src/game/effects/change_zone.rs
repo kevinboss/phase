@@ -1383,6 +1383,7 @@ pub fn resolve(
                 .expect("paused ChangeZone retains its explicit delivery prefix");
                 state.push_change_zone_iteration(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: anticipated_pause.map(|mut boundary| {
                             boundary.append_delivery_events(&events[delivery_start..]);
@@ -1437,6 +1438,7 @@ pub fn resolve(
                 .expect("paused ChangeZone retains its explicit delivery prefix");
                 state.push_change_zone_iteration_after_child(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: Some(
                             state
@@ -2206,8 +2208,8 @@ pub fn resolve_all(
             .map(|(owner, cards)| snapshot_mass_library_order_batch(state, owner, cards))
             .collect();
         if !remaining_batches.is_empty() {
-            state.pending_mass_library_order_choice =
-                Some(crate::types::game_state::PendingMassLibraryOrderChoice {
+            state.pending_mass_library_order_choice = Some(Box::new(
+                crate::types::game_state::PendingMassLibraryOrderChoice {
                     source_id: ability.source_id,
                     library_position: effect_library_position
                         .clone()
@@ -2218,7 +2220,8 @@ pub fn resolve_all(
                         crate::types::game_state::PendingMassLibraryOrderBatches::Typed(
                             remaining_batches,
                         ),
-                });
+                },
+            ));
         }
         state.waiting_for = mass_library_order_effect_zone_choice(
             snapshot_mass_library_order_batch(state, first_owner, first_cards),
@@ -2338,6 +2341,7 @@ pub fn resolve_all(
                 .expect("paused ChangeZoneAll retains its explicit delivery prefix");
                 state.push_change_zone_iteration_after_child(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: (!entry_target_choice).then(|| {
                             state
@@ -2401,6 +2405,7 @@ pub fn resolve_all(
                 .expect("paused ChangeZoneAll retains its explicit delivery prefix");
                 state.push_change_zone_iteration(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: anticipated_pause.map(|mut boundary| {
                             boundary.append_delivery_events(&events[delivery_start..]);
@@ -6950,6 +6955,7 @@ mod tests {
         let logical_zone_change_group =
             crate::game::triggers::allocate_logical_zone_change_group(&mut state, &[hero, soldier]);
         state.push_change_zone_iteration(crate::types::game_state::PendingChangeZoneIteration {
+            pending_return_result_producer: None,
             logical_zone_change_group,
             paused_current: None,
             remaining: vec![hero, soldier],

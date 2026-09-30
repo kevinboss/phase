@@ -80,6 +80,10 @@ mod tests {
         count: QuantityExpr,
     ) -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::SkipNextTurn { target, count },
             controller,
@@ -140,6 +144,8 @@ mod tests {
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            activation_record: None,
         }
     }
 

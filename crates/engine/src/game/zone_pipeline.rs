@@ -1227,7 +1227,7 @@ pub(crate) fn move_objects_simultaneously_then(
             // Synchronous completion (the common single-redirect path): run the
             // cleanup now, and surface a pause it raises to the enclosing caller.
             completion.map_or(BatchMoveResult::Done, |mut completion| {
-                crate::types::game_state::settle_dig_delivery_outcome(
+                crate::types::game_state::settle_batch_delivery_outcome(
                     &mut completion,
                     state,
                     &logical_zone_change_group,
@@ -1661,7 +1661,7 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                     // prompt + fresh BatchDelivery frame, not via
                     // this return value. Witnessed by the compound double-pause
                     // test (miss batch redirect, then hit-delivery redirect).
-                    crate::types::game_state::settle_dig_delivery_outcome(
+                    crate::types::game_state::settle_batch_delivery_outcome(
                         &mut completion,
                         state,
                         &logical_zone_change_group,
@@ -4507,16 +4507,17 @@ fn execute_zone_move_with_applied_terminal(
             // planeswalker enters with 0 loyalty counters and dies immediately
             // to CR 704.5i. Ravenous (front-face cast-time) does not apply to an
             // effect-driven transformed entry, so only face counters are seeded.
+            // CR 714.3a: a back-face Saga's lore counter comes from its own
+            // replacement via the CR 614.12 projection
+            // (`replacement::stage_transformed_entry_projection`), not from
+            // this seeding.
             let intrinsic = match (enter_transformed, obj.back_face.as_ref()) {
-                (true, Some(back)) => {
-                    crate::game::printed_cards::intrinsic_entry_counters_for_face(
-                        back.printed_loyalty,
-                        back.loyalty,
-                        None,
-                        back.defense,
-                        &back.card_types,
-                    )
-                }
+                (true, Some(back)) => crate::game::printed_cards::intrinsic_face_entry_counters(
+                    back.printed_loyalty,
+                    back.loyalty,
+                    None,
+                    back.defense,
+                ),
                 _ => crate::game::printed_cards::intrinsic_etb_counters(obj, None),
             };
             if !intrinsic.is_empty() {
