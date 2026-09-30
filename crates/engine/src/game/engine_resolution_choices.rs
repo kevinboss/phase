@@ -3713,13 +3713,7 @@ pub(super) fn handle_resolution_choice(
                             // CR 502.4: that is no window to hand a player in the
                             // untap step, so the deferral is settled and retried as
                             // after an untap-choice answer.
-                            match crate::game::turns::auto_advance_reporting_deferral(state, events)
-                            {
-                                (waiting_for, false) => waiting_for,
-                                (_, true) => {
-                                    super::engine::settle_deferred_untap_transition(state, events)
-                                }
-                            }
+                            super::engine::auto_advance_settling_deferral(state, events)
                         } else {
                             state.waiting_for.clone()
                         }
@@ -5811,12 +5805,7 @@ pub(super) fn handle_resolution_choice(
                         // CR 502.3 + CR 500.8: the run can enter an added untap step
                         // whose leave ends the turn and defers; the deferral goes to
                         // the settlement an untap-choice answer uses.
-                        let advanced = match turns::auto_advance_reporting_deferral(state, events) {
-                            (waiting_for, false) => waiting_for,
-                            (_, true) => {
-                                super::engine::settle_deferred_untap_transition(state, events)
-                            }
-                        };
+                        let advanced = super::engine::auto_advance_settling_deferral(state, events);
                         public_state::sync_waiting_for(state, &advanced);
                     }
                 }

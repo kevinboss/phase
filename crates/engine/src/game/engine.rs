@@ -11050,7 +11050,7 @@ fn untap_completion_waiting_for(
     // active player's provisional window first. CR 502.4: that window is not
     // handed to a player here. The subset prompt, or the waiting state of the
     // run after a committed leave, replaces it; a deferred leave goes to
-    // `settle_deferred_untap_transition`, which synchronizes the same window
+    // `settle_deferred_phase_transition`, which synchronizes the same window
     // and keeps it only for a carrier it cannot settle.
     sync_waiting_for(
         state,
@@ -11065,28 +11065,24 @@ fn untap_completion_waiting_for(
         // step added after the end step) can defer its own transition. The
         // waiting state standing then is this answered prompt, which must not
         // be offered again, so that deferral is settled here too.
-        turns::UntapCompletion::Advanced => {
-            match turns::auto_advance_reporting_deferral(state, events) {
-                (waiting_for, false) => waiting_for,
-                (_, true) => settle_deferred_untap_transition(state, events),
-            }
-        }
-        turns::UntapCompletion::LeaveDeferred => settle_deferred_untap_transition(state, events),
+        turns::UntapCompletion::Advanced => auto_advance_settling_deferral(state, events),
+        turns::UntapCompletion::LeaveDeferred => settle_deferred_phase_transition(state, events),
     }
 }
 
 /// Settles a transition the turn interpreter deferred at an untap step's
 /// turn-ending leave or at the cleanup step's entry, and retries it once. Its
-/// callers are the untap-choice answers (see [`untap_completion_waiting_for`]),
-/// the loop-collapse and cleanup-discard answers in
-/// `engine_resolution_choices`, and the resume a completed phase entry owes
+/// callers are the untap-choice answers (see [`untap_completion_waiting_for`])
+/// and, through [`auto_advance_settling_deferral`], the loop-collapse and
+/// cleanup-discard answers in `engine_resolution_choices` and the resume a
+/// completed phase entry owes
 /// (`turns::resume_deferred_step_triggers`). A carrier it cannot settle keeps the
 /// provisional Priority window at the step where the transition deferred. In
 /// an untap step, that departs from CR 502.4. At the cleanup step's entry,
 /// before the step's actions, it departs from CR 514.3 ("Normally, no player
 /// receives priority during the cleanup step"); that is the window the
 /// priority reducer already leaves when a pass defers there.
-pub(super) fn settle_deferred_untap_transition(
+pub(super) fn settle_deferred_phase_transition(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> WaitingFor {
@@ -11121,6 +11117,19 @@ pub(super) fn settle_deferred_untap_transition(
         }
     }
     provisional
+}
+
+/// Runs the turn interpreter and, when it defers a transition, settles and
+/// retries that transition through [`settle_deferred_phase_transition`]
+/// instead of returning the waiting state that was standing before the run.
+pub(super) fn auto_advance_settling_deferral(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> WaitingFor {
+    match turns::auto_advance_reporting_deferral(state, events) {
+        (waiting_for, false) => waiting_for,
+        (_, true) => settle_deferred_phase_transition(state, events),
+    }
 }
 
 fn apply_non_priority_pass_action(

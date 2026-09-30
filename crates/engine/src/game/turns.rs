@@ -1129,7 +1129,7 @@ pub(super) fn drain_pending_phase_transition_progress(
 ///
 /// A transition the resumed run defers is settled and retried once here, as after an
 /// untap-choice answer. Only a carrier that cannot settle leaves the provisional
-/// `Priority { active }` window standing (see `engine::settle_deferred_untap_transition`).
+/// `Priority { active }` window standing (see `engine::settle_deferred_phase_transition`).
 pub(crate) fn resume_deferred_step_triggers(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
@@ -1145,10 +1145,7 @@ pub(crate) fn resume_deferred_step_triggers(
         // the turn while a resolution is live, so the interpreter stops with the untap done
         // and the window from before the run standing. CR 502.4: that is no window to hand
         // a player in the untap step.
-        match auto_advance_reporting_deferral(state, events) {
-            (waiting_for, false) => waiting_for,
-            (_, true) => super::engine::settle_deferred_untap_transition(state, events),
-        }
+        super::engine::auto_advance_settling_deferral(state, events)
     })
 }
 
