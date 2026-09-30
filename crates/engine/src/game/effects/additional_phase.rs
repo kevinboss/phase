@@ -1,6 +1,6 @@
 use crate::game::quantity::resolve_quantity;
 use crate::game::targeting::extract_player_from_event;
-use crate::game::turns::{first_phase_of_turn_has_ended, last_step_of_phase};
+use crate::game::turns::{final_step_of_phase_in_progress, first_phase_of_turn_has_ended};
 use crate::types::ability::{
     Effect, EffectError, EffectKind, ExtraPhaseAnchor, ExtraPhaseRecipient, ResolvedAbility,
     TargetFilter, TargetRef,
@@ -10,22 +10,29 @@ use crate::types::game_state::{ExtraPhase, GameState};
 use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
 
 /// CR 500.8 + CR 500.9 + CR 500.10: the step an added phase or step follows.
-/// "This step/phase" is the step/phase in which the effect resolves. `None`:
+/// "This step/phase" is the step/phase in which the effect resolves; inside a
+/// phase an effect added, "this phase" is that phase, and inside a step an
+/// effect added, the phase that step was added to
+/// (`turns::final_step_of_phase_in_progress`). `None`:
 /// there is no such phase to add after (CR 500.8), because the text names a
-/// kind of phase (CR 505.1 "this main phase") that the effect is not resolving
-/// in, or the first phase of a kind this turn and that phase has already ended
+/// kind of phase (CR 505.1 "this main phase") that the phase in progress is
+/// not, or the first phase of a kind this turn and that phase has already ended
 /// (CR 505.1b).
 fn anchor_step(after: &ExtraPhaseAnchor, state: &GameState) -> Option<Phase> {
     let current = state.phase;
     match after {
         ExtraPhaseAnchor::Step(step) => Some(*step),
         ExtraPhaseAnchor::ThisStep => Some(current),
-        ExtraPhaseAnchor::ThisPhase { named: None } => Some(last_step_of_phase(current)),
+        ExtraPhaseAnchor::ThisPhase { named: None } => Some(final_step_of_phase_in_progress(state)),
         ExtraPhaseAnchor::ThisPhase {
             named: Some(groups),
-        } => groups
-            .contains(&current.group())
-            .then(|| last_step_of_phase(current)),
+        } => {
+            // CR 500.9: a step added to a phase is part of it, so the kind of
+            // the phase in progress is read from its end, not from the step
+            // the effect resolves in.
+            let end = final_step_of_phase_in_progress(state);
+            groups.contains(&end.group()).then_some(end)
+        }
         ExtraPhaseAnchor::FirstOfTurn(group) => {
             (!first_phase_of_turn_has_ended(state, *group)).then(|| group.last_step())
         }
@@ -1375,6 +1382,300 @@ mod tests {
 
         resolve(&mut state, &ability, &mut events).unwrap();
 
+        assert!(state.extra_phases.is_empty());
+    }
+
+    /// Test helper: the anchor "after this phase, there is an additional draw
+    /// step" (Untap, Upkeep, Draw's draw mode) resolves to in the step
+    /// `resolving`, with `units` the added units the step is inside, outermost
+    /// first.
+    fn this_phase_anchor_inside(units: &[(Phase, TurnSegment)], resolving: Phase) -> Phase {
+        let mut state = GameState {
+            active_player: PlayerId(0),
+            phase: resolving,
+            extra_phase_resume: units
+                .iter()
+                .map(|&(anchor, segment)| InsertedPhaseResume {
+                    anchor,
+                    segment,
+                    entry: ExtraPhaseId::default(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let ability = make_ability(
+            ExtraPhaseRecipient::NoPlayer,
+            TurnSegment::CreatedPhase(Phase::Draw),
+            ExtraPhaseAnchor::ThisPhase { named: None },
+            vec![],
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        match state.extra_phases.as_slice() {
+            [entry] => entry.anchor,
+            other => panic!("expected one scheduled entry, got {other:?}"),
+        }
+    }
+
+    /// CR 500.10 + CR 500.11: a phase created to hold only one step ends when
+    /// that step ends, because its other steps are skipped, so "after this
+    /// phase" resolving inside it anchors at that step (Untap, Upkeep, Draw
+    /// cast inside one of Obeka's upkeep-only phases), not at the last step of
+    /// the phase that normally holds it (draw, cleanup).
+    #[test]
+    fn this_phase_inside_a_created_phase_anchors_at_its_step() {
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[(Phase::EndCombat, TurnSegment::CreatedPhase(Phase::Upkeep))],
+                Phase::Upkeep,
+            ),
+            Phase::Upkeep
+        );
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[(Phase::PostCombatMain, TurnSegment::CreatedPhase(Phase::End))],
+                Phase::End,
+            ),
+            Phase::End
+        );
+    }
+
+    /// CR 500.9: a step added to a phase is part of that phase, so "after this
+    /// phase" resolving in the added step anchors at the enclosing phase's last
+    /// step: the turn's own beginning phase ends with its draw step, a created
+    /// upkeep-only phase with its upkeep, and the combat phase upkeep steps
+    /// were added to (one after beginning of combat, The Ninth Doctor, and one
+    /// after that one) with end of combat.
+    #[test]
+    fn this_phase_inside_an_added_step_anchors_at_the_enclosing_phase() {
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[(Phase::Upkeep, TurnSegment::Step(Phase::Upkeep))],
+                Phase::Upkeep,
+            ),
+            Phase::Draw
+        );
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[
+                    (Phase::EndCombat, TurnSegment::CreatedPhase(Phase::Upkeep)),
+                    (Phase::Upkeep, TurnSegment::Step(Phase::Upkeep)),
+                ],
+                Phase::Upkeep,
+            ),
+            Phase::Upkeep
+        );
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[(Phase::BeginCombat, TurnSegment::Step(Phase::Upkeep))],
+                Phase::Upkeep,
+            ),
+            Phase::EndCombat
+        );
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[
+                    (Phase::BeginCombat, TurnSegment::Step(Phase::Upkeep)),
+                    (Phase::Upkeep, TurnSegment::Step(Phase::Upkeep)),
+                ],
+                Phase::Upkeep,
+            ),
+            Phase::EndCombat
+        );
+    }
+
+    /// CR 500.9 + CR 500.8: an upkeep step added after beginning of combat is
+    /// part of that combat phase, so "after this combat phase" (Raphael, Save
+    /// Point) resolving in it anchors at end of combat, and "after this main
+    /// phase" adds nothing there (CR 505.1).
+    #[test]
+    fn named_phase_inside_an_added_step_reads_the_phase_it_was_added_to() {
+        for (after, expected) in [
+            (
+                ExtraPhaseAnchor::ThisPhase {
+                    named: Some(vec![PhaseGroup::Combat]),
+                },
+                vec![ep(Phase::EndCombat, TurnSegment::Phase(PhaseGroup::Combat))],
+            ),
+            (ExtraPhaseAnchor::this_main_phase(), vec![]),
+        ] {
+            let mut state = GameState {
+                active_player: PlayerId(0),
+                phase: Phase::Upkeep,
+                extra_phase_resume: vec![InsertedPhaseResume {
+                    anchor: Phase::BeginCombat,
+                    segment: TurnSegment::Step(Phase::Upkeep),
+                    entry: ExtraPhaseId::default(),
+                }],
+                ..Default::default()
+            };
+            let ability = make_ability(
+                ExtraPhaseRecipient::NoPlayer,
+                TurnSegment::Phase(PhaseGroup::Combat),
+                after.clone(),
+                vec![],
+                PlayerId(0),
+            );
+            resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+            assert_eq!(scheduled(&state), expected, "{after:?}");
+        }
+    }
+
+    /// CR 500.8: inside a whole added phase, "after this phase" anchors at that
+    /// phase's last step. The innermost added phase is the one in progress: a
+    /// combat added after a created upkeep-only phase has ended runs inside
+    /// that phase's record, and ends with end of combat.
+    #[test]
+    fn this_phase_inside_an_added_phase_anchors_at_its_last_step() {
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[(Phase::EndCombat, TurnSegment::Phase(PhaseGroup::Beginning))],
+                Phase::Upkeep,
+            ),
+            Phase::Draw
+        );
+        assert_eq!(
+            this_phase_anchor_inside(
+                &[
+                    (Phase::EndCombat, TurnSegment::CreatedPhase(Phase::Upkeep)),
+                    (Phase::Upkeep, TurnSegment::Phase(PhaseGroup::Combat)),
+                ],
+                Phase::DeclareAttackers,
+            ),
+            Phase::EndCombat
+        );
+    }
+
+    /// CR 500.8 + CR 500.10: a phase added "after this phase" from inside one of
+    /// Obeka's upkeep-only phases runs directly after that phase, before
+    /// Obeka's other upkeep-only phase, and the turn then continues to the
+    /// postcombat main phase. Reach guard: the effect resolves with the turn
+    /// machine inside the created phase.
+    #[test]
+    fn this_phase_inside_a_created_upkeep_phase_runs_directly_after_it() {
+        let mut state = GameState {
+            active_player: PlayerId(0),
+            phase: Phase::CombatDamage,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let obeka = make_ability_with_count(
+            ExtraPhaseRecipient::Controller,
+            TurnSegment::CreatedPhase(Phase::Upkeep),
+            ExtraPhaseAnchor::ThisPhase { named: None },
+            vec![],
+            PlayerId(0),
+            QuantityExpr::Fixed { value: 2 },
+        );
+        resolve(&mut state, &obeka, &mut events).unwrap();
+        crate::game::turns::advance_phase(&mut state, &mut events);
+        crate::game::turns::advance_phase(&mut state, &mut events);
+        assert_eq!(state.phase, Phase::Upkeep);
+        assert_eq!(
+            state
+                .extra_phase_resume
+                .iter()
+                .map(|unit| (unit.anchor, unit.segment))
+                .collect::<Vec<_>>(),
+            vec![(Phase::EndCombat, TurnSegment::CreatedPhase(Phase::Upkeep))]
+        );
+
+        let draw_mode = make_ability(
+            ExtraPhaseRecipient::NoPlayer,
+            TurnSegment::CreatedPhase(Phase::Draw),
+            ExtraPhaseAnchor::ThisPhase { named: None },
+            vec![],
+            PlayerId(0),
+        );
+        resolve(&mut state, &draw_mode, &mut events).unwrap();
+
+        let mut sequence = Vec::new();
+        for _ in 0..8 {
+            crate::game::turns::advance_phase(&mut state, &mut events);
+            sequence.push(state.phase);
+            if state.phase == Phase::PostCombatMain {
+                break;
+            }
+        }
+        assert_eq!(
+            sequence,
+            vec![Phase::Draw, Phase::Upkeep, Phase::PostCombatMain]
+        );
+        assert!(state.extra_phases.is_empty());
+        assert!(state.extra_phase_resume.is_empty());
+    }
+
+    /// CR 500.9 + CR 500.8: inside one of Obeka's upkeep-only phases, an upkeep
+    /// step added after this step (Paradox Haze's shape) is part of that phase,
+    /// so a draw phase added after the phase, even when created later, runs
+    /// after the added step, and Obeka's other upkeep-only phase after both.
+    /// Each entered step is paired with the innermost added unit it runs in.
+    #[test]
+    fn an_added_step_runs_before_a_phase_added_after_its_phase() {
+        let mut state = GameState {
+            active_player: PlayerId(0),
+            phase: Phase::CombatDamage,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let obeka = make_ability_with_count(
+            ExtraPhaseRecipient::Controller,
+            TurnSegment::CreatedPhase(Phase::Upkeep),
+            ExtraPhaseAnchor::ThisPhase { named: None },
+            vec![],
+            PlayerId(0),
+            QuantityExpr::Fixed { value: 2 },
+        );
+        resolve(&mut state, &obeka, &mut events).unwrap();
+        crate::game::turns::advance_phase(&mut state, &mut events);
+        crate::game::turns::advance_phase(&mut state, &mut events);
+        assert_eq!(state.phase, Phase::Upkeep);
+        assert_eq!(
+            state.extra_phase_resume.len(),
+            1,
+            "inside the created upkeep"
+        );
+
+        for (segment, after) in [
+            (TurnSegment::Step(Phase::Upkeep), ExtraPhaseAnchor::ThisStep),
+            (
+                TurnSegment::CreatedPhase(Phase::Draw),
+                ExtraPhaseAnchor::ThisPhase { named: None },
+            ),
+        ] {
+            let ability = make_ability(
+                ExtraPhaseRecipient::Controller,
+                segment,
+                after,
+                vec![],
+                PlayerId(0),
+            );
+            resolve(&mut state, &ability, &mut events).unwrap();
+        }
+
+        let mut sequence = Vec::new();
+        for _ in 0..8 {
+            crate::game::turns::advance_phase(&mut state, &mut events);
+            sequence.push((
+                state.phase,
+                state.extra_phase_resume.last().map(|unit| unit.segment),
+            ));
+            if state.phase == Phase::PostCombatMain {
+                break;
+            }
+        }
+        assert_eq!(
+            sequence,
+            vec![
+                (Phase::Upkeep, Some(TurnSegment::Step(Phase::Upkeep))),
+                (Phase::Draw, Some(TurnSegment::CreatedPhase(Phase::Draw))),
+                (
+                    Phase::Upkeep,
+                    Some(TurnSegment::CreatedPhase(Phase::Upkeep))
+                ),
+                (Phase::PostCombatMain, None),
+            ]
+        );
         assert!(state.extra_phases.is_empty());
     }
 

@@ -3,7 +3,7 @@
 //! in written order, so the most recently added one runs first (CR 702.42b +
 //! CR 500.8).
 
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{CardBuilder, GameRunner, GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{Effect, ExtraPhaseAnchor, ExtraPhaseRecipient};
 use engine::types::actions::GameAction;
@@ -25,15 +25,20 @@ fn board(islands: usize) -> (GameScenario, ObjectId, Vec<ObjectId>) {
         .collect();
     scenario.add_card_to_library_top(P0, "Island");
     scenario.add_card_to_library_top(P0, "Island");
-    let spell = scenario
-        .add_spell_to_hand_from_oracle(P0, NAME, false, ORACLE)
+    let spell = add_spell(&mut scenario).id();
+    (scenario, spell, lands)
+}
+
+/// Puts a copy of Untap, Upkeep, Draw into P0's hand.
+fn add_spell(scenario: &mut GameScenario) -> CardBuilder<'_> {
+    let mut spell = scenario.add_spell_to_hand_from_oracle(P0, NAME, false, ORACLE);
+    spell
         .from_oracle_text_with_keywords(&["Entwine"], ORACLE)
         .with_mana_cost(ManaCost::Cost {
             shards: vec![ManaCostShard::Blue],
             generic: 1,
-        })
-        .id();
-    (scenario, spell, lands)
+        });
+    spell
 }
 
 /// Passes priority until the beginning of combat, returning every step the
@@ -168,5 +173,37 @@ fn entwined_cast_runs_draw_upkeep_then_untap() {
         ]
     );
     assert_eq!(tapped(&runner, &lands), vec![false; 5]);
+    assert_eq!(runner.state().players[0].hand.len(), hand + 1);
+}
+
+/// CR 500.8 + CR 500.10 + CR 702.8a: with flash granted, a second copy cast
+/// inside the upkeep-only phase the first copy created resolves there, so its
+/// draw mode's "after this phase" is after that created phase: the draw step
+/// runs before the natural combat, this turn.
+#[test]
+fn draw_mode_cast_inside_the_created_upkeep_phase_runs_after_it() {
+    let (mut scenario, first, _) = board(4);
+    let second = add_spell(&mut scenario).flash().id();
+    let mut runner = scenario.build();
+    runner.cast(first).modes(&[1]).resolve();
+    while runner.state().phase != Phase::Upkeep {
+        runner.act(GameAction::PassPriority).expect("pass priority");
+        assert_ne!(
+            runner.state().phase,
+            Phase::BeginCombat,
+            "no created upkeep"
+        );
+    }
+    runner.cast(second).modes(&[2]).resolve();
+    assert_eq!(
+        runner.state().phase,
+        Phase::Upkeep,
+        "resolved in the upkeep"
+    );
+    let hand = runner.state().players[0].hand.len();
+
+    let steps = steps_to_combat(&mut runner);
+
+    assert_eq!(steps, vec![Phase::Upkeep, Phase::Draw, Phase::BeginCombat]);
     assert_eq!(runner.state().players[0].hand.len(), hand + 1);
 }

@@ -16,7 +16,7 @@ use crate::types::game_state::{
     PendingEmptyPoolLifeLoss, TurnBoundary, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
-use crate::types::phase::{Phase, PhaseGroup};
+use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
 use crate::types::statics::{HandSizeModification, StaticMode, StaticModeKind};
@@ -52,10 +52,40 @@ pub fn next_phase(phase: Phase) -> Phase {
 /// (`PhaseGroup::last_step`). Anchors an inserted whole phase "after this
 /// phase" (CR 500.8): the insert lands after the containing phase's last step,
 /// and the turn resumes at that phase's natural successor
-/// (`next_phase(last_step_of_phase(this_phase))`). Used by
-/// `additional_phase::anchor_step` for `ExtraPhaseAnchor::ThisPhase`.
-pub(crate) fn last_step_of_phase(phase: Phase) -> Phase {
+/// (`next_phase(last_step_of_phase(this_phase))`). The last step of one of the
+/// turn's own phases, for [`final_step_of_phase_in_progress`].
+fn last_step_of_phase(phase: Phase) -> Phase {
     phase.group().last_step()
+}
+
+/// CR 500.8 + CR 500.9 + CR 500.10: the last step of the phase in progress,
+/// which "after this phase" anchors at. The innermost added unit that is a
+/// phase decides it: a whole added phase ends with its segment's final step,
+/// and a phase created to hold one step ends with that step, because its
+/// other steps are skipped (CR 500.11). A step added to a phase is part of
+/// that phase (CR 500.9), so it is passed over. With no added phase open, the
+/// phase in progress is the turn's own phase that holds the step the outermost
+/// added step was added after, or, with no added step open either, the one
+/// that holds the current step.
+pub(crate) fn final_step_of_phase_in_progress(state: &GameState) -> Phase {
+    state
+        .extra_phase_resume
+        .iter()
+        .rev()
+        .find_map(|unit| match unit.segment {
+            TurnSegment::Step(_) => None,
+            segment @ (TurnSegment::Phase(_) | TurnSegment::CreatedPhase(_)) => {
+                Some(segment.final_step())
+            }
+        })
+        .unwrap_or_else(|| {
+            last_step_of_phase(
+                state
+                    .extra_phase_resume
+                    .first()
+                    .map_or(state.phase, |unit| unit.anchor),
+            )
+        })
 }
 
 /// CR 500.8 + CR 505.1a + CR 505.1b: whether the first phase of `group` this
@@ -83,12 +113,12 @@ pub(crate) fn first_phase_of_turn_has_ended(state: &GameState, group: PhaseGroup
 }
 
 /// CR 500.8 + CR 500.9 + CR 500.10: the successor of the step `leaving`.
-/// A phase or step queued after the step that just ended runs next, newest
-/// first, entered at its segment's first step. Every taken entry records its
-/// unit, together with the entry's identity (`ExtraPhase::id`); when the final
-/// step of the unit's segment ends, the turn continues as though the unit's
-/// anchor had just ended, so an insert queued for that same anchor runs next
-/// and nested units unwind LIFO.
+/// A step or phase queued after the step that just ended runs next, entered at
+/// its segment's first step: a queued step before a queued phase, each kind
+/// newest first. Every taken entry records its unit, together with the entry's
+/// identity (`ExtraPhase::id`); when the final step of the unit's segment
+/// ends, the turn continues as though the unit's anchor had just ended, so an
+/// insert queued for that same anchor runs next and nested units unwind LIFO.
 /// Otherwise the natural successor follows. An entry anchored at step X is
 /// therefore taken when the next step labelled X ends, including the final
 /// step of an enclosing unit (CR 505.1a: every added main phase is a
@@ -145,7 +175,21 @@ impl ScheduledSuccessor {
         let mut units = state.extra_phase_resume.iter().rev();
         let mut unwound = 0;
         loop {
-            if let Some(index) = state.extra_phases.iter().rposition(|ep| ep.anchor == ended) {
+            // CR 500.9 + CR 500.8: a step added after `ended` is part of the
+            // phase in progress, and a phase added after that phase comes
+            // after all of its steps, so a queued step is taken before a
+            // queued phase. Within each kind the most recently created occurs
+            // first.
+            let queued_step = state.extra_phases.iter().rposition(|ep| {
+                ep.anchor == ended
+                    && match ep.segment {
+                        TurnSegment::Step(_) => true,
+                        TurnSegment::Phase(_) | TurnSegment::CreatedPhase(_) => false,
+                    }
+            });
+            if let Some(index) =
+                queued_step.or_else(|| state.extra_phases.iter().rposition(|ep| ep.anchor == ended))
+            {
                 return Self::Insert { unwound, index };
             }
             match units.next() {
