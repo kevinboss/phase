@@ -62,6 +62,11 @@ fn added_to_turn_in_progress(
             .as_ref()
             .and_then(|event| extract_player_from_event(event, state)),
         ExtraPhaseRecipient::TargetedPlayer(_) => {
+            // CR 115.1 + CR 608.2b: the embedded recipient filter assigned
+            // this instruction its own player slot at announcement and the
+            // chain's initial legality pass retained only its legal target.
+            // Independent empty slots never inherit another clause's player;
+            // legality is not checked again after earlier instructions run.
             ability.targets.iter().find_map(|target| match target {
                 TargetRef::Player(player) => Some(*player),
                 TargetRef::Object(_) => None,

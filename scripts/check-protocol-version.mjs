@@ -36,7 +36,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // v91 retypes PendingManaAbility's required chosen-counter count (#9207).
 // v93 adds the SacrificedForCost reduction provenance.
 // v97 adds TargetReadOrigin instruction provenance.
-// v98 replaces `AdditionalPhase.phase` with a `TurnSegment` `segment`,
+// v99 replaces `AdditionalPhase.phase` with a `TurnSegment` `segment`,
 // retypes `followed_by` to `TurnSegment`, and replaces
 // `AdditionalPhase.target` with an `ExtraPhaseRecipient` `recipient`.
 // Keep the measured base so a future merge cannot collapse independent wire
@@ -66,8 +66,11 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +25: the v96 QuantityRef::NameStickerLetterCount tagged quantity.
 // +26: the v97 serialized TargetReadOrigin (`target_reads`) instruction
 // provenance.
-// +27: the v98 additional-phase segment and recipient parse bump.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 27;
+// +28: the v99 additional-phase segment and recipient parse bump.
+// +27: the v98 PerPlayerScope::Opponents value, the PerPlayerChoiceOrder and
+// SubstituteChooser chooser purposes, and the per-player frame's current and
+// nominee fields.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 28;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -116,9 +119,11 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +23: wire 77 moves with full-game v95 for the FilterProp::BlockStatus reshape.
 // +24: wire 78 moves with full-game v96 for name-sticker quantities.
 // +25: wire 79 moves with full-game v97 for the serialized TargetReadOrigin.
-// +26: wire 80 moves with full-game v98 for the additional-phase segment and
+// +27: wire 81 moves with full-game v99 for the additional-phase segment and
 // recipient.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 26;
+// +26: wire 80 moves with full-game v98 for per-player choice order and
+// PerPlayerScope::Opponents.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 27;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

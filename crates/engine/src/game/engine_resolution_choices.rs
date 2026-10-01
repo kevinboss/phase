@@ -3963,12 +3963,47 @@ pub(super) fn handle_resolution_choice(
             },
             GameAction::ChooseZoneOpponentChooser { opponent },
         ) => {
-            // CR 608.2d: The picked opponent must be one of the offered
-            // candidates (a live opponent of the choose's controller).
+            // CR 608.2d: The picked player must be one of the offered
+            // candidates.
             if !candidates.contains(&opponent) {
                 return Err(EngineError::InvalidAction(format!(
-                    "Chosen zone-choice opponent {opponent:?} is not a legal opponent"
+                    "Chosen zone-choice player {opponent:?} is not a legal candidate"
                 )));
+            }
+            if matches!(purpose, ZoneOpponentChooserPurpose::PerPlayerChoiceOrder) {
+                // CR 101.4c: the chooser picked whose selection to make next.
+                // Candidates may include the chooser themself (each player).
+                effects::choose_from_zone::answer_per_player_order(
+                    state, &ability, opponent, events,
+                )
+                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                // A pool that emptied since the prompt re-advanced instead; if
+                // that disposed the whole iteration, its continuation resumes.
+                if state.active_per_player_zone_choice().is_none() {
+                    effects::choose_from_zone::settle_finished_per_player_iteration(
+                        state, &ability, events,
+                    )
+                    .expect("a settled per-player iteration must resume its continuation");
+                }
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
+            }
+            if matches!(purpose, ZoneOpponentChooserPurpose::SubstituteChooser) {
+                // CR 800.4g: the elected player makes the pending pick only.
+                effects::choose_from_zone::answer_substitute_chooser(
+                    state, &ability, opponent, events,
+                )
+                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                if state.active_per_player_zone_choice().is_none() {
+                    effects::choose_from_zone::settle_finished_per_player_iteration(
+                        state, &ability, events,
+                    )
+                    .expect("a settled per-player iteration must resume its continuation");
+                }
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
             }
             if matches!(purpose, ZoneOpponentChooserPurpose::BindReciprocalConsume) {
                 effects::bind_reciprocal_consumer_from_picker(state, opponent)
@@ -5471,14 +5506,23 @@ pub(super) fn handle_resolution_choice(
             // that tracked set. Hand the choice straight to the drain so it can
             // accumulate and prompt the next player (Breach the Multiverse).
             if state.active_per_player_zone_choice().is_some() {
+                let ability = state
+                    .active_per_player_zone_choice()
+                    .map(|frame| frame.ability.as_ref().clone())
+                    .expect("the active per-player frame was just read");
                 effects::choose_from_zone::drain_active_per_player_zone_choice(
                     state, &chosen, events,
                 );
-                // Only after every player has been prompted (the drain leaves no
-                // pending iteration and is no longer waiting on a choice) does
-                // the parked continuation run.
-                super::engine::resume_pending_continuation_if_priority(state, events)
+                // Only after every player has been chosen for (the drain leaves
+                // no pending iteration and is no longer waiting on a choice)
+                // does the parked continuation run — with priority on a player
+                // still in the game (CR 800.4j).
+                if state.active_per_player_zone_choice().is_none() {
+                    effects::choose_from_zone::settle_finished_per_player_iteration(
+                        state, &ability, events,
+                    )
                     .expect("a settled zone choice must resume its continuation");
+                }
                 return Ok(ResolutionChoiceOutcome::WaitingFor(
                     state.waiting_for.clone(),
                 ));
@@ -6230,6 +6274,34 @@ pub(super) fn handle_resolution_choice(
                         "Selected card is no longer in {:?}",
                         zone
                     )));
+                }
+            }
+
+            // CR 608.2c: For an up-to choice ("You may put a card from among
+            // them into your hand. If you don't, ..."), the validated selection
+            // is whether the instruction was performed. Stamp it on the stashed
+            // continuation so its "if you do" / "if you don't" gates read this
+            // choice rather than the default or an earlier accept-time latch.
+            // CastFromZone is performed by the cast, not the pick (its cast and
+            // decline paths own the flag). Sacrifice is left out: its
+            // player-scope collection re-enters this arm once per player, and
+            // Devour's as-enters pick can sit under a non-continuation frame.
+            // An empty Attach pick discards the continuation; PayCost is a cost.
+            if up_to
+                && matches!(
+                    effect_kind,
+                    EffectKind::ChangeZone
+                        | EffectKind::BounceAll
+                        | EffectKind::Tap
+                        | EffectKind::Untap
+                        | EffectKind::PutAtLibraryPosition
+                )
+            {
+                if let Some(frame) = state.active_ability_continuation_frame_mut() {
+                    frame
+                        .pending
+                        .chain
+                        .set_optional_effect_performed_recursive(!chosen.is_empty());
                 }
             }
 
@@ -10345,10 +10417,11 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, CastPermissionConstraint, CastingPermission, Comparator,
-        ControllerRef, Duration, FilterProp, ManaSpendPermission, PermissionGrantee, QuantityExpr,
-        ReplacementDefinition, ReplacementMode, ReplacementPlayerScope, ResolutionCastFacePolicy,
-        SearchSelectionConstraint, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+        AbilityCondition, AbilityDefinition, AbilityKind, CastPermissionConstraint,
+        CastingPermission, Comparator, ControllerRef, Duration, FilterProp, ManaSpendPermission,
+        PermissionGrantee, QuantityExpr, ReplacementDefinition, ReplacementMode,
+        ReplacementPlayerScope, ResolutionCastFacePolicy, SearchSelectionConstraint,
+        StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::CardId;
@@ -10356,6 +10429,7 @@ mod tests {
     use crate::types::proposed_event::ReplacementId;
     use crate::types::replacements::ReplacementEvent;
     use crate::types::statics::{ProhibitionScope, StaticMode};
+    use crate::types::zones::EtbTapState;
 
     /// CR 701.23a + CR 701.24a: A search whose continuation begins with a
     /// parent-target shuffle must retain the player target after replacing the
@@ -12811,6 +12885,106 @@ mod tests {
             Some(Zone::Graveyard),
             "zero-choice must leave eligible cards unmoved"
         );
+    }
+
+    /// CR 608.2c: An up-to `EffectZoneChoice` records whether its instruction
+    /// was performed on the stashed continuation, for every effect kind whose
+    /// selection is the performance. An empty pick runs an "If you don't"
+    /// rider even over an earlier accept-time `true` latch; a non-empty pick
+    /// skips it even over the default `false`.
+    #[test]
+    fn up_to_effect_zone_choice_stamps_optional_effect_performed() {
+        let kinds = [
+            (EffectKind::ChangeZone, Zone::Graveyard, Some(Zone::Hand)),
+            (EffectKind::BounceAll, Zone::Battlefield, Some(Zone::Hand)),
+            (EffectKind::Tap, Zone::Battlefield, None),
+            (EffectKind::Untap, Zone::Battlefield, None),
+            (EffectKind::PutAtLibraryPosition, Zone::Hand, None),
+        ];
+        for (effect_kind, zone, destination) in kinds {
+            for pick in [false, true] {
+                let mut state = GameState::new_two_player(42);
+                let source = create_object(
+                    &mut state,
+                    CardId(1),
+                    PlayerId(0),
+                    "Source".to_string(),
+                    Zone::Battlefield,
+                );
+                let eligible = create_object(
+                    &mut state,
+                    CardId(2),
+                    PlayerId(0),
+                    "Eligible".to_string(),
+                    zone,
+                );
+                if effect_kind == EffectKind::Untap {
+                    state.objects.get_mut(&eligible).unwrap().tapped = true;
+                }
+                // "If you don't, gain 1 life." Latch the opposite of the pick
+                // so the rider outcome can only come from the stamp.
+                let mut rider = ResolvedAbility::new(
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                    vec![],
+                    source,
+                    PlayerId(0),
+                )
+                .condition(AbilityCondition::Not {
+                    condition: Box::new(AbilityCondition::effect_performed()),
+                });
+                rider.set_optional_effect_performed_recursive(!pick);
+                state.park_ability_continuation(PendingContinuation::new(Box::new(rider), &state));
+                let waiting = WaitingFor::EffectZoneChoice {
+                    player: PlayerId(0),
+                    cards: vec![eligible],
+                    count: 1,
+                    min_count: 0,
+                    up_to: true,
+                    source_id: source,
+                    effect_kind,
+                    zone,
+                    destination,
+                    enter_tapped: EtbTapState::Unspecified,
+                    enter_transformed: false,
+                    enters_under_player: None,
+                    enters_attacking: false,
+                    owner_library: false,
+                    track_exiled_by_source: false,
+                    face_down_in_exile: crate::types::ability::ExileConcealment::Public,
+                    face_down_profile: None,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    count_param: 0,
+                    library_position: None,
+                    mass_library_order: None,
+                    is_cost_payment: false,
+                    enters_modified_if: None,
+                    duration: None,
+                };
+                state.waiting_for = waiting.clone();
+                let life_before = state.players[0].life;
+
+                let chosen = if pick { vec![eligible] } else { vec![] };
+                let mut events = Vec::new();
+                handle_resolution_choice(
+                    &mut state,
+                    waiting,
+                    GameAction::SelectCards { cards: chosen },
+                    &mut events,
+                )
+                .unwrap_or_else(|e| panic!("{effect_kind:?} pick={pick}: {e:?}"));
+
+                let expected_gain = if pick { 0 } else { 1 };
+                assert_eq!(
+                    state.players[0].life - life_before,
+                    expected_gain,
+                    "{effect_kind:?} pick={pick}: \"If you don't\" rider must read the choice"
+                );
+            }
+        }
     }
 
     /// Minimal 1/1 `CopiableValues` for the `Tokens` stash kind — only the VARIANT is under

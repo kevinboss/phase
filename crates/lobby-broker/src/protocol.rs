@@ -60,7 +60,7 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 98 — `Effect::AdditionalPhase` states what it adds as the text words it
+/// 99 — `Effect::AdditionalPhase` states what it adds as the text words it
 ///      (CR 500.8–500.10). Its `phase` field (a `Phase`) was replaced by
 ///      `segment`, the adjacently tagged `TurnSegment` 82 introduced
 ///      (`{"type":"Phase","data":"Combat"}`,
@@ -75,7 +75,16 @@ pub struct TournamentRequestId(pub u64);
 ///      `GameObject`, so every full-GameState frame holding any
 ///      additional-phase card is unparseable across the pair — an
 ///      unconditional PARSE bump like 82. Lobby messages are unchanged, and
-///      P2P moves in lockstep (wire 80).
+///      P2P moves in lockstep (wire 81).
+/// 98 — `PerPlayerScope` gains `Opponents` (CR 102.2 + CR 102.3), the
+///      team-relative population of "for each opponent, choose …" (Ultimate
+///      Magic: Meteor), written as `{"Each":"Opponents"}` inside `ZoneOwner`.
+///      `ZoneOpponentChooserPurpose` gains `PerPlayerChoiceOrder` (CR 101.4c:
+///      the chooser picks whose selection to make next) and `SubstituteChooser`
+///      (CR 800.4g: electing who makes a departed player's pick), and the
+///      parked per-player zone-choice frame gains `current` and `nominee`. A
+///      v97 peer cannot deserialize the new values. Full-game peers and P2P move in lockstep
+///      (wire 80); lobby messages are unchanged.
 /// 97 — `ResolvedAbility.target_reads` and `AbilityDefinition.target_reads`
 ///      (`TargetReadOrigin`, `#[serde(default, skip_serializing_if = ...)]`) are
 ///      new: `ParentAnnouncement` marks an instruction whose `Target` reads name
@@ -820,7 +829,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 98;
+pub const PROTOCOL_VERSION: u32 = 99;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2061,12 +2070,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 98);
+        assert_eq!(PROTOCOL_VERSION, 99);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 97);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 98);
     }
 
     #[test]

@@ -7736,6 +7736,8 @@ mod tests {
                 ability: Box::new(choose_from_zone),
                 remaining_players: Vec::new(),
                 accumulated: false,
+                current: None,
+                nominee: None,
             },
         );
         crate::game::effects::choose_from_zone::drain_active_per_player_zone_choice(

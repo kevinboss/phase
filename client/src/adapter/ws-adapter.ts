@@ -210,13 +210,19 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 98 — Effect.AdditionalPhase carries segment, a TurnSegment, in place of
+ * 99 — Effect.AdditionalPhase carries segment, a TurnSegment, in place of
  *      phase, followed_by holds TurnSegments, and recipient, an
  *      ExtraPhaseRecipient, replaces target — see PROTOCOL_VERSION's own
- *      `/// 98` entry in crates/lobby-broker/src/protocol.rs. This client
- *      hands server frames to JSON.parse, so a v97 client would take the new
+ *      `/// 99` entry in crates/lobby-broker/src/protocol.rs. This client
+ *      hands server frames to JSON.parse, so a v98 client would take the new
  *      shape with no decode error; the exact-match version check at connect
  *      refuses the pairing instead.
+ * 98 — PerPlayerScope gains Opponents (CR 102.2 + CR 102.3), written inside
+ *      ZoneOwner as {"Each":"Opponents"}; ZoneOpponentChooserPurpose gains
+ *      PerPlayerChoiceOrder (CR 101.4c) and SubstituteChooser (CR 800.4g);
+ *      the parked per-player zone-choice frame gains current and nominee. A v97 peer cannot deserialize them; the exact-match handshake
+ *      refuses the pairing. P2P moves in lockstep (wire 80); lobby messages
+ *      are unchanged.
  * 97 — ResolvedAbility.target_reads and AbilityDefinition.target_reads
  *      (TargetReadOrigin) are serialized: a ParentAnnouncement instruction
  *      reads the object its immediately preceding instruction announced
@@ -657,7 +663,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 98;
+export const PROTOCOL_VERSION = 99;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -1690,7 +1696,7 @@ export class WebSocketAdapter implements EngineAdapter {
     // native sidecar is a local trusted transport rather than a network socket.
     if (
       !this.serverUrl.startsWith("wss://")
-      && !this.serverUrl.startsWith("native-engine://")
+      && !this.isNativeSocket()
     ) {
       throw new AdapterError(
         "WS_ERROR",

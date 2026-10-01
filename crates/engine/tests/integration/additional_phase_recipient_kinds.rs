@@ -3,8 +3,7 @@
 //! is chosen when the spell is cast, re-checked when it resolves, and the phase
 //! goes only to that player's own turn. A player target lost before
 //! resolution in the spell's first clause is not replaced by the spell's
-//! controller; a later clause's lost target is refilled from the parent
-//! clause's targets by chain target propagation (follow-up F-26).
+//! controller or a surviving player from another instruction.
 //!
 //! No printed card says "target player gets an additional … phase"; the
 //! grammar reaches it (charter C8c-a), so these rows use synthetic text.
@@ -17,7 +16,7 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::static_abilities::player_has_hexproof;
 use engine::game::trigger_index::reindex_object_triggers;
 use engine::types::ability::{
-    ControllerRef, EffectKind, StaticDefinition, TargetFilter, TargetRef, TypedFilter,
+    ControllerRef, Effect, EffectKind, StaticDefinition, TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
@@ -185,16 +184,146 @@ fn a_lost_player_target_is_not_replaced_by_the_controller() {
     }
 }
 
-/// CR 500.10a: "each player gets" grants the phase to each player in turn,
-/// and each grant is gated on that player's own turn, so on P0's turn exactly
-/// one combat is added (P0's), not one per player. Reach guard: the effect
-/// resolved.
+/// CR 115.1 + CR 608.2b + CR 500.10a: identical player filters announce
+/// distinct slots. The grant uses its own surviving target, never a preceding
+/// life instruction's target. The text is synthetic grammar coverage.
 #[test]
-fn each_player_gets_adds_only_the_active_players_phase() {
-    let (mut runner, spell, _) = board(P0, EACH_PLAYER_COMBAT);
-    let outcome = runner.cast(spell).resolve();
+fn a_later_player_grant_preserves_its_own_slot_and_illegal_targets_stay_empty() {
+    const TEXT: &str = "Target player gains 3 life. Target player gets an additional combat phase after this phase.";
+    for (caster, earlier, recipient, make_illegal, added) in [
+        (P0, P0, P0, false, 1),
+        (P0, P1, P0, false, 1),
+        (P0, P0, P1, false, 0),
+        (P0, P0, P1, true, 0),
+        (P1, P1, P0, false, 1),
+        (P1, P1, P0, true, 0),
+    ] {
+        let (mut runner, spell, _) = board(caster, TEXT);
+        let mut committed = runner
+            .cast(spell)
+            .target_players(&[earlier, recipient])
+            .commit();
+        let root = committed
+            .state()
+            .stack
+            .last()
+            .and_then(|entry| entry.ability())
+            .unwrap();
+        assert!(
+            std::iter::successors(Some(root), |node| node.sub_ability.as_deref())
+                .all(|node| !matches!(node.effect, Effect::Unimplemented { .. })),
+            "reach guard: no instruction is unsupported"
+        );
+        assert!(matches!(root.effect, Effect::GainLife { .. }));
+        assert_eq!(root.targets, vec![TargetRef::Player(earlier)]);
+        let grant = root.sub_ability.as_deref().unwrap();
+        assert!(matches!(grant.effect, Effect::AdditionalPhase { .. }));
+        assert_eq!(grant.targets, vec![TargetRef::Player(recipient)]);
+        assert!(
+            grant.sub_ability.is_none(),
+            "both clauses reached their supported effects"
+        );
+        if make_illegal {
+            grant_hexproof(committed.state_mut(), recipient);
+            assert!(player_has_hexproof(committed.state(), recipient));
+        }
+        let outcome = committed.resolve();
+        outcome.assert_life_delta(earlier, 3);
+        assert!(
+            resolved_additional_phase(outcome.events()),
+            "the legal earlier target keeps the chain resolving"
+        );
+        assert_eq!(outcome.state().extra_phases.len(), added,
+            "caster {caster:?}, earlier {earlier:?}, recipient {recipient:?}, illegal {make_illegal}");
+    }
+}
+
+/// CR 608.2b: legality is checked before instructions resolve, so hexproof
+/// gained from an earlier instruction does not invalidate the later grant.
+#[test]
+fn a_player_becoming_hexproof_mid_resolution_keeps_the_announced_phase_grant() {
+    const TEXT: &str = "Return target creature card from a graveyard to the battlefield. Target player gets an additional combat phase after this phase.";
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let grantor = scenario
+        .add_creature_to_graveyard(P0, "Hexproof Grantor", 2, 2)
+        .with_static_definition(StaticDefinition::new(StaticMode::Hexproof).affected(
+            TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::SpecificPlayer { id: P0 }),
+            ),
+        ))
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P1, "Mid-resolution Recipient Probe", true, TEXT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    assert!(!player_has_hexproof(runner.state(), P0));
+    runner
+        .act(GameAction::PassPriority)
+        .expect("P0 passes priority to the caster");
+    let committed = runner
+        .cast(spell)
+        .target_object(grantor)
+        .target_player(P0)
+        .commit();
+    let root = committed
+        .state()
+        .stack
+        .last()
+        .and_then(|entry| entry.ability())
+        .unwrap();
+    assert!(
+        std::iter::successors(Some(root), |node| node.sub_ability.as_deref())
+            .all(|node| !matches!(node.effect, Effect::Unimplemented { .. }))
+    );
+    assert_eq!(root.targets, vec![TargetRef::Object(grantor)]);
+    assert_eq!(
+        root.sub_ability.as_deref().unwrap().targets,
+        vec![TargetRef::Player(P0)]
+    );
+    assert!(matches!(root.effect, Effect::ChangeZone { .. }));
+    assert!(matches!(
+        root.sub_ability.as_deref().unwrap().effect,
+        Effect::AdditionalPhase { .. }
+    ));
+    let outcome = committed.resolve();
+    outcome.assert_zone(&[grantor], Zone::Battlefield);
+    assert!(
+        player_has_hexproof(outcome.state(), P0),
+        "the preceding instruction granted hexproof"
+    );
     assert!(resolved_additional_phase(outcome.events()));
     assert_eq!(outcome.state().extra_phases.len(), 1);
+}
+
+/// CR 500.10a: "each player gets" grants the phase to each player in turn,
+/// and each grant is gated on that player's own turn. On P0's and P1's turns
+/// exactly one combat is added. Reach guard: the effect resolves once per player.
+#[test]
+fn each_player_gets_adds_only_the_active_players_phase() {
+    for active in [P0, P1] {
+        let (mut runner, spell, _) = board(P0, EACH_PLAYER_COMBAT);
+        runner.state_mut().active_player = active;
+        let outcome = runner.cast(spell).resolve();
+        assert_eq!(outcome.state().active_player, active);
+        assert_eq!(
+            outcome
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::AdditionalPhase,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "reach guard: the grant resolves for each player on {active:?}'s turn"
+        );
+        assert_eq!(outcome.state().extra_phases.len(), 1);
+    }
 }
 
 /// CR 500.10a + CR 603.2: Paradox Haze's "that player gets" names the player
