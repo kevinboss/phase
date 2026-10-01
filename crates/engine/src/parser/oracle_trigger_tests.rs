@@ -154,6 +154,43 @@ fn dies_trigger_owner_subject_anchors_each_other_player_scope() {
     );
 }
 
+/// Oracle of the Alpha (verbatim ETB line): the collective-name conjure head
+/// lowers to a 9-entry `Conjure` with the `Shuffle` sub-ability chained — the
+/// full trigger body parses with zero `Unimplemented`.
+#[test]
+fn oracle_of_the_alpha_etb_conjures_power_nine_then_shuffles() {
+    let trigger = parse_trigger_line(
+        "When Oracle of the Alpha enters the battlefield, conjure the Power Nine into your library, then shuffle.",
+        "Oracle of the Alpha",
+    );
+
+    assert_eq!(trigger.mode, TriggerMode::ChangesZone);
+    assert_eq!(trigger.destination, Some(Zone::Battlefield));
+    let execute = trigger.execute.as_deref().expect("ETB trigger body");
+    assert_no_unimplemented(execute);
+
+    let Effect::Conjure {
+        cards, destination, ..
+    } = execute.effect.as_ref()
+    else {
+        panic!("expected Power Nine conjure head, got {:?}", execute.effect);
+    };
+    assert_eq!(cards.len(), 9);
+    assert_eq!(cards[0].named_name(), Some("Ancestral Recall"));
+    assert_eq!(cards[8].named_name(), Some("Timetwister"));
+    assert_eq!(*destination, Zone::Library);
+
+    let shuffle = execute
+        .sub_ability
+        .as_deref()
+        .expect("shuffle follows the conjure");
+    assert!(
+        matches!(shuffle.effect.as_ref(), Effect::Shuffle { .. }),
+        "expected Shuffle sub-ability, got {:?}",
+        shuffle.effect
+    );
+}
+
 /// CR 108.3 + CR 608.2c: After phase 3 extracts the intervening-if head, the
 /// remaining Goat-shaped body must still bind "each other player" to the owner
 /// subject immediately preceding it.
@@ -17692,6 +17729,51 @@ fn trigger_blocks_a_creature() {
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
 }
 
+/// CR 509.1 + CR 603.7a + CR 608.2c: Wall of Tears
+/// "Whenever this creature blocks a creature, return that creature to its owner's hand at end of combat."
+/// "that creature" inside the delayed trigger refers to the blocked creature (the attacker),
+/// which resolves to `ParentTarget` from the `BlockersDeclared` trigger event.
+#[test]
+fn trigger_wall_of_tears_blocks_a_creature() {
+    let def = parse_trigger_line(
+        "Whenever Wall of Tears blocks a creature, return that creature to its owner's hand at end of combat.",
+        "Wall of Tears",
+    );
+    assert_eq!(def.mode, TriggerMode::Blocks);
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::Typed(TypedFilter::creature()))
+    );
+    let execute = def
+        .execute
+        .as_deref()
+        .expect("Wall of Tears must lower to an execute ability");
+    match execute.effect.as_ref() {
+        Effect::CreateDelayedTrigger {
+            condition, effect, ..
+        } => {
+            assert_eq!(
+                *condition,
+                DelayedTriggerCondition::AtNextPhase {
+                    phase: Phase::EndCombat
+                }
+            );
+            match effect.effect.as_ref() {
+                Effect::Bounce { target, .. } | Effect::ChangeZone { target, .. } => {
+                    assert_eq!(
+                        *target,
+                        TargetFilter::ParentTarget,
+                        "Wall of Tears must target the blocked creature via ParentTarget, not SelfRef"
+                    );
+                }
+                other => panic!("expected Bounce or ChangeZone, got {other:?}"),
+            }
+        }
+        other => panic!("expected CreateDelayedTrigger, got {other:?}"),
+    }
+}
+
 #[test]
 fn trigger_blocks_or_becomes_blocked() {
     // CR 509.1h + CR 509.3d: "blocks or becomes blocked" is a compound trigger —
@@ -23549,6 +23631,10 @@ fn trigger_two_or_more_typed_creatures_attack() {
     );
     assert_eq!(def.mode, TriggerMode::YouAttack);
     assert!(def.batched);
+    // CR 506.2 + CR 603.2: an unscoped subject ("two or more Dinosaurs") is not
+    // limited to the source controller's attackers — any attacking player's
+    // declaration can satisfy it, so the attacking-player gate is pass-through.
+    assert_eq!(def.valid_target, Some(TargetFilter::Player));
     match &def.valid_card {
         Some(TargetFilter::Typed(tf)) => assert!(
             tf.type_filters
@@ -23559,26 +23645,353 @@ fn trigger_two_or_more_typed_creatures_attack() {
         ),
         other => panic!("expected Typed valid_card with Dinosaur, got {other:?}"),
     }
+    // CR 508.1a + CR 805.10b: no controller restriction; counts attacking
+    // Dinosaurs, read at the trigger event (CR 603.2).
+    let Some(TriggerCondition::EventTime { condition }) = &def.condition else {
+        panic!(
+            "expected EventTime {{ QuantityComparison {{ ObjectCount(Dinosaur + Attacking) GE 2 }} }}, got {:?}",
+            def.condition
+        );
+    };
+    match condition.as_ref() {
+        TriggerCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        } => {
+            assert_eq!(
+                filter,
+                &add_property(
+                    def.valid_card.clone().expect("valid_card"),
+                    FilterProp::Attacking { defender: None },
+                ),
+                "count = subject + Attacking"
+            );
+            match filter {
+                TargetFilter::Typed(tf) => {
+                    assert!(
+                        tf.type_filters
+                            .iter()
+                            .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Dinosaur")),
+                        "expected Dinosaur subtype in count filter, got {:?}",
+                        tf.type_filters,
+                    );
+                    assert_eq!(tf.controller, None, "unscoped count: no controller");
+                }
+                other => panic!("expected Typed count filter, got {other:?}"),
+            }
+        }
+        other => panic!(
+            "expected QuantityComparison {{ ObjectCount(Dinosaur + Attacking) GE 2 }}, got {other:?}"
+        ),
+    }
+}
+
+/// Shared shape assertions for an unscoped one-or-more subject-led attack
+/// trigger ("Whenever one or more creatures attack, ...").
+fn assert_unscoped_one_or_more_creatures_attack(def: &TriggerDefinition) {
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    assert!(def.batched);
+    // CR 506.2 + CR 603.2: an unscoped subject watches every attacking player —
+    // the attacking-player gate is the `Player` pass-through.
+    assert_eq!(def.valid_target, Some(TargetFilter::Player));
+    assert_eq!(def.condition, None, "one or more ⇒ no count condition");
+    assert_eq!(def.attack_target_filter, None);
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::creature())),
+        "subject carries no controller scope"
+    );
+}
+
+/// G1: Duelist's Heritage (verbatim Oracle) — fires on any player's attack.
+#[test]
+fn trigger_one_or_more_creatures_attack_duelists_heritage_any_player() {
+    let def = parse_trigger_line(
+        "Whenever one or more creatures attack, you may have target attacking creature gain double strike until end of turn.",
+        "Duelist's Heritage",
+    );
+    assert_unscoped_one_or_more_creatures_attack(&def);
+}
+
+/// G2: Lightmine Field (verbatim Oracle).
+#[test]
+fn trigger_one_or_more_creatures_attack_lightmine_field_any_player() {
+    let def = parse_trigger_line(
+        "Whenever one or more creatures attack, this enchantment deals damage to each of those creatures equal to the number of attacking creatures.",
+        "Lightmine Field",
+    );
+    assert_unscoped_one_or_more_creatures_attack(&def);
+}
+
+/// G3: Roar of Resistance trigger line (verbatim Oracle).
+#[test]
+fn trigger_one_or_more_creatures_attack_roar_of_resistance_any_player() {
+    let def = parse_trigger_line(
+        "Whenever one or more creatures attack, you may pay {1}{R}. If you do, creatures attacking your opponents and/or planeswalkers they control get +2/+0 until end of turn.",
+        "Roar of Resistance",
+    );
+    assert_unscoped_one_or_more_creatures_attack(&def);
+}
+
+/// G4: Argent Dais trigger line (verbatim Oracle) — unscoped two-or-more: the
+/// gate is pass-through and the count reads every attacking creature at the
+/// trigger event.
+#[test]
+fn trigger_two_or_more_creatures_attack_argent_dais_any_player() {
+    let def = parse_trigger_line(
+        "Whenever two or more creatures attack, put an oil counter on this artifact.",
+        "Argent Dais",
+    );
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    assert!(def.batched);
+    assert_eq!(def.valid_target, Some(TargetFilter::Player));
+    // CR 508.1a + CR 805.10b: no controller restriction; read at the event
+    // (CR 603.2).
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::EventTime {
+            condition: Box::new(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature()
+                                .properties(vec![FilterProp::Attacking { defender: None }])
+                        ),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 2 },
+            }),
+        })
+    );
+}
+
+/// G5: Flummoxed Cyclops trigger line (verbatim Oracle) — "your opponents
+/// control" scopes both the gate and the count to opponents.
+#[test]
+fn trigger_two_or_more_opponent_creatures_attack_flummoxed_cyclops() {
+    let def = parse_trigger_line(
+        "Whenever two or more creatures your opponents control attack, this creature can't block this combat.",
+        "Flummoxed Cyclops",
+    );
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    assert!(def.batched);
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::Controller {
+                scope: ControllerRef::Opponent,
+                filter: None,
+            },
+            comparator: Comparator::GE,
+            count: 2,
+        })
+    );
+}
+
+/// G6: synthetic one-or-more "an opponent controls" subject — opponent gate,
+/// no count condition.
+#[test]
+fn trigger_one_or_more_opponent_creatures_attack_gate() {
+    let def = parse_trigger_line(
+        "Whenever one or more creatures an opponent controls attack, draw a card.",
+        "Test Opponent Watcher",
+    );
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
+    assert_eq!(def.condition, None);
+}
+
+/// G7: Path of Bravery (verbatim Oracle) — "you control" keeps the canonical
+/// YouAttack encoding (`valid_target == None` ⇒ source controller attacks).
+/// Preservation guard: passes both before and after the subject-scope change.
+#[test]
+fn trigger_one_or_more_creatures_you_control_attack_keeps_controller_gate() {
+    let def = parse_trigger_line(
+        "Whenever one or more creatures you control attack, you gain life equal to the number of attacking creatures.",
+        "Path of Bravery",
+    );
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    assert_eq!(def.valid_target, None);
+    assert_eq!(def.condition, None);
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You)
+        ))
+    );
+}
+
+/// H-Or: a disjunctive subject with a trailing controller clause — the
+/// controller distributes to every leg, so the gate and count are opponent-scoped.
+#[test]
+fn trigger_two_or_more_disjunctive_opponent_subject_attack() {
+    let def = parse_trigger_line(
+        "Whenever two or more Elves or Warriors your opponents control attack, draw a card.",
+        "Test Disjunction Watcher",
+    );
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    assert!(
+        matches!(def.valid_card, Some(TargetFilter::Or { .. })),
+        "expected disjunctive valid_card, got {:?}",
+        def.valid_card
+    );
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
     match &def.condition {
         Some(TriggerCondition::AttackersDeclaredCount {
             subject:
                 AttackersDeclaredCountSubject::Controller {
-                    scope: ControllerRef::You,
-                    filter: Some(TargetFilter::Typed(tf)),
+                    scope: ControllerRef::Opponent,
+                    filter: Some(_),
                 },
             comparator: Comparator::GE,
             count: 2,
-        }) => assert!(
-            tf.type_filters
-                .iter()
-                .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Dinosaur")),
-            "expected Dinosaur subtype in condition filter, got {:?}",
-            tf.type_filters,
+        }) => {}
+        other => panic!(
+            "expected AttackersDeclaredCount {{ Controller {{ Opponent, Some(_) }}, GE, 2 }}, got {other:?}"
         ),
-        other => {
-            panic!("expected AttackersDeclaredCount {{ Controller {{ You, Some(Dinosaur) }}, GE, 2 }}, got {other:?}")
-        }
     }
+}
+
+/// H-Or-unscoped: a disjunctive subject with no controller clause — the gate
+/// is pass-through and the event-time count keeps the whole disjunction
+/// (`add_property` `And`-wraps a non-`Typed` subject; nothing is dropped).
+#[test]
+fn trigger_two_or_more_disjunctive_unscoped_subject_attack() {
+    let def = parse_trigger_line(
+        "Whenever two or more Elves or Warriors attack, draw a card.",
+        "Test Disjunction Watcher",
+    );
+    assert_eq!(def.mode, TriggerMode::YouAttack);
+    // Reach-guard: the subject is disjunctive, so the count filter takes
+    // `add_property`'s `And`-wrap arm, not the `Typed` push arm.
+    assert!(
+        matches!(def.valid_card, Some(TargetFilter::Or { .. })),
+        "expected disjunctive valid_card, got {:?}",
+        def.valid_card
+    );
+    assert_eq!(def.valid_target, Some(TargetFilter::Player));
+    // CR 508.1a + CR 805.10b: no controller restriction; counts attacking
+    // Elves or Warriors, read at the trigger event (CR 603.2).
+    let Some(TriggerCondition::EventTime { condition }) = &def.condition else {
+        panic!(
+            "expected EventTime count condition, got {:?}",
+            def.condition
+        );
+    };
+    match condition.as_ref() {
+        TriggerCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        } => {
+            assert_eq!(
+                filter,
+                &add_property(
+                    def.valid_card.clone().expect("valid_card"),
+                    FilterProp::Attacking { defender: None },
+                ),
+                "count = subject + Attacking"
+            );
+            assert!(
+                matches!(filter, TargetFilter::And { .. }),
+                "disjunctive subject must not be silently dropped: {filter:?}"
+            );
+        }
+        other => panic!(
+            "expected QuantityComparison {{ ObjectCount(subject + Attacking) GE 2 }}, got {other:?}"
+        ),
+    }
+}
+
+/// F: a subject controller scope that neither the attacking-player gate
+/// (`player_matches_filter`) nor the count (`attackers_declared_count`) can
+/// evaluate declines the subject-led parse at EVERY quantifier, rather than
+/// failing open on the gate.
+#[test]
+fn n_or_more_attacks_declines_uncountable_subject_scope() {
+    // Reach-guard (a): the subject phrase parses fully to a `TargetPlayer`
+    // controller scope, so F1/F2 reach the scope decline — not the
+    // unparsed-remainder `continue`.
+    let (subject, remainder) = parse_type_phrase_folding("creatures target player controls");
+    assert!(remainder.trim().is_empty(), "remainder: {remainder:?}");
+    match &subject {
+        TargetFilter::Typed(tf) => {
+            assert_eq!(tf.controller, Some(ControllerRef::TargetPlayer));
+        }
+        other => panic!("expected Typed subject, got {other:?}"),
+    }
+
+    // F1: two or more.
+    assert!(try_parse_n_or_more_attacks(
+        "whenever two or more creatures target player controls attack"
+    )
+    .is_none());
+    // F2: one or more — declined too (no count-independent fail-open gate).
+    assert!(try_parse_n_or_more_attacks(
+        "whenever one or more creatures target player controls attack"
+    )
+    .is_none());
+
+    // Reach-guard (b): the opponent-scoped sibling of F1 is accepted.
+    let (_, accepted) =
+        try_parse_n_or_more_attacks("whenever two or more creatures your opponents control attack")
+            .expect("opponent-scoped two-or-more subject is accepted");
+    assert_eq!(
+        accepted.condition,
+        Some(TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::Controller {
+                scope: ControllerRef::Opponent,
+                filter: None,
+            },
+            comparator: Comparator::GE,
+            count: 2,
+        })
+    );
+    // Reach-guard (c): the opponent-scoped sibling of F2 is accepted.
+    assert!(try_parse_n_or_more_attacks(
+        "whenever one or more creatures an opponent controls attack"
+    )
+    .is_some());
+
+    // F3: the full line never yields a YouAttack trigger with a fail-open
+    // `Typed{TargetPlayer}` attacking-player gate.
+    let def = parse_trigger_line(
+        "Whenever one or more creatures target player controls attack, draw a card.",
+        "Test Exotic Scope",
+    );
+    // Measured fall-through: with the subject-led parser declining, the line
+    // reaches the generic per-creature attack path (`Attacks` mode, no
+    // attacking-player gate). No printed card carries this subject scope; the
+    // assertion pins that the decline routes away from the YouAttack family.
+    assert_eq!(
+        def.mode,
+        TriggerMode::Attacks,
+        "exotic subject scope must route away from the YouAttack family: {def:?}"
+    );
 }
 
 // --- Plan 03: SpellCast trigger sub-patterns ---

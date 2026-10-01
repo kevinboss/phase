@@ -128,10 +128,10 @@ use crate::types::ability::{
     RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
     SharedQualityRelation, SiblingCondition, SkipScope, SpellStackToGraveyardReplacement,
     StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
-    TargetFilter, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource, TriggerCondition,
-    TriggerDefinition, TurnGate, TypeFilter, TypedFilter, UnlessPayModifier, UnloweredGuard,
-    UntilCondition, VoteSubject, WheneverEventExpiry, ZoneChoiceCandidateSource, ZoneChoiceChooser,
-    ZoneOwner,
+    TargetFilter, TargetReadOrigin, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource,
+    TriggerCondition, TriggerDefinition, TurnGate, TypeFilter, TypedFilter, UnlessPayModifier,
+    UnloweredGuard, UntilCondition, VoteSubject, WheneverEventExpiry, ZoneChoiceCandidateSource,
+    ZoneChoiceChooser, ZoneOwner,
 };
 // `DoubleTarget` has no production use in this module since the counter-doubling
 // discriminator moved to `Effect::is_counter_multiplication()`; the child
@@ -3684,6 +3684,7 @@ fn try_parse_conditional_damage_prevention_with_followup(text: &str) -> Option<P
             amount: PreventionAmount::All,
             amount_dynamic: None,
             target,
+            recipient_scope: EffectScope::Single,
             scope: PreventionScope::AllDamage,
             damage_source_filter: None,
             prevention_duration: None,
@@ -11326,6 +11327,14 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return parsed_clause(effect);
     }
 
+    // Digital-only: "conjure the {card-group} into/onto zone" — a conjure by
+    // collective name, expanding to one `Named` entry per group member (Oracle
+    // of the Alpha's Power Nine). Disjoint from the sibling arms: this requires
+    // "conjure the ", the others "conjure a …".
+    if let Some(effect) = try_parse_conjure_named_group(tp) {
+        return parsed_clause(effect);
+    }
+
     // Digital-only: "conjure a card named X into/onto zone" — Conjure keyword action.
     if let Some(effect) = try_parse_conjure(tp) {
         return parsed_clause(effect);
@@ -12583,6 +12592,91 @@ fn try_parse_conjure_from_spellbook(tp: TextPair) -> Option<Effect> {
         tapped,
         random,
     })
+}
+
+/// Digital-only collective conjure names (no CR entry — the string "conjure"
+/// does not occur in `docs/MagicCompRules.txt`): lowercase group phrase →
+/// canonical member card names in printed order. The single extension point
+/// for future "conjure the {group}" wordings — a second collective name is a
+/// one-row data change with no new code paths.
+const NAMED_CARD_GROUPS: &[(&str, &[&str])] = &[(
+    "power nine",
+    &[
+        "Ancestral Recall",
+        "Black Lotus",
+        "Mox Pearl",
+        "Mox Sapphire",
+        "Mox Jet",
+        "Mox Ruby",
+        "Mox Emerald",
+        "Time Walk",
+        "Timetwister",
+    ],
+)];
+
+/// Digital-only keyword action: parse "conjure the {card-group} into/onto
+/// {zone}" — a conjure by collective name (Oracle of the Alpha's "conjure the
+/// Power Nine into your library"), expanding to one `Named` card per group
+/// member. The produced AST is shape-identical to the multi-card named form
+/// (Darksteel Hydra): `cards: Vec<ConjureCard>` with `count: Fixed { value: 1 }`
+/// each, so the resolver and registry-seeding paths are unchanged.
+///
+/// Uses nom combinators exclusively for dispatch and structure recognition.
+fn try_parse_conjure_named_group(tp: TextPair) -> Option<Effect> {
+    // Gate: must start with "conjure the " (nom tag dispatch). Disjoint from
+    // the sibling conjure arms, which all require "conjure a …".
+    let (rest, _) = tag::<_, _, OracleError<'_>>("conjure the ")
+        .parse(tp.lower)
+        .ok()?;
+
+    // Table-driven group match: each row is attempted with a nom `tag`
+    // application (a static `alt` tuple cannot be table-driven). Canonical
+    // member names come from the table, so no original-case slicing is needed.
+    for (group_lower, members) in NAMED_CARD_GROUPS {
+        let Ok((after_group, _)) = tag::<_, _, OracleError<'_>>(*group_lower).parse(rest) else {
+            continue;
+        };
+
+        let cards = members
+            .iter()
+            .map(|name| ConjureCard {
+                source: ConjureSource::Named {
+                    name: name.to_string(),
+                },
+                count: QuantityExpr::Fixed { value: 1 },
+            })
+            .collect();
+
+        // Destination via the shared conjure-zone parser; " tapped" only after
+        // the battlefield (mirrors the spellbook arm).
+        let Some((destination, library_position, library_players, zone_rest)) =
+            parse_conjure_zone(after_group)
+        else {
+            continue;
+        };
+        let (tail, tapped) = if destination == Zone::Battlefield {
+            match tag::<_, _, OracleError<'_>>(" tapped").parse(zone_rest) {
+                Ok((tail, _)) => (tail, true),
+                Err(_) => (zone_rest, false),
+            }
+        } else {
+            (zone_rest, false)
+        };
+        // Fully consume the tail (mirrors the duplicate arm): an unmodeled
+        // rider falls through to `Unimplemented` rather than being dropped.
+        if !tail.trim().trim_end_matches('.').trim().is_empty() {
+            continue;
+        }
+
+        return Some(Effect::Conjure {
+            cards,
+            destination,
+            tapped,
+            library_position,
+            library_players,
+        });
+    }
+    None
 }
 
 /// Digital-only keyword action: Parse "conjure [quantity] card(s) named {Name} into/onto {zone}"
@@ -24738,7 +24832,32 @@ fn chain_prior_chosen_target(clauses: &[ClauseIr]) -> Option<&TargetFilter> {
 /// `lower::rekey_counter_slot_in_chain` must re-key to `Some(0)` precisely
 /// because its condition node has its own local target.
 fn chain_declared_object_target(clauses: &[ClauseIr]) -> Option<&TargetFilter> {
-    for prev in clauses.iter().rev() {
+    chain_declared_object_target_clause(clauses).map(|(_, filter)| filter)
+}
+
+/// CR 115.1: does this clause announce a target of its OWN — an instance of the
+/// word "target" in its effect, its compound remainder, or a multi-target spec?
+/// Context references (`SelfRef`, `ParentTarget`, …) announce nothing.
+fn clause_announces_own_target(clause: &ClauseIr) -> bool {
+    clause.multi_target.is_some()
+        || clause.parsed.multi_target.is_some()
+        || triggers::extract_target_filter_from_effect(&clause.parsed.effect).is_some()
+        || std::iter::successors(clause.parsed.sub_ability.as_deref(), |def| {
+            def.sub_ability.as_deref()
+        })
+        .any(|def| {
+            def.multi_target.is_some()
+                || triggers::extract_target_filter_from_effect(&def.effect).is_some()
+        })
+}
+
+/// [`chain_declared_object_target`], also naming WHICH clause declared the
+/// antecedent (its index in `clauses`). Same walk, same exclusions: the only
+/// difference is that the declaring clause's position is returned alongside the
+/// filter, for a caller that must know the antecedent is the IMMEDIATELY
+/// preceding instruction (the comparative "that creature" gate).
+fn chain_declared_object_target_clause(clauses: &[ClauseIr]) -> Option<(usize, &TargetFilter)> {
+    for (index, prev) in clauses.iter().enumerate().rev() {
         // CR 608.2c + CR 118.12 / CR 603.12: an affirmative "if you do" / "when you do" gate decides whether its
         // instruction happens, not what that instruction declared, so its declared
         // target stays the nearest antecedent of a later "that creature" (Magitek
@@ -24760,7 +24879,7 @@ fn chain_declared_object_target(clauses: &[ClauseIr]) -> Option<&TargetFilter> {
             {
                 return None
             }
-            Some(t @ TargetFilter::Typed(_)) if !t.is_player_scope() => return Some(t),
+            Some(t @ TargetFilter::Typed(_)) if !t.is_player_scope() => return Some((index, t)),
             Some(TargetFilter::Typed(_)) => return None,
             // CR 608.2c: an earlier anaphor already bound to the declared target
             // ("That land becomes a 0/0 Elemental creature") names the same object,
@@ -24783,7 +24902,7 @@ fn chain_declared_object_target(clauses: &[ClauseIr]) -> Option<&TargetFilter> {
                     def.sub_ability.as_deref()
                 })
                 .filter_map(|def| match def.effect.target_filter() {
-                    Some(t @ TargetFilter::Typed(_)) if !t.is_player_scope() => Some(t),
+                    Some(t @ TargetFilter::Typed(_)) if !t.is_player_scope() => Some((index, t)),
                     _ => None,
                 })
                 .last();
@@ -40227,8 +40346,15 @@ pub(crate) fn parse_effect_chain_ir(
         } else {
             (None, text)
         };
-        // CR 608.2c: "If that creature has [keyword], [effect] instead"
-        let (keyword_instead_cond, text) = if condition.is_none()
+        // CR 608.2c: "If that creature has <predicate>, [effect][ instead]" — the
+        // target "has" gate family. A P/T comparison against the source (CR 208.1,
+        // Conformer Shuriken) is tried first; then a keyword (Porcelain Zealot,
+        // Super-Adaptoid). Both fail closed instead of shipping a gate they
+        // cannot evaluate: a comparison whose "that creature" has no declared
+        // object target, or a non-keyword predicate (`Keyword::Unknown`: counter
+        // and P/T thresholds such as Bring Low's "a +1/+1 counter on it").
+        let mut comparative_gate_producer: Option<usize> = None;
+        let (target_has_cond, text) = if condition.is_none()
             && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
@@ -40240,7 +40366,51 @@ pub(crate) fn parse_effect_chain_ir(
             && player_property_cond.is_none()
             && turn_cond.is_none()
         {
-            strip_target_keyword_instead(&text)
+            // CR 115.1 + CR 608.2c: "that creature" names the object the
+            // immediately preceding instruction announced as its one target. The
+            // antecedent must be exactly that instruction — the same walk and
+            // exclusions as every other "that creature" anaphor (no mass,
+            // resolution-chosen, private-zone or player producer; no intervening
+            // conditional) — with a single announced object and no compound
+            // remainder, so the lowered gated clause's runtime parent IS the
+            // announcing node.
+            let producer = chain_declared_object_target_clause(builder.clauses())
+                .map(|(index, _)| index)
+                .filter(|&index| {
+                    let clause = &builder.clauses()[index];
+                    index + 1 == builder.clauses().len()
+                        && clause.multi_target.is_none()
+                        && clause.parsed.multi_target.is_none()
+                        && clause.parsed.sub_ability.is_none()
+                });
+            match strip_target_comparative_pt_conditional(&text, producer.is_some()) {
+                ComparativePtGate::Parsed { condition, body } => {
+                    comparative_gate_producer = producer;
+                    (Some(*condition), body)
+                }
+                ComparativePtGate::Unbound => {
+                    unimplemented_clause(
+                        &mut builder,
+                        "comparative_pt_anaphor_unbound",
+                        normalized_text,
+                        chunk.boundary_after,
+                    );
+                    continue;
+                }
+                ComparativePtGate::NotOwned => match strip_target_keyword_instead(&text) {
+                    KeywordConditionStrip::Parsed { condition, body } => (Some(*condition), body),
+                    KeywordConditionStrip::UnknownKeyword => {
+                        unimplemented_clause(
+                            &mut builder,
+                            "target_has_unknown_keyword_condition",
+                            normalized_text,
+                            chunk.boundary_after,
+                        );
+                        continue;
+                    }
+                    KeywordConditionStrip::NotOwned => (None, text),
+                },
+            }
         } else {
             (None, text)
         };
@@ -40258,7 +40428,7 @@ pub(crate) fn parse_effect_chain_ir(
             && property_cond.is_none()
             && player_property_cond.is_none()
             && turn_cond.is_none()
-            && keyword_instead_cond.is_none()
+            && target_has_cond.is_none()
         {
             strip_suffix_conditional(&text, ctx)
         } else {
@@ -40274,7 +40444,7 @@ pub(crate) fn parse_effect_chain_ir(
             .or(property_cond)
             .or(player_property_cond)
             .or(turn_cond)
-            .or(keyword_instead_cond)
+            .or(target_has_cond)
             .or(suffix_cond);
         // CR 603.12 + CR 603.4 + CR 608.2a: A `When you do, if <guard>, ...` rider is
         // not equivalent to a bare reflexive trigger. The shared leading
@@ -42991,6 +43161,27 @@ pub(crate) fn parse_effect_chain_ir(
             .declared_target_choice_timing(chunk_ctx.declared_target_choice_timing.take())
             .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
             .push();
+
+        // CR 115.1 + CR 608.2c: the comparative gate's "that creature" reads the
+        // single object the immediately preceding instruction announced
+        // (`TargetReadOrigin::ParentAnnouncement`), so this instruction declares
+        // no target of its own. The origin is per INSTRUCTION — every `Target`
+        // read on it shares it — so an instruction that would ALSO announce its
+        // own object target ("…put counters on target creature you control")
+        // would have one scope naming two objects. That mixed shape is refused
+        // rather than represented.
+        if comparative_gate_producer.is_some() {
+            if let Some(reader) = builder.last_mut() {
+                if clause_announces_own_target(reader) {
+                    reader.parsed = parsed_clause(Effect::unimplemented(
+                        "comparative_pt_rider_declares_target",
+                        normalized_text,
+                    ));
+                } else {
+                    reader.target_reads = TargetReadOrigin::ParentAnnouncement;
+                }
+            }
+        }
 
         // Drain chunk-ctx diagnostics into the accumulator (the outer `ctx` is
         // shadowed inside the loop, so we collect here and extend after the loop).

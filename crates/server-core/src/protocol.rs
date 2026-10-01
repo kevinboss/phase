@@ -3320,8 +3320,12 @@ mod tests {
 
     /// `Effect::AdditionalPhase` now carries a `TurnSegment` in place of its
     /// `phase` field and an `ExtraPhaseRecipient` in place of its `target`
-    /// field; a v96 peer cannot parse it, so it must be refused before it
-    /// receives v97 state.
+    /// field; a v97 peer cannot parse it, so it must be refused before it
+    /// receives v98 state.
+    /// `ResolvedAbility.target_reads` and `AbilityDefinition.target_reads`
+    /// (`TargetReadOrigin`, CR 115.1 + CR 608.2c) are serialized; a v96 peer
+    /// would default the field and rebuild a target slot the rules do not
+    /// announce, so it must be refused before it receives v97 state.
     /// `FilterProp::Unblocked` is reshaped to `FilterProp::BlockStatus { status:
     /// AttackerBlockStatus }` (CR 509.1h); a v94 peer cannot parse the new
     /// `"BlockStatus"` tag carried in `GameState` ability definitions, so it must
@@ -3364,8 +3368,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_97_for_additional_phase_segment() {
-        assert_eq!(PROTOCOL_VERSION, 97);
+    fn protocol_version_is_98_for_additional_phase_segment() {
+        assert_eq!(PROTOCOL_VERSION, 98);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3376,7 +3380,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_97_for_additional_phase_segment` stays
+    /// `protocol_version_is_98_for_additional_phase_segment` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

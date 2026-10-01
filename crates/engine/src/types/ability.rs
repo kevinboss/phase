@@ -18910,7 +18910,9 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_exile: Option<ExiledSpellRider>,
     },
-    /// CR 615: Prevent damage to a target.
+    /// CR 615: Prevent damage to a declared recipient (a chosen target, or a
+    /// context reference) or to an untargeted population, per
+    /// `recipient_scope`.
     PreventDamage {
         amount: PreventionAmount,
         /// CR 615.11 + CR 107.3i: When present, overrides `amount` at effect
@@ -18922,6 +18924,12 @@ pub enum Effect {
         amount_dynamic: Option<QuantityExpr>,
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
+        /// CR 115.1a + CR 115.10a: `Single` = a declared target, or a
+        /// context reference that mints no slot (`TargetFilter::is_context_ref`);
+        /// `All` = an untargeted descriptor, singular ones such as "enchanted
+        /// creature" included, matched as each damage event happens (CR 615.1, CR 611.2c).
+        #[serde(default = "default_effect_scope_single")]
+        recipient_scope: EffectScope,
         #[serde(default)]
         scope: PreventionScope,
         /// CR 615 + CR 614.1a: Optional filter restricting which damage *sources* are
@@ -21963,7 +21971,6 @@ impl Effect {
             | Effect::BecomeUnprepared { target, .. }
             | Effect::BecomeSaddled { target, .. }
             | Effect::CastFromZone { target, .. }
-            | Effect::PreventDamage { target, .. }
             | Effect::Exploit { target, .. }
             | Effect::GivePlayerCounter { target, .. }
             | Effect::LoseAllPlayerCounters { target, .. }
@@ -22187,6 +22194,21 @@ impl Effect {
             } => Some(target),
             Effect::Transform {
                 scope: EffectScope::All,
+                ..
+            } => None,
+
+            // CR 115.1a + CR 115.10a: `PreventDamage` exposes its recipient only
+            // when it is declared ("prevent all damage that would be dealt to
+            // target creature"). An `All` recipient ("...to creatures this turn")
+            // is an untargeted population matched as each damage event happens
+            // (CR 615.1), so no target slot or prompt is built.
+            Effect::PreventDamage {
+                recipient_scope: EffectScope::Single,
+                target,
+                ..
+            } => Some(target),
+            Effect::PreventDamage {
+                recipient_scope: EffectScope::All,
                 ..
             } => None,
 
@@ -26061,6 +26083,9 @@ pub struct AbilityDefinition {
     /// `SequentialSibling` = independent following instruction. Set during
     /// `lower_effect_chain_ir` from the `ClauseBoundary` PRECEDING this clause.
     pub sub_link: SubAbilityLink,
+    /// CR 115.1 + CR 608.2c: where this instruction's `ObjectScope::Target`
+    /// reads take their object from. See [`TargetReadOrigin`].
+    pub target_reads: TargetReadOrigin,
     /// CR 608.2c + CR 122.1: when this ability is a `ChooseOneOf` branch driven
     /// by a counter-kind iteration (`repeat_for: DistinctCounterKindsAmong`),
     /// `Some(RebindToIteratedKind)` marks the branch whose `PutCounter`
@@ -26164,6 +26189,8 @@ struct AbilityDefinitionRepr<'a> {
     repeat_until: &'a Option<RepeatContinuation>,
     #[serde(skip_serializing_if = "SubAbilityLink::is_continuation")]
     sub_link: SubAbilityLink,
+    #[serde(skip_serializing_if = "TargetReadOrigin::is_own")]
+    target_reads: TargetReadOrigin,
     #[serde(skip_serializing_if = "Option::is_none")]
     iteration_kind_binding: &'a Option<IterationKindBinding>,
     #[serde(skip_serializing_if = "SiblingCondition::is_default")]
@@ -26221,6 +26248,7 @@ impl Serialize for AbilityDefinition {
             target_chooser,
             repeat_until,
             sub_link,
+            target_reads,
             iteration_kind_binding,
             sibling_condition,
             unlowered_guard,
@@ -26269,6 +26297,7 @@ impl Serialize for AbilityDefinition {
             target_chooser,
             repeat_until,
             sub_link: *sub_link,
+            target_reads: *target_reads,
             iteration_kind_binding,
             sibling_condition: *sibling_condition,
             unlowered_guard,
@@ -26392,6 +26421,8 @@ struct AbilityDefinitionDe {
     #[serde(default)]
     sub_link: SubAbilityLink,
     #[serde(default)]
+    target_reads: TargetReadOrigin,
+    #[serde(default)]
     iteration_kind_binding: Option<IterationKindBinding>,
     #[serde(default)]
     sibling_condition: SiblingCondition,
@@ -26453,6 +26484,7 @@ impl<'de> Deserialize<'de> for AbilityDefinition {
             target_chooser: de.target_chooser,
             repeat_until: de.repeat_until,
             sub_link: de.sub_link,
+            target_reads: de.target_reads,
             iteration_kind_binding: de.iteration_kind_binding,
             sibling_condition: de.sibling_condition,
             unlowered_guard: de.unlowered_guard,
@@ -26497,6 +26529,37 @@ impl SubAbilityLink {
     /// `skip_serializing_if` predicate — the default needs no JSON byte.
     pub fn is_continuation(link: &Self) -> bool {
         matches!(link, Self::ContinuationStep)
+    }
+}
+
+/// CR 115.1 + CR 608.2c: where an instruction's `ObjectScope::Target` reads — its
+/// condition and its quantities — take their object from.
+///
+/// A target is declared only by an instance of the word "target" (CR 115.1). A
+/// later instruction that says "that creature" names the object an EARLIER
+/// instruction of the same ability announced (CR 608.2c) and declares nothing
+/// itself, so a `Target`-scoped magnitude on it must not surface a slot of its
+/// own. The origin is a property of the whole instruction: every `Target` read
+/// on it shares one origin, which is why an instruction that would both read its
+/// parent's announcement and announce a target of its own is refused at parse
+/// time rather than represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum TargetReadOrigin {
+    /// `Target` reads name this instruction's own announced target(s); a
+    /// `Target`-scoped magnitude with no primary target supplies its own slot.
+    #[default]
+    OwnAnnouncement,
+    /// `Target` reads name the single object the immediately preceding
+    /// instruction announced (Conformer Shuriken: "tap target creature defending
+    /// player controls. If that creature has greater power than this creature,
+    /// put … equal to the difference"). This instruction announces no target.
+    ParentAnnouncement,
+}
+
+impl TargetReadOrigin {
+    /// `skip_serializing_if` predicate — the default needs no JSON byte.
+    pub fn is_own(origin: &Self) -> bool {
+        matches!(origin, Self::OwnAnnouncement)
     }
 }
 
@@ -26720,6 +26783,7 @@ impl AbilityDefinition {
             target_chooser: None,
             repeat_until: None,
             sub_link: SubAbilityLink::ContinuationStep,
+            target_reads: TargetReadOrigin::OwnAnnouncement,
             iteration_kind_binding: None,
             sibling_condition: SiblingCondition::Dependent,
             unlowered_guard: None,
@@ -28931,6 +28995,11 @@ pub enum TriggerCondition {
     /// `if` beside it stays rechecked. Pugnacious Hammerskull's 2023-11-10
     /// ruling: a Dinosaur that enters after the attack declaration does not stop
     /// the stun counter.
+    /// The same event-time reading carries a count qualifier that is part of the
+    /// trigger event itself when no player anchors it — an unscoped subject-led
+    /// "Whenever two or more <subject> attack" (Argent Dais) compares the number
+    /// of attacking objects of the subject class when attackers are declared
+    /// (CR 508.1a + CR 603.2); there is no intervening "if" to recheck.
     EventTime { condition: Box<TriggerCondition> },
 }
 
@@ -32706,6 +32775,54 @@ mod parent_target_missing_reason_tests {
     }
 }
 
+#[cfg(test)]
+mod target_read_origin_tests {
+    use super::*;
+
+    /// CR 115.1 + CR 608.2c: `target_reads` rides both carriers. The
+    /// parent-announcement origin serializes its key and round-trips; the
+    /// default omits the key, round-trips, and is what a key-less payload
+    /// (every pre-v93 save) deserializes to.
+    #[test]
+    fn target_reads_round_trips_and_omits_the_default() {
+        let effect = Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        };
+        for origin in [
+            TargetReadOrigin::ParentAnnouncement,
+            TargetReadOrigin::OwnAnnouncement,
+        ] {
+            let mut def = AbilityDefinition::new(AbilityKind::Spell, effect.clone());
+            def.target_reads = origin;
+            let json = serde_json::to_value(&def).unwrap();
+            assert_eq!(
+                json.get("target_reads").is_some(),
+                origin == TargetReadOrigin::ParentAnnouncement,
+                "definition key presence for {origin:?}: {json}"
+            );
+            let back: AbilityDefinition = serde_json::from_value(json).unwrap();
+            assert_eq!(back.target_reads, origin);
+
+            let mut resolved = ResolvedAbility::new(
+                effect.clone(),
+                vec![],
+                crate::types::identifiers::ObjectId(1),
+                crate::types::player::PlayerId(0),
+            );
+            resolved.target_reads = origin;
+            let json = serde_json::to_value(&resolved).unwrap();
+            assert_eq!(
+                json.get("target_reads").is_some(),
+                origin == TargetReadOrigin::ParentAnnouncement,
+                "resolved key presence for {origin:?}: {json}"
+            );
+            let back: ResolvedAbility = serde_json::from_value(json).unwrap();
+            assert_eq!(back.target_reads, origin);
+        }
+    }
+}
+
 /// CR 608.2c: what a chain split — a `player_scope` fan-out, or a multi-target
 /// player subject — DETACHED from this node's chain.
 ///
@@ -33256,6 +33373,10 @@ pub struct ResolvedAbility {
     /// `SequentialSibling` subs resolve even when an optional parent is declined.
     #[serde(default, skip_serializing_if = "SubAbilityLink::is_continuation")]
     pub sub_link: SubAbilityLink,
+    /// CR 115.1 + CR 608.2c: Copied through from the originating
+    /// `AbilityDefinition`. See [`TargetReadOrigin`].
+    #[serde(default, skip_serializing_if = "TargetReadOrigin::is_own")]
+    pub target_reads: TargetReadOrigin,
     /// CR 702.1c ("the same is true") + CR 608.2c (written order): Copied through
     /// from the originating `AbilityDefinition`. When `ReplicatedOrBranch`, this
     /// `SequentialSibling` is an INDEPENDENT
@@ -33376,6 +33497,7 @@ impl PartialEq for ResolvedAbility {
             repeat_until: a_repeat_until,
             replacement_applied: a_replacement_applied,
             sub_link: a_sub_link,
+            target_reads: a_target_reads,
             sibling_condition: a_sibling_condition,
             modal: a_modal,
             mode_abilities: a_mode_abilities,
@@ -33444,6 +33566,7 @@ impl PartialEq for ResolvedAbility {
             repeat_until: b_repeat_until,
             replacement_applied: b_replacement_applied,
             sub_link: b_sub_link,
+            target_reads: b_target_reads,
             sibling_condition: b_sibling_condition,
             modal: b_modal,
             mode_abilities: b_mode_abilities,
@@ -33513,6 +33636,7 @@ impl PartialEq for ResolvedAbility {
             && a_repeat_until == b_repeat_until
             && a_replacement_applied == b_replacement_applied
             && a_sub_link == b_sub_link
+            && a_target_reads == b_target_reads
             && a_sibling_condition == b_sibling_condition
             && a_modal == b_modal
             && a_mode_abilities == b_mode_abilities
@@ -33616,6 +33740,7 @@ impl ResolvedAbility {
             repeat_until: None,
             replacement_applied: HashSet::new(),
             sub_link: SubAbilityLink::ContinuationStep,
+            target_reads: TargetReadOrigin::OwnAnnouncement,
             sibling_condition: SiblingCondition::Dependent,
             source_incarnation: None,
             trigger_source: None,

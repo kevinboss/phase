@@ -801,6 +801,7 @@ pub fn ability_definition_is_cast_stable_for_pre_cast(definition: &AbilityDefini
         target_chooser,
         repeat_until,
         sub_link: _,
+        target_reads: _, // TargetReadOrigin tag, no quantity of its own
         iteration_kind_binding: _,
         sibling_condition: _,
         // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
@@ -933,6 +934,7 @@ pub fn ability_definition_has_only_unbound_variable_quantities_for_pre_cast(
         target_chooser: None,
         repeat_until: None,
         sub_link: _,
+        target_reads: _, // TargetReadOrigin tag, no quantity of its own
         iteration_kind_binding: _,
         sibling_condition: _,
         // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
@@ -20015,8 +20017,10 @@ mod tests {
                 attachments: Vec::new(),
             },
         );
-        state.current_trigger_event =
-            Some(crate::types::events::GameEvent::CreatureDestroyed { object_id: dead_id });
+        state.current_trigger_event = Some(crate::types::events::GameEvent::CreatureDestroyed {
+            object_id: dead_id,
+            source_id: None,
+        });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::Power {
                 scope: ObjectScope::CostPaidObject,

@@ -987,7 +987,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::Milled { object_id, .. }
         | GameEvent::SpellCast { object_id, .. }
         | GameEvent::TokenCreated { object_id, .. }
-        | GameEvent::CreatureDestroyed { object_id }
+        | GameEvent::CreatureDestroyed { object_id, .. }
         | GameEvent::Evolved { object_id }
         | GameEvent::PermanentSacrificed { object_id, .. }
         | GameEvent::ControllerChanged { object_id, .. }
@@ -2763,7 +2763,7 @@ pub(super) fn match_destroyed(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::CreatureDestroyed { object_id } = event {
+    if let GameEvent::CreatureDestroyed { object_id, .. } = event {
         valid_card_matches(trigger, state, *object_id, source_context)
     } else {
         false
@@ -4388,8 +4388,11 @@ pub(super) fn matching_you_attack_pairs(
     if attacker_ids.is_empty() {
         return Vec::new();
     }
-    // CR 506.2: the active player is the attacking player; all attackers in
-    // a single AttackersDeclared batch share one controller.
+    // CR 506.2: the active player is the attacking player. Under shared team
+    // turns one combined declaration can hold several attacking players'
+    // creatures (CR 805.10a + CR 805.10b); the player-scoped gates below read
+    // the first attacker's controller, while the `Player` pass-through admits
+    // every attacking player.
     let Some(attacking_player) = attacker_ids
         .iter()
         .find_map(|id| state.objects.get(id).map(|o| o.controller))
@@ -4403,7 +4406,9 @@ pub(super) fn matching_you_attack_pairs(
         // attacking-player pass-through (any attacking player) and carries NO
         // attack-target narrowing — that lives solely in `attack_target_filter`.
         // Used by attachment-relation triggers ("enchanted by an Aura you control
-        // attack") whose enchanted/equipped attacker may be opponent-controlled.
+        // attack") whose enchanted/equipped attacker may be opponent-controlled,
+        // and (CR 603.2 + CR 506.2) by unscoped subject-led triggers ("whenever one
+        // or more creatures attack") that watch every attacking player.
         Some(TargetFilter::Player) => true,
         Some(_) => valid_player_matches(trigger, state, attacking_player, source_context),
         None => attacking_player == source_context.source_read(state).controller(),
