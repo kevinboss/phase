@@ -21728,7 +21728,7 @@ mod tests {
         }
     }
 
-    /// CR 500.10a: a subject no recipient kind names fails closed in each of
+    /// Engine limitation: a subject no recipient kind names fails closed in each of
     /// the three arms, rather than granting the step or phase to the
     /// controller. Reach guard: `additional_phase_recipient_follows_the_subject`
     /// parses the same arms with "you get" and "there is".
