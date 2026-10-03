@@ -110,7 +110,7 @@ fn blades_board() -> BladesBoard {
     }
 }
 
-/// WB1. CR 601.2c + CR 601.2f + CR 602.2b: two +1/+1 counters on the chosen
+/// CR 601.2c + CR 601.2f + CR 602.2b: two +1/+1 counters on the chosen
 /// creature reduce Equip {3} to {1}, priced when the target is chosen.
 #[test]
 fn warriors_blades_equip_costs_less_per_counter_on_its_target() {
@@ -137,7 +137,7 @@ fn warriors_blades_equip_costs_less_per_counter_on_its_target() {
     );
 }
 
-/// WB2. CR 601.2h: the counterless creature leaves Equip at {3}, which one
+/// CR 601.2h: the counterless creature leaves Equip at {3}, which one
 /// mana can't pay — the activation is reversed to priority with nothing paid.
 #[test]
 fn warriors_blades_equip_on_a_counterless_target_is_unaffordable() {
@@ -167,7 +167,7 @@ fn warriors_blades_equip_on_a_counterless_target_is_unaffordable() {
 
 // ── Blitzball Stadium: kind of counter on the creature the trigger is on ─────
 
-/// BS1. CR 122.1: the granted trigger draws one card per kind of counter on the
+/// CR 122.1: the granted trigger draws one card per kind of counter on the
 /// creature dealing the damage — +1/+1 and oil are two kinds, whatever their
 /// numbers.
 #[test]
@@ -227,7 +227,7 @@ const DIES_KIND_CENSUS: &str =
     "When this creature dies, draw a card for each kind of counter on it.";
 const DESTROY_TARGET_CREATURE: &str = "Destroy target creature.";
 
-/// KC1. CR 122.1 + CR 122.2 + CR 608.2h: "it" is the creature that died; its
+/// CR 122.1 + CR 122.2 + CR 608.2h: "it" is the creature that died; its
 /// counters ceased to exist in the graveyard, so the census reads its last
 /// known information — +1/+1 and oil are two kinds (three counters), so two
 /// cards.
@@ -275,7 +275,7 @@ const PER_RECIPIENT_KIND_ANTHEMS: [&str; 2] = [
     "Creatures you control get +1/+1 for each kind of counter on them.",
 ];
 
-/// KC2. CR 122.1 + CR 611.3a + CR 613.4c: in a per-recipient continuous
+/// CR 122.1 + CR 611.3a + CR 613.4c: in a per-recipient continuous
 /// static the pronoun names each affected creature, so each creature counts the
 /// kinds of counter on ITSELF — not the source's (which has none).
 #[test]
@@ -334,7 +334,7 @@ fn per_recipient_anthem_counts_each_creatures_own_counter_kinds() {
 
 // ── Moth Herb Elixir: a multi-word counter name ──────────────────────────────
 
-/// MH1. CR 122.1: "acquired taste" is one counter name — the first ability
+/// CR 122.1: "acquired taste" is one counter name — the first ability
 /// adds one.
 #[test]
 fn moth_herb_elixir_puts_an_acquired_taste_counter_on_itself() {
@@ -361,7 +361,7 @@ fn moth_herb_elixir_puts_an_acquired_taste_counter_on_itself() {
     );
 }
 
-/// MH2. CR 122.1 + CR 608.2h: the sacrificed Elixir's acquired taste counters
+/// CR 122.1 + CR 608.2h: the sacrificed Elixir's acquired taste counters
 /// (as it last existed) set the life gained: draw two, lose 4, gain 3.
 #[test]
 fn moth_herb_elixir_gains_life_per_acquired_taste_counter() {
@@ -390,7 +390,7 @@ fn moth_herb_elixir_gains_life_per_acquired_taste_counter() {
 
 // ── Ulasht, the Hate Seed: conjoined enters-with "for each" placements ───────
 
-/// UL1. CR 614.1c + CR 122.1: one counter per other red creature you control
+/// CR 614.1c + CR 122.1: one counter per other red creature you control
 /// AND one per other green creature you control; the red-green creature is
 /// counted by both (Ulasht ruling), the opponent's red creature by neither.
 #[test]

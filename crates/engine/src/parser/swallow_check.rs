@@ -6354,7 +6354,7 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         }
     }
 
-    /// SW1. CR 614.1c: a mixed-kind conjunct declines the whole per-each tail,
+    /// CR 614.1c: a mixed-kind conjunct declines the whole per-each tail,
     /// so the line surfaces as a `DynamicQty` swallow rather than reporting the
     /// base single counter as supported.
     #[test]
@@ -6392,7 +6392,7 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         );
     }
 
-    /// SW2a. An enters-with per-each clause whose operand has no quantity reading
+    /// An enters-with per-each clause whose operand has no quantity reading
     /// (a cost-paid object's counters) is surfaced, not silently counted as one.
     #[test]
     fn enters_with_unparsed_for_each_operand_is_a_swallow() {
@@ -6422,7 +6422,7 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         );
     }
 
-    /// SW2b. An activated self cost rider whose operand has no quantity reading
+    /// An activated self cost rider whose operand has no quantity reading
     /// installs no discount and is surfaced.
     #[test]
     fn activated_cost_rider_with_unparsed_operand_is_a_swallow() {

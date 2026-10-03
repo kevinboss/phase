@@ -184,7 +184,7 @@ fn deepwood_offered(board: &DeepwoodBoard) -> bool {
     by_gate
 }
 
-/// T1. CR 601.2f + CR 602.2b + CR 122.1: one +1/+1 counter on Deepwood and two
+/// CR 601.2f + CR 602.2b + CR 122.1: one +1/+1 counter on Deepwood and two
 /// on another creature you control reduce {5}{G} to {2}{G}; three mana pays it,
 /// the ability resolves and draws.
 #[test]
@@ -208,7 +208,7 @@ fn deepwood_denizen_counts_counters_on_every_creature_you_control() {
     assert_eq!(hand_len(&board.runner, P0), hand_before + 1, "drew a card");
 }
 
-/// T2. The same board with two mana: {2}{G} is not affordable, so the ability
+/// The same board with two mana: {2}{G} is not affordable, so the ability
 /// is not offered; one more mana makes it so (reach guard).
 #[test]
 fn deepwood_denizen_is_not_offered_below_the_reduced_cost() {
@@ -222,7 +222,7 @@ fn deepwood_denizen_is_not_offered_below_the_reduced_cost() {
     );
 }
 
-/// T3. CR 109.5: "you control" — an opponent's creature's counters do not
+/// CR 109.5: "you control" — an opponent's creature's counters do not
 /// reduce the cost.
 #[test]
 fn deepwood_denizen_ignores_counters_on_opponents_creatures() {
@@ -239,7 +239,7 @@ fn deepwood_denizen_ignores_counters_on_opponents_creatures() {
     );
 }
 
-/// T4. CR 122.1: only +1/+1 counters count. -1/-1 counters on a separate
+/// CR 122.1: only +1/+1 counters count. -1/-1 counters on a separate
 /// permanent (so CR 704.5q does not annihilate them) are a different kind.
 #[test]
 fn deepwood_denizen_ignores_other_counter_kinds() {
@@ -256,7 +256,7 @@ fn deepwood_denizen_ignores_other_counter_kinds() {
     );
 }
 
-/// T5. CR 118.7a: a generic reduction cannot reduce the colored component —
+/// CR 118.7a: a generic reduction cannot reduce the colored component —
 /// seven counters still leave {G}.
 #[test]
 fn deepwood_denizen_reduction_floors_at_the_colored_pip() {
@@ -273,7 +273,7 @@ fn deepwood_denizen_reduction_floors_at_the_colored_pip() {
     );
 }
 
-/// T6. CR 601.2f: the count is read live when the cost is determined, so
+/// CR 601.2f: the count is read live when the cost is determined, so
 /// counters added by Immaculate Magistrate make the ability affordable.
 #[test]
 fn deepwood_denizen_cost_tracks_counters_added_before_activation() {
@@ -313,7 +313,7 @@ fn deepwood_denizen_cost_tracks_counters_added_before_activation() {
 
 // ── Gleam of Authority: per-recipient continuous P/T (CR 611.3a + CR 613.4c) ──
 
-/// G1. "other creatures you control" is relative to the enchanted creature:
+/// "other creatures you control" is relative to the enchanted creature:
 /// the host's own counter is excluded, an opponent's counters are excluded,
 /// and the bonus follows counters added later (CR 611.3a).
 #[test]
@@ -352,7 +352,7 @@ fn gleam_of_authority_counts_counters_on_creatures_other_than_the_enchanted_one(
 
 // ── Enters-with replacements (CR 614.1c + CR 614.12) ─────────────────────────
 
-/// B1. Bioessence Hydra enters with a +1/+1 counter per loyalty counter on
+/// Bioessence Hydra enters with a +1/+1 counter per loyalty counter on
 /// planeswalkers you control — not an opponent's.
 #[test]
 fn bioessence_hydra_enters_with_counters_from_your_planeswalkers_only() {
@@ -384,7 +384,7 @@ fn bioessence_hydra_enters_with_counters_from_your_planeswalkers_only() {
     assert_eq!(counters(&runner, hydra, &CounterType::Plus1Plus1), 4);
 }
 
-/// A1. Ascendant Acolyte counts +1/+1 counters among OTHER creatures you
+/// Ascendant Acolyte counts +1/+1 counters among OTHER creatures you
 /// control.
 #[test]
 fn ascendant_acolyte_enters_with_counters_among_your_other_creatures() {
@@ -413,7 +413,7 @@ fn ascendant_acolyte_enters_with_counters_among_your_other_creatures() {
 
 // ── Resolution effects (CR 608.2h) ───────────────────────────────────────────
 
-/// C1. Chong and Lily, Nomads, mode two: +1/+0 for each lore counter among
+/// Chong and Lily, Nomads, mode two: +1/+0 for each lore counter among
 /// Sagas you control — the opponent's Saga and a non-Saga enchantment are
 /// excluded, and the amount is locked in at resolution (CR 608.2h).
 #[test]
@@ -484,7 +484,7 @@ fn chong_and_lily_mode_two_counts_lore_among_your_sagas() {
     );
 }
 
-/// SP1. Spara's Bodyguard's combat trigger counts shield counters among OTHER
+/// Spara's Bodyguard's combat trigger counts shield counters among OTHER
 /// creatures you control: not its own, not an opponent's.
 #[test]
 fn sparas_bodyguard_counts_shield_counters_among_your_other_creatures() {
@@ -507,7 +507,7 @@ fn sparas_bodyguard_counts_shield_counters_among_your_other_creatures() {
     assert_eq!(power_toughness(&runner, spara), (5, 5));
 }
 
-/// MB1. Moira Brown's Wasteland Survival Guide: "+1/+1 for each quest counter
+/// Moira Brown's Wasteland Survival Guide: "+1/+1 for each quest counter
 /// among permanents you control" — the token's own, Moira's, not an opponent's.
 #[test]
 fn wasteland_survival_guide_counts_quest_counters_among_your_permanents() {
@@ -546,7 +546,7 @@ fn wasteland_survival_guide_counts_quest_counters_among_your_permanents() {
     assert_eq!(power_toughness(&runner, bearer), (4, 4));
 }
 
-/// N1. Hydra Trainer: X is the number of counters (every kind) on permanents
+/// Hydra Trainer: X is the number of counters (every kind) on permanents
 /// you control.
 #[test]
 fn hydra_trainer_x_counts_every_kind_of_counter_on_your_permanents() {
@@ -582,7 +582,7 @@ fn hydra_trainer_x_counts_every_kind_of_counter_on_your_permanents() {
     assert_eq!(power_toughness(&runner, target), (6, 6));
 }
 
-/// N2. Dimension X Pizzasaur: the reflexive destroy's mana-value cap is the
+/// Dimension X Pizzasaur: the reflexive destroy's mana-value cap is the
 /// number of counters among permanents you control, read after the two
 /// counters land.
 #[test]
@@ -675,7 +675,7 @@ fn dimension_x_pizzasaur_caps_the_destroy_at_counters_among_your_permanents() {
 
 // ── Self-spell cost static (CR 601.2f) ───────────────────────────────────────
 
-/// S1. A self-spell cost reduction over the same census: three counters on
+/// A self-spell cost reduction over the same census: three counters on
 /// creatures you control reduce {5}{G} to {2}{G}; an opponent's do not count.
 #[test]
 fn self_spell_cost_reduction_counts_counters_on_your_creatures() {

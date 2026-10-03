@@ -9225,7 +9225,7 @@ mod tests {
 
     #[test]
     fn counter_census_reads_the_same_under_a_carried_context() {
-        // The context-aware census carries the caller's context (N2). A phrase
+        // The context-aware census carries the caller's context. A phrase
         // with no anaphor reads identically under a populated context and a
         // fresh one.
         for text in [

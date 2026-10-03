@@ -1576,7 +1576,10 @@ pub(crate) fn parse_counters_on_population_with_ctx<'a>(
 ) -> OracleResult<'a, QuantityRef> {
     let (rest, counter_type) = parse_counter_kind_word(input)?;
     let (population, _) = alt((tag(" on "), tag(" among "))).parse(rest)?;
-    // Determiner-led phrases name a single object; the object-scope arms own them.
+    // Determiner-led phrases are not populations: single objects ("target",
+    // "that", "the", "this", "a") belong to the object-scope arms, and
+    // quantifier forms ("each", "any", "another") have no census reading, so
+    // they fail closed.
     not(alt((
         tag("target "),
         tag("that "),
