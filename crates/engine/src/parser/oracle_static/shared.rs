@@ -889,7 +889,9 @@ impl GrantedCastKeywordKind {
 /// pass binds each one once the affected set is known. Binding is **per
 /// quantity**, keyed on the scope the parser recorded for that individual
 /// counter read, so a static that reads counters on `~` AND on its recipient
-/// keeps both referents: the explicit `Source` read is never touched.
+/// keeps both referents: the explicit `Source` read is never touched. The
+/// counter-kind census of a pronoun ("for each kind of counter on it") is bound
+/// by the same pass (see `bind_anaphoric_counter_ref`).
 ///
 /// This is the quantity-axis twin of `StaticCondition::RecipientHasCounters`
 /// (the recipient analog of `HasCounters` on the condition axis) — the two
@@ -955,11 +957,31 @@ fn bind_anaphoric_counters_in_condition(cond: &mut StaticCondition, bound: Objec
 
 /// CR 608.2k: The leaf binder — retargets a deferred counter anaphor and leaves
 /// every other `QuantityRef` and every already-bound scope untouched.
+///
+/// Two pronoun forms reach it. The counter COUNT ("for each +1/+1 counter on
+/// it") parks the pronoun on `ObjectScope::Anaphoric`. The counter-KIND census
+/// ("for each kind of counter on it") is parsed to its settled effect-side
+/// reading, the ability's own object (`SelfRef`) — the pronoun arm is that
+/// census's only `SelfRef` producer, since an explicit "~" is declined.
+///
+/// CR 611.3a + CR 613.4c: in a per-recipient static that pronoun instead names
+/// each affected object, so the census is rebound to the identity filter that
+/// follows the recipient (`FilterProp::Another` is recipient-relative while a
+/// recipient is bound, `game::filter`). A self-scoped static keeps `SelfRef`.
 fn bind_anaphoric_counter_ref(qty: &mut QuantityRef, bound: ObjectScope) {
-    if let QuantityRef::CountersOn { scope, .. } = qty {
-        if *scope == ObjectScope::Anaphoric {
+    match qty {
+        QuantityRef::CountersOn { scope, .. } if *scope == ObjectScope::Anaphoric => {
             *scope = bound;
         }
+        QuantityRef::DistinctCounterKindsAmong { filter }
+            if bound == ObjectScope::Recipient && matches!(filter, TargetFilter::SelfRef) =>
+        {
+            *filter =
+                TargetFilter::Typed(TypedFilter::permanent().properties(vec![FilterProp::Not {
+                    prop: Box::new(FilterProp::Another),
+                }]));
+        }
+        _ => {}
     }
 }
 
@@ -1043,15 +1065,14 @@ fn continuous_modification_dynamic_quantity_mut(
 
 /// CR 608.2k: Bind every **deferred** counter anaphor in a dynamic magnitude to
 /// `bound`. Mirrors `rebind_anaphoric_object_scope` (`oracle_effect/mod.rs`),
-/// the effect-side authority for the same pronoun, and touches only
-/// `ObjectScope::Anaphoric` — an explicit `Source` (`~`) or `Target` ("that
-/// creature") counter read in the same expression keeps its own referent.
+/// the effect-side authority for the same pronoun, and touches only the pronoun
+/// forms `bind_anaphoric_counter_ref` names — an explicit `Source` (`~`) or
+/// `Target` ("that creature") counter read in the same expression keeps its own
+/// referent.
 fn bind_anaphoric_counters(expr: &mut QuantityExpr, bound: ObjectScope) {
     match expr {
-        QuantityExpr::Ref {
-            qty: QuantityRef::CountersOn { scope, .. },
-        } if *scope == ObjectScope::Anaphoric => *scope = bound,
-        QuantityExpr::Ref { .. } | QuantityExpr::Fixed { .. } => {}
+        QuantityExpr::Ref { qty } => bind_anaphoric_counter_ref(qty, bound),
+        QuantityExpr::Fixed { .. } => {}
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::ClampMin { inner, .. }

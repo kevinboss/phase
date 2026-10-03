@@ -2307,24 +2307,24 @@ fn parse_bare_mana_values_among_tail(input: &str) -> OracleResult<'_, QuantityRe
 /// Taker's "for each kind of counter on permanents you control" — the filter is
 /// any controlled-permanent type phrase, so the combinator covers the whole
 /// class, not one card. Both "on" and "among" surface forms are accepted. A bare
-/// object pronoun ("kind of counter on it") names the single affected object
-/// through an identity filter.
+/// object pronoun ("kind of counter on it") names the ability's own object
+/// (`SelfRef`), read live or from last known information at resolution.
 fn parse_for_each_distinct_counter_kinds_among(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("kind of counter ").parse(input)?;
     let (rest, _) = alt((tag("on "), tag("among "))).parse(rest)?;
-    // CR 122.1 + CR 608.2c: the identity filter names the affected object when a
-    // recipient is bound and the ability source otherwise ("draw a card for each
-    // kind of counter on it", Blitzball Stadium's granted trigger). An explicit
-    // "~" keeps the type-phrase path below.
+    // CR 122.1 + CR 608.2k: with no antecedent in the clause, the pronoun names
+    // the object the trigger condition referred to — the ability's own object
+    // ("Whenever this creature deals combat damage to a player, draw a card for
+    // each kind of counter on it", Blitzball Stadium's granted trigger). Same
+    // settled reading as the counter-count sibling
+    // (`settle_deferred_counter_anaphor_ref` → `ObjectScope::Source`); the
+    // resolver reads it through the same live-or-LKI source authority
+    // (CR 608.2h), so a departed source still reports its kinds.
     if let Ok((after_pronoun, _)) = parse_deferred_counter_pronoun(rest) {
         return Ok((
             after_pronoun,
             QuantityRef::DistinctCounterKindsAmong {
-                filter: TargetFilter::Typed(TypedFilter::permanent().properties(vec![
-                    FilterProp::Not {
-                        prop: Box::new(FilterProp::Another),
-                    },
-                ])),
+                filter: TargetFilter::SelfRef,
             },
         ));
     }
@@ -14202,11 +14202,7 @@ mod tests {
             Ok((
                 "",
                 QuantityRef::DistinctCounterKindsAmong {
-                    filter: TargetFilter::Typed(TypedFilter::permanent().properties(vec![
-                        FilterProp::Not {
-                            prop: Box::new(FilterProp::Another),
-                        },
-                    ])),
+                    filter: TargetFilter::SelfRef,
                 }
             ))
         );

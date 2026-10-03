@@ -4,8 +4,10 @@
 //! target), "for each kind of counter on it" (the object a granted trigger is
 //! on), "for each acquired taste counter on this artifact" (a multi-word counter
 //! name on the source), and an enters-with clause whose two "for each"
-//! conjuncts each place counters. Every card is staged from its verbatim Oracle
-//! text (MTGJSON `AtomicCards.json`) and driven through the real pipeline.
+//! conjuncts each place counters. Every printed card is staged from its verbatim
+//! Oracle text (MTGJSON `AtomicCards.json`); the synthetic class cards (no
+//! printed card yet) are marked as such. All are driven through the real
+//! pipeline.
 
 use engine::game::combat::AttackTarget;
 use engine::game::game_object::AttachTarget;
@@ -217,6 +219,117 @@ fn blitzball_stadium_grant_draws_per_kind_of_counter_on_the_creature() {
         "reach guard: the 5/5 runner connected"
     );
     outcome.assert_hand_drawn(P0, 2);
+}
+
+/// Synthetic class card: the counter-kind census of a trigger's own object
+/// after that object has left the battlefield (no printed card yet).
+const DIES_KIND_CENSUS: &str =
+    "When this creature dies, draw a card for each kind of counter on it.";
+const DESTROY_TARGET_CREATURE: &str = "Destroy target creature.";
+
+/// KC1. CR 122.1 + CR 122.2 + CR 608.2h: "it" is the creature that died; its
+/// counters ceased to exist in the graveyard, so the census reads its last
+/// known information — +1/+1 and oil are two kinds (three counters), so two
+/// cards.
+#[test]
+fn dies_trigger_draws_per_kind_of_counter_the_creature_last_had() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let dier = scenario
+        .add_creature_from_oracle(P0, "Census Keeper", 2, 2, DIES_KIND_CENSUS)
+        .id();
+    scenario.with_counter(dier, CounterType::Plus1Plus1, 1);
+    scenario.with_counter(dier, parse_counter_type("oil"), 2);
+    let destroy = scenario
+        .add_spell_to_hand_from_oracle(P0, "Execution", true, DESTROY_TARGET_CREATURE)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    seed_library(&mut scenario, P0);
+    let mut runner = scenario.build();
+    let library_before = runner.state().players[P0.0 as usize].library.len();
+
+    runner.cast(destroy).target_object(dier).resolve();
+    drive_to_empty_stack(&mut runner);
+
+    assert_eq!(
+        runner.state().objects[&dier].zone,
+        Zone::Graveyard,
+        "reach guard: the creature died"
+    );
+    assert!(
+        runner.state().objects[&dier].counters.is_empty(),
+        "reach guard: the live object no longer carries the counters (CR 122.2)"
+    );
+    assert_eq!(
+        library_before - runner.state().players[P0.0 as usize].library.len(),
+        2,
+        "one card per kind of counter it last had"
+    );
+}
+
+/// Synthetic class cards: a per-recipient anthem scaled by the counter-kind
+/// census of each affected creature (no printed card yet). Both pronoun
+/// numbers are exercised.
+const PER_RECIPIENT_KIND_ANTHEMS: [&str; 2] = [
+    "Creatures you control get +1/+1 for each kind of counter on it.",
+    "Creatures you control get +1/+1 for each kind of counter on them.",
+];
+
+/// KC2. CR 122.1 + CR 611.3a + CR 613.4c: in a per-recipient continuous
+/// static the pronoun names each affected creature, so each creature counts the
+/// kinds of counter on ITSELF — not the source's (which has none).
+#[test]
+fn per_recipient_anthem_counts_each_creatures_own_counter_kinds() {
+    use engine::game::derived::derive_display_state;
+    use engine::game::layers::evaluate_layers;
+    use engine::types::ability::{ContinuousModification, QuantityExpr, QuantityRef};
+
+    for text in PER_RECIPIENT_KIND_ANTHEMS {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature_from_oracle(P0, "Kind Warden", 1, 1, text)
+            .id();
+        // Non-P/T counters so the only P/T change is the anthem's.
+        let two_kinds = scenario.add_creature(P0, "Two Kinds", 2, 2).id();
+        scenario.with_counter(two_kinds, parse_counter_type("charge"), 1);
+        scenario.with_counter(two_kinds, parse_counter_type("oil"), 2);
+        let one_kind = scenario.add_creature(P0, "One Kind", 2, 2).id();
+        scenario.with_counter(one_kind, parse_counter_type("slime"), 3);
+        let mut runner = scenario.build();
+        evaluate_layers(runner.state_mut());
+        derive_display_state(runner.state_mut());
+
+        let state = runner.state();
+        assert!(
+            state.objects[&source]
+                .static_definitions
+                .as_slice()
+                .iter()
+                .flat_map(|def| def.modifications.iter())
+                .any(|m| matches!(
+                    m,
+                    ContinuousModification::AddDynamicPower {
+                        value: QuantityExpr::Ref {
+                            qty: QuantityRef::DistinctCounterKindsAmong { .. }
+                        }
+                    }
+                )),
+            "reach guard: {text:?} parsed to a counter-kind anthem"
+        );
+        assert_eq!(
+            state.objects[&two_kinds].counters.len(),
+            2,
+            "reach guard: two counter kinds staged"
+        );
+        let pt = |id: ObjectId| {
+            let obj = &state.objects[&id];
+            (obj.power.unwrap_or(0), obj.toughness.unwrap_or(0))
+        };
+        assert_eq!(pt(two_kinds), (4, 4), "{text:?}: charge + oil → +2/+2");
+        assert_eq!(pt(one_kind), (3, 3), "{text:?}: slime → +1/+1");
+        assert_eq!(pt(source), (1, 1), "{text:?}: no counters → +0/+0");
+    }
 }
 
 // ── Moth Herb Elixir: a multi-word counter name ──────────────────────────────

@@ -1693,35 +1693,18 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
     match expr {
         QuantityExpr::Fixed { .. } => false,
         QuantityExpr::Ref { qty } => match qty {
-            QuantityRef::HandSize {
-                player: PlayerScope::RecipientController,
-            }
-            | QuantityRef::LifeTotal {
-                player: PlayerScope::RecipientController,
-            }
-            | QuantityRef::LifeLostThisTurn {
-                player: PlayerScope::RecipientController,
-            }
-            | QuantityRef::LifeGainedThisTurn {
-                player: PlayerScope::RecipientController,
-            }
-            | QuantityRef::CardsDrawnThisTurn {
-                player: PlayerScope::RecipientController,
-            }
-            | QuantityRef::CardsDiscardedThisTurn {
-                player: PlayerScope::RecipientController,
-            }
-            | QuantityRef::TokensCreatedThisTurn {
-                player: PlayerScope::RecipientController,
-                ..
-            }
-            | QuantityRef::PlayerActionsThisTurn {
-                player: PlayerScope::RecipientController,
-                ..
-            }
-            | QuantityRef::PartySize {
-                player: PlayerScope::RecipientController,
-            } => true,
+            // CR 613.4c: a player-scoped read varies per affected
+            // object exactly when its scope names the recipient's controller
+            // ("…for each card in its controller's hand").
+            QuantityRef::HandSize { player }
+            | QuantityRef::LifeTotal { player }
+            | QuantityRef::LifeLostThisTurn { player }
+            | QuantityRef::LifeGainedThisTurn { player }
+            | QuantityRef::CardsDrawnThisTurn { player }
+            | QuantityRef::CardsDiscardedThisTurn { player }
+            | QuantityRef::TokensCreatedThisTurn { player, .. }
+            | QuantityRef::PlayerActionsThisTurn { player, .. }
+            | QuantityRef::PartySize { player } => player_scope_is_recipient(player),
             QuantityRef::ObjectCount { filter }
             | QuantityRef::ObjectCountDistinct { filter, .. }
             | QuantityRef::ObjectCountBySharedQuality { filter, .. }
@@ -1747,61 +1730,33 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
                 ..
             }
             // CR 613.4c + CR 611.3a: a counter census whose population is
-            // recipient-relative ('other creatures' under an Aura, 'it' under a
-            // grant) varies per affected object.
+            // recipient-relative ('other creatures' under an Aura) varies per
+            // affected object.
             | QuantityRef::CountersOnObjects { filter, .. }
             | QuantityRef::DistinctCounterKindsAmong { filter } => filter_uses_recipient(filter),
-            QuantityRef::ObjectColorCount {
-                scope: ObjectScope::Recipient,
-            }
-            | QuantityRef::ObjectNameWordCount {
-                scope: ObjectScope::Recipient,
-            }
+            // CR 613.4c: a per-object characteristic read varies per affected
+            // object exactly when its scope names the recipient. CR 122.1 +
+            // CR 613.4c: "…for each [kind] counter on it/them" in a
+            // per-recipient continuous static counts the counters on the
+            // affected object (Toxrill, Clamavus, Thelon of Havenwood, Luxior,
+            // Spark Rupture).
+            QuantityRef::ObjectColorCount { scope }
+            | QuantityRef::ObjectNameWordCount { scope }
             | QuantityRef::NameStickerLetterCount {
-                stickers:
-                    NameStickerSet::OnObject {
-                        scope: ObjectScope::Recipient,
-                    },
+                stickers: NameStickerSet::OnObject { scope },
                 letters: _,
             }
-            | QuantityRef::ObjectTypelineComponentCount {
-                scope: ObjectScope::Recipient,
-            }
-            | QuantityRef::Power {
-                scope: ObjectScope::Recipient,
-            }
-            | QuantityRef::BasePower {
-                scope: ObjectScope::Recipient,
-            }
-            | QuantityRef::Toughness {
-                scope: ObjectScope::Recipient,
-            }
-            | QuantityRef::ObjectManaValue {
-                scope: ObjectScope::Recipient,
-            }
-            | QuantityRef::ManaSymbolsInManaCost {
-                scope: ObjectScope::Recipient,
-                ..
-            }
-            // CR 122.1 + CR 613.4c: "…for each [kind] counter on it/them" in a
-            // per-recipient continuous static counts the counters on the
-            // affected object, so the magnitude varies per recipient (Toxrill,
-            // Clamavus, Thelon of Havenwood, Luxior, Spark Rupture).
-            | QuantityRef::CountersOn {
-                scope: ObjectScope::Recipient,
-                ..
-            } => true,
-            QuantityRef::Power {
-                scope: ObjectScope::CostPaidObject,
-            }
-            | QuantityRef::BasePower {
-                scope: ObjectScope::CostPaidObject,
-            }
-            | QuantityRef::Toughness {
-                scope: ObjectScope::CostPaidObject,
-            }
-            | QuantityRef::ObjectManaValue {
-                scope: ObjectScope::CostPaidObject,
+            | QuantityRef::ObjectTypelineComponentCount { scope }
+            | QuantityRef::Power { scope }
+            | QuantityRef::BasePower { scope }
+            | QuantityRef::Toughness { scope }
+            | QuantityRef::ObjectManaValue { scope }
+            | QuantityRef::ManaSymbolsInManaCost { scope, .. }
+            | QuantityRef::CountersOn { scope, .. } => object_scope_is_recipient(*scope),
+            // The sticker just put on names no object.
+            QuantityRef::NameStickerLetterCount {
+                stickers: NameStickerSet::ThatSticker,
+                letters: _,
             } => false,
             // Filter-bearing history / aggregate refs: their 'other/another'
             // contrasts with the ability source (Thunder Salvo, Wolverine);
@@ -1822,35 +1777,16 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::CounterAddedThisTurn { .. }
             | QuantityRef::ZoneCardCount { .. }
             | QuantityRef::SacrificedThisTurn { .. }
-            | QuantityRef::TokensCreatedThisTurn { .. }
             | QuantityRef::PlayerCount { .. }
             | QuantityRef::EventContextPlayerCount { .. } => false,
             // Scalar, player-scoped and resolution-bound refs, and the
-            // non-recipient scopes / sources of the variants classified above:
-            // none reads the affected object.
-            QuantityRef::HandSize { .. }
-            | QuantityRef::LifeTotal { .. }
-            | QuantityRef::LifeLostThisTurn { .. }
-            | QuantityRef::LifeGainedThisTurn { .. }
-            | QuantityRef::CardsDrawnThisTurn { .. }
-            | QuantityRef::CardsDiscardedThisTurn { .. }
-            | QuantityRef::PlayerActionsThisTurn { .. }
-            | QuantityRef::PartySize { .. }
-            | QuantityRef::DistinctCardTypes { .. }
+            // non-recipient sources of the variants classified above: none
+            // reads the affected object.
+            QuantityRef::DistinctCardTypes { .. }
             | QuantityRef::SharedCardTypes { .. }
             | QuantityRef::DistinctSubtypes { .. }
             | QuantityRef::ManaSpentToCast { .. }
             | QuantityRef::AttackedThisTurn { .. }
-            | QuantityRef::ObjectColorCount { .. }
-            | QuantityRef::ObjectNameWordCount { .. }
-            | QuantityRef::NameStickerLetterCount { .. }
-            | QuantityRef::ObjectTypelineComponentCount { .. }
-            | QuantityRef::Power { .. }
-            | QuantityRef::BasePower { .. }
-            | QuantityRef::Toughness { .. }
-            | QuantityRef::ObjectManaValue { .. }
-            | QuantityRef::ManaSymbolsInManaCost { .. }
-            | QuantityRef::CountersOn { .. }
             | QuantityRef::UnspentMana { .. }
             | QuantityRef::GraveyardSize { .. }
             | QuantityRef::LifeAboveStarting
@@ -1911,6 +1847,45 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
         QuantityExpr::Difference { left, right } => {
             quantity_expr_uses_recipient(left) || quantity_expr_uses_recipient(right)
         }
+    }
+}
+
+/// CR 613.4c: Whether a player scope names the controller of the
+/// per-recipient affected object. Exhaustive so a new scope must be classified
+/// rather than defaulting.
+fn player_scope_is_recipient(scope: &PlayerScope) -> bool {
+    match scope {
+        PlayerScope::RecipientController => true,
+        PlayerScope::Controller
+        | PlayerScope::ScopedPlayer
+        | PlayerScope::Target
+        | PlayerScope::Opponent { .. }
+        | PlayerScope::AllPlayers { .. }
+        | PlayerScope::DefendingPlayer
+        | PlayerScope::ParentObjectTargetController
+        | PlayerScope::SourceChosenPlayer
+        | PlayerScope::AnyTurn
+        | PlayerScope::SpecificPlayer { .. } => false,
+    }
+}
+
+/// CR 613.4c: Whether an object scope names the per-recipient affected object.
+/// Exhaustive so a new scope must be classified rather than defaulting.
+fn object_scope_is_recipient(scope: ObjectScope) -> bool {
+    match scope {
+        ObjectScope::Recipient => true,
+        ObjectScope::Source
+        | ObjectScope::Target
+        | ObjectScope::EventSource
+        | ObjectScope::CostPaidObject
+        | ObjectScope::Anaphoric
+        | ObjectScope::Demonstrative
+        | ObjectScope::AmassedArmy
+        | ObjectScope::EventTarget
+        | ObjectScope::OtherRevealedCard
+        | ObjectScope::OwnedLinkedExileCard
+        | ObjectScope::BatchSource
+        | ObjectScope::ChainRootTarget => false,
     }
 }
 
@@ -7270,12 +7245,39 @@ pub(crate) fn distinct_counter_kinds_among(
     filter: &TargetFilter,
     filter_ctx: &FilterContext<'_>,
 ) -> Vec<CounterType> {
+    // CR 122.1 + CR 608.2h + CR 608.2k: the ability's own object ("each kind of
+    // counter on ~", or the trigger-condition object a bare "it" names) is read
+    // through the same live-or-last-known authority as its counter count
+    // (`QuantityRef::CountersOn { scope: Source }`), so a source that has left
+    // the battlefield ("When this creature dies, …") still reports the kinds it
+    // had rather than dropping out of a battlefield scan.
+    if matches!(filter, TargetFilter::SelfRef) {
+        let ctx = QuantityContext {
+            entering: None,
+            source: filter_ctx.source_id,
+            trigger_source: filter_ctx.trigger_source.cloned(),
+            recipient: None,
+            scoped_player: None,
+            damage_source: None,
+            spell: None,
+            event_amount: None,
+        };
+        let kinds = read_counters_on_live_or_lki_scope(
+            state,
+            ObjectScope::Source,
+            ctx,
+            &[],
+            positive_counter_types,
+        )
+        .unwrap_or_default();
+        return sorted_counter_kinds(kinds.into_iter().collect());
+    }
     let mut seen: HashSet<CounterType> = HashSet::new();
-    // CR 608.2c + CR 122.1: parent-target domains ("it", "that permanent",
-    // or an indexed parent slot) resolve through the same ability-bound
-    // authorities as other resolution effects. Predicate domains instead scan
-    // every zone declared by `InZone` / `InAnyZone`, defaulting to the
-    // battlefield only when the filter declares no zone.
+    // CR 608.2c + CR 122.1: parent-target domains ("that permanent", or an
+    // indexed parent slot) resolve through the same ability-bound authorities
+    // as other resolution effects. Predicate domains instead scan every zone
+    // declared by `InZone` / `InAnyZone`, defaulting to the battlefield only
+    // when the filter declares no zone.
     let object_ids: Vec<ObjectId> = match filter {
         TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. } => filter_ctx
             .ability
@@ -7310,6 +7312,12 @@ pub(crate) fn distinct_counter_kinds_among(
             }
         }
     }
+    sorted_counter_kinds(seen)
+}
+
+/// The deterministic (`CounterType::as_str`-sorted) order of a counter-kind
+/// set — see [`distinct_counter_kinds_among`].
+fn sorted_counter_kinds(seen: HashSet<CounterType>) -> Vec<CounterType> {
     let mut kinds: Vec<CounterType> = seen.into_iter().collect();
     kinds.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
     kinds
@@ -7612,15 +7620,31 @@ fn resolve_counters_on_live_or_lki_scope(
     targets: &[TargetRef],
     counter_type: Option<&CounterType>,
 ) -> i32 {
+    read_counters_on_live_or_lki_scope(state, scope, ctx, targets, |counters| {
+        counter_count_from_map(counters, counter_type)
+    })
+    .unwrap_or(0)
+}
+
+/// Read the counters on the object an ordinary scope names — the single
+/// authority behind both the counter COUNT (`QuantityRef::CountersOn`) and the
+/// counter-KIND census of the ability's own object
+/// (`QuantityRef::DistinctCounterKindsAmong { filter: SelfRef }`). `None` when
+/// the scope names no object.
+fn read_counters_on_live_or_lki_scope<T>(
+    state: &GameState,
+    scope: ObjectScope,
+    ctx: QuantityContext,
+    targets: &[TargetRef],
+    read: impl FnOnce(&HashMap<CounterType, u32>) -> T,
+) -> Option<T> {
     // CR 608.2k: An `Anaphoric` counter read that reached runtime found no
     // clause subject and no per-recipient static to bind it, so the pronoun
     // names the ability's own object — "+1/+1 counters on him" on Red Hulk's
     // Enrage reflex.
     if matches!(scope, ObjectScope::Source | ObjectScope::Anaphoric) && ctx.trigger_source.is_some()
     {
-        return source_lki_for_context(state, &ctx)
-            .map(|lki| counter_count_from_map(&lki.counters, counter_type))
-            .unwrap_or(0);
+        return source_lki_for_context(state, &ctx).map(|lki| read(&lki.counters));
     }
     // An unbound anaphor resolves through the `Source` lookup — the generic
     // scope helpers have no referent for `Anaphoric` itself.
@@ -7628,18 +7652,15 @@ fn resolve_counters_on_live_or_lki_scope(
         ObjectScope::Anaphoric => ObjectScope::Source,
         other => other,
     };
-    let Some(object_id) = object_id_for_scope(state, lookup_scope, ctx, targets) else {
-        return 0;
-    };
+    let object_id = object_id_for_scope(state, lookup_scope, ctx, targets)?;
     let live = state.objects.get(&object_id);
     let on_battlefield = live.is_some_and(|obj| obj.zone == Zone::Battlefield);
     if !on_battlefield {
         if let Some(lki) = state.lki_cache.get(&object_id) {
-            return counter_count_from_map(&lki.counters, counter_type);
+            return Some(read(&lki.counters));
         }
     }
-    live.map(|obj| counter_count_from_map(&obj.counters, counter_type))
-        .unwrap_or(0)
+    live.map(|obj| read(&obj.counters))
 }
 
 fn resolve_counters_on_scope(

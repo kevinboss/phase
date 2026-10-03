@@ -254,8 +254,12 @@ pub(crate) fn parse_quantity_ref_with_context(
 
     // CR 109.5 + CR 122.1: the context-aware entry for anaphoric populations;
     // grammar lives in parse_counters_on_population. The caller's context is
-    // carried (subject, trigger, actor) with its third-person player as the
-    // referent of "they control" / "that player controls".
+    // carried (subject, trigger, actor, chain-bound qualifiers) with its
+    // third-person player as the referent of "they control" / "that player
+    // controls". The read runs on a tentative clone committed back only on
+    // success (the `ChosenColorQualifierScope` merge-back rule), so a pending
+    // printed-colour choice it records reaches the chain; the scope override
+    // stays local to this read.
     if let Ok((population, _)) = alt((
         tag::<_, _, OracleError<'_>>("the total number of "),
         tag("the number of "),
@@ -270,6 +274,8 @@ pub(crate) fn parse_quantity_ref_with_context(
         if let Ok(("", qty)) =
             nom_quantity::parse_counters_on_population_with_ctx(population, &mut population_ctx)
         {
+            population_ctx.relative_player_scope = ctx.relative_player_scope.clone();
+            *ctx = population_ctx;
             return Some(qty);
         }
     }
@@ -9241,5 +9247,54 @@ mod tests {
             assert!(fresh.is_ok(), "reach guard: {text:?} must parse");
             assert_eq!(with_ctx, fresh, "{text:?}");
         }
+    }
+
+    #[test]
+    fn counter_census_carries_and_commits_the_callers_chain_context() {
+        use crate::parser::oracle_ir::context::ChosenColorQualifierScope;
+        use crate::types::ability::ChoiceType;
+        // CR 105.4 + CR 608.2c: the census reads its population under the
+        // CALLER's context, not a fresh one. Only an effect-chain context
+        // (`ChainBound`) may consume the printed "of the color of your choice"
+        // qualifier, and the pending colour choice it records must reach that
+        // caller. "they control" makes the context-free reading decline, so the
+        // phrase reaches the context-aware census.
+        let text =
+            "the number of +1/+1 counters on creatures they control of the color of your choice";
+        let mut chain = ParseContext {
+            actor: Some(ControllerRef::Opponent),
+            chosen_color_qualifier: ChosenColorQualifierScope::ChainBound,
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_quantity_ref_with_context(text, &mut chain),
+            Some(QuantityRef::CountersOnObjects {
+                counter_type: Some(CounterType::Plus1Plus1),
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(ControllerRef::Opponent)
+                        .properties(vec![FilterProp::IsChosenColor])
+                ),
+            })
+        );
+        assert_eq!(
+            chain.pending_printed_color_choice,
+            Some(ChoiceType::color()),
+            "the chooser request is committed to the caller's context"
+        );
+        assert_eq!(
+            chain.relative_player_scope, None,
+            "the 'they control' referent stays local to the census read"
+        );
+
+        // The same phrase under an unbound context leaves the qualifier
+        // unconsumed, so the census declines it rather than stamping a
+        // chooser-less colour filter.
+        let mut unbound = ParseContext {
+            actor: Some(ControllerRef::Opponent),
+            ..Default::default()
+        };
+        assert_eq!(parse_quantity_ref_with_context(text, &mut unbound), None);
+        assert_eq!(unbound.pending_printed_color_choice, None);
     }
 }
