@@ -5076,6 +5076,61 @@ mod tests {
         );
     }
 
+    /// CR 601.2f + CR 122.1: Deepwood Denizen — the rider counts +1/+1
+    /// counters summed over the controlled creature population.
+    #[test]
+    fn cost_reduction_for_each_counter_on_a_controlled_population() {
+        use crate::types::ability::{
+            ControllerRef, QuantityExpr, QuantityRef, TargetFilter, TypedFilter,
+        };
+        use crate::types::counter::CounterType;
+        use crate::types::statics::CostModifyMode;
+
+        let reduction = try_parse_cost_reduction(
+            "This ability costs {1} less to activate for each +1/+1 counter on creatures you control.",
+        )
+        .expect("Deepwood Denizen discount should parse");
+        assert_eq!(reduction.mode, CostModifyMode::Reduce);
+        assert_eq!(reduction.amount_per, 1);
+        assert_eq!(reduction.condition, None);
+        assert_eq!(
+            reduction.count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::CountersOnObjects {
+                    counter_type: Some(CounterType::Plus1Plus1),
+                    filter: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::You)
+                    ),
+                },
+            },
+        );
+    }
+
+    /// CR 601.2c + CR 602.2b: Warrior's Blades — the equip discount counts the
+    /// +1/+1 counters on the creature the ability targets (Dragonfire Blade's
+    /// counter-kind sibling).
+    #[test]
+    fn cost_reduction_for_each_counter_on_creature_it_targets() {
+        use crate::types::ability::{ObjectScope, QuantityExpr, QuantityRef};
+        use crate::types::counter::CounterType;
+
+        let reduction = try_parse_cost_reduction(
+            "this ability costs {1} less to activate for each +1/+1 counter on the creature it targets",
+        )
+        .expect("Warrior's Blades equip discount should parse");
+        assert_eq!(reduction.amount_per, 1);
+        assert_eq!(reduction.condition, None);
+        assert_eq!(
+            reduction.count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::CountersOn {
+                    scope: ObjectScope::Target,
+                    counter_type: Some(CounterType::Plus1Plus1),
+                },
+            },
+        );
+    }
+
     /// #3223: the self cost-reduction *head* recognizer matches both the bare
     /// sentence and a sentence carrying a trailing "if [condition]" tail; it
     /// rejects unrelated effect sentences. Drives the upstream

@@ -621,6 +621,10 @@ fn parse_keyword_counter_name(input: &str) -> OracleResult<'_, &str> {
 fn parse_named_counter_type(input: &str) -> OracleResult<'_, &str> {
     // Split into two alt groups to stay within nom's 21-arm tuple limit.
     alt((
+        // CR 122.1: multi-word counter names must be enumerated — the open
+        // fallback consumes one token; 'acquired taste' is the only multi-word
+        // non-keyword name in the corpus.
+        tag("acquired taste"),
         tag("loyalty"),
         tag("charge"),
         tag("lore"),

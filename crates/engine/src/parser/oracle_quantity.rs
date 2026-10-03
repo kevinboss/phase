@@ -252,39 +252,25 @@ pub(crate) fn parse_quantity_ref_with_context(
         }
     }
 
-    // "the number of [counter type] counters on [filter]" — total counters across
-    // all matching objects, distinct from object count.
-    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("the number of ").parse(trimmed) {
-        for suffix in [
-            " counters on ",
-            " counter on ",
-            " counters among ",
-            " counter among ",
-        ] {
-            let Ok((after_suffix, counter_text)) =
-                take_until::<_, _, OracleError<'_>>(suffix).parse(rest)
-            else {
-                continue;
-            };
-            let Ok((after_filter, _)) = tag::<_, _, OracleError<'_>>(suffix).parse(after_suffix)
-            else {
-                continue;
-            };
-            let counter_text = counter_text.trim();
-            if counter_text.is_empty() {
-                continue;
-            }
-            let counter_type = normalize_counter_type(counter_text);
-            let (filter, remainder) = parse_type_phrase_folding_with_ctx(after_filter, ctx);
-            if remainder.trim().is_empty()
-                && !matches!(filter, TargetFilter::Any)
-                && !is_empty_typed_filter(&filter)
-            {
-                return Some(QuantityRef::CountersOnObjects {
-                    counter_type: Some(counter_type),
-                    filter,
-                });
-            }
+    // CR 109.5 + CR 122.1: the context-aware entry for anaphoric populations;
+    // grammar lives in parse_counters_on_population. The caller's context is
+    // carried (subject, trigger, actor) with its third-person player as the
+    // referent of "they control" / "that player controls".
+    if let Ok((population, _)) = alt((
+        tag::<_, _, OracleError<'_>>("the total number of "),
+        tag("the number of "),
+    ))
+    .parse(trimmed)
+    {
+        let mut population_ctx = ctx.clone();
+        population_ctx.relative_player_scope = Some(
+            ctx.third_person_player_controller_ref()
+                .unwrap_or(ControllerRef::ScopedPlayer),
+        );
+        if let Ok(("", qty)) =
+            nom_quantity::parse_counters_on_population_with_ctx(population, &mut population_ctx)
+        {
+            return Some(qty);
         }
     }
 
@@ -3536,8 +3522,12 @@ fn parse_for_each_clause_with_they_controller(
         });
     }
 
-    // "[counter type] counter(s) on that creature/permanent" — anaphoric, must check
-    // before the wildcard "counter on" guard below which would misroute to CountersOnSelf.
+    // "[counter type] counter(s) on that creature/permanent" — anaphoric.
+    // CR 122.1: counter counts bind to the object the text names; the nom
+    // source/target/population arms are the authority. An unrecognized object
+    // returns None — callers must surface it (the DynamicQty swallow detector
+    // does on effect/replacement routes; the cost-modification route's ObjectCount
+    // fallback does not — see phase-rs/phase#9513).
     if clause.contains("counter on that") {
         if let Some(qty) = parse_quantity_ref(clause) {
             return Some(qty);
@@ -3547,11 +3537,8 @@ fn parse_for_each_clause_with_they_controller(
     // CR 109.1 + CR 122.1: "[type] you control with a [counter] counter on it" —
     // objects matching a type filter AND bearing at least one counter of the given
     // type. The filter is the type-phrase plus a
-    // `FilterProp::Counters { OfType(t), GE, Fixed(1) }`.
-    // This must be checked BEFORE the self-counter fallback below, which would
-    // otherwise misroute any clause containing "counter on" to CountersOnSelf and
-    // discard the subject type phrase (Inspiring Call bug: "creature you control
-    // with a +1/+1 counter on it" → CountersOnSelf{ "creature you control with a +1/+1" }).
+    // `FilterProp::Counters { OfType(t), GE, Fixed(1) }` (Inspiring Call:
+    // "creature you control with a +1/+1 counter on it").
     if let Ok((_, type_part)) = take_until::<_, _, OracleError<'_>>(" with ").parse(clause) {
         let suffix_part = &clause[type_part.len() + 1..]; // starts at "with "
         if let Some((counter_prop, consumed)) =
@@ -3574,16 +3561,6 @@ fn parse_for_each_clause_with_they_controller(
                     }
                 }
             }
-        }
-    }
-
-    if clause.contains("counter on") {
-        let raw_type = clause.split("counter").next().unwrap_or("").trim();
-        if !raw_type.is_empty() {
-            return Some(QuantityRef::CountersOn {
-                scope: ObjectScope::Source,
-                counter_type: Some(normalize_counter_type(raw_type)),
-            });
         }
     }
 
@@ -9160,6 +9137,109 @@ mod tests {
                 None,
                 "combinator must decline {phrase:?}"
             );
+        }
+    }
+
+    // ── Counter counts: the wildcard object reading is gone (CR 122.1) and the
+    // context-aware counter census binds anaphoric controllers (CR 109.5).
+
+    #[test]
+    fn for_each_counter_clause_with_an_unparsed_object_fails_closed() {
+        // Reach guard: Deepwood Denizen's population clause parses.
+        assert!(matches!(
+            parse_for_each_clause("+1/+1 counter on creatures you control"),
+            Some(QuantityRef::CountersOnObjects { .. })
+        ));
+        // Ulasht's conjoined tail is two clauses, not one counter-on-self count.
+        assert_eq!(
+            parse_for_each_clause(
+                "other red creature you control and a +1/+1 counter on it for each other \
+                 green creature you control"
+            ),
+            None
+        );
+        // A cost-paid object has no counter-count reading here.
+        assert_eq!(
+            parse_for_each_clause("+1/+1 counter on the sacrificed creature"),
+            None
+        );
+    }
+
+    #[test]
+    fn for_each_multi_word_named_counter_on_self() {
+        assert_eq!(
+            parse_for_each_clause("acquired taste counter on this artifact"),
+            Some(QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Generic("acquired taste".to_string())),
+            })
+        );
+    }
+
+    #[test]
+    fn number_of_counters_on_creatures_they_control_binds_the_context_player() {
+        let text = "the number of +1/+1 counters on creatures they control";
+        let mut defending = ParseContext {
+            relative_player_scope: Some(ControllerRef::DefendingPlayer),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_quantity_ref_with_context(text, &mut defending),
+            Some(QuantityRef::CountersOnObjects {
+                counter_type: Some(CounterType::Plus1Plus1),
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::DefendingPlayer)
+                ),
+            })
+        );
+        assert_eq!(
+            parse_quantity_ref_with_context(text, &mut ParseContext::default()),
+            Some(QuantityRef::CountersOnObjects {
+                counter_type: Some(CounterType::Plus1Plus1),
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::ScopedPlayer)
+                ),
+            })
+        );
+        // The actor stands in for a missing relative scope (third-person player).
+        let mut acting = ParseContext {
+            actor: Some(ControllerRef::Opponent),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_quantity_ref_with_context(text, &mut acting),
+            Some(QuantityRef::CountersOnObjects {
+                counter_type: Some(CounterType::Plus1Plus1),
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::Opponent)
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn counter_census_reads_the_same_under_a_carried_context() {
+        // The context-aware census carries the caller's context (N2). A phrase
+        // with no anaphor reads identically under a populated context and a
+        // fresh one.
+        for text in [
+            "time counters among permanents you control",
+            "counters on permanents you control",
+            "+1/+1 counters on other creatures you control",
+        ] {
+            let fresh =
+                nom_quantity::parse_counters_on_population(text, Some(ControllerRef::ScopedPlayer));
+            let mut carried = ParseContext {
+                card_name: Some("Kate Stewart".to_string()),
+                in_trigger: true,
+                subject: Some(TargetFilter::Typed(TypedFilter::creature())),
+                actor: Some(ControllerRef::You),
+                relative_player_scope: Some(ControllerRef::ScopedPlayer),
+                ..Default::default()
+            };
+            let with_ctx = nom_quantity::parse_counters_on_population_with_ctx(text, &mut carried);
+            assert!(fresh.is_ok(), "reach guard: {text:?} must parse");
+            assert_eq!(with_ctx, fresh, "{text:?}");
         }
     }
 }

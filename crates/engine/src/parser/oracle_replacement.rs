@@ -4272,8 +4272,17 @@ fn parse_enters_with_counters(
         parse_enters_base_plus_additional_for_each(after_counter, &counter_type, &count_expr)
     {
         count_expr = combined;
-    } else if let Some(for_each_count) = parse_enters_counter_for_each_suffix(after_counter) {
-        count_expr = multiply_counter_count_by_for_each(count_expr, for_each_count);
+    } else if let Some(terms) = parse_enters_counter_for_each_suffix(after_counter, &counter_type) {
+        let first = multiply_counter_count_by_for_each(count_expr, terms.first);
+        // CR 614.1c + CR 122.1: each 'for each' conjunct places its own counters;
+        // an object matching both is counted by both (Ulasht ruling).
+        count_expr = if terms.extra.is_empty() {
+            first
+        } else {
+            QuantityExpr::Sum {
+                exprs: std::iter::once(first).chain(terms.extra).collect(),
+            }
+        };
     }
     // CR 122.6: For "a number of counters equal to [quantity]" and the
     // sibling shorthand "counters on it equal to [quantity]", parse the
@@ -4953,7 +4962,24 @@ fn replacement_condition_from_static_unless(
     }
 }
 
-fn parse_enters_counter_for_each_suffix(after_counter: &str) -> Option<QuantityExpr> {
+/// The per-each scaling of an enters-with counter clause: the leading
+/// "for each <filter>" count, plus one term per further conjunct
+/// "and <N> <kind> counter[s] on <pronoun> for each <filter>" (Ulasht, the
+/// Hate Seed). `extra` is empty for the single-clause form.
+struct EntersForEachTerms {
+    first: QuantityExpr,
+    extra: Vec<QuantityExpr>,
+}
+
+/// CR 614.1c + CR 614.12: Parse the " counter[s] on <pronoun> for each
+/// <filter>[ and <N> <kind> counter[s] on <pronoun> for each <filter>]…" tail
+/// of an enters-with clause. Every conjunct must name `base_type` — a conjunct
+/// placing a different kind of counter is a separate placement this count
+/// cannot express, so the whole tail declines (fail closed).
+fn parse_enters_counter_for_each_suffix(
+    after_counter: &str,
+    base_type: &CounterType,
+) -> Option<EntersForEachTerms> {
     let (rest, _) = opt(tag::<_, _, OracleError<'_>>("s"))
         .parse(after_counter)
         .ok()?;
@@ -4972,14 +4998,71 @@ fn parse_enters_counter_for_each_suffix(after_counter: &str) -> Option<QuantityE
         .ok()?;
     if let Ok((rest, qty)) = parse_for_each_convoked_creature_clause(rest) {
         if rest.trim().is_empty() {
-            return Some(qty);
+            return Some(EntersForEachTerms {
+                first: qty,
+                extra: Vec::new(),
+            });
         }
     }
-    let clause = match nom_primitives::split_once_on(rest, ".") {
+    let (first, extra) = parse_enters_for_each_conjuncts(rest, base_type)?;
+    Some(EntersForEachTerms { first, extra })
+}
+
+/// Split a "for each" clause list at its first
+/// "and <N> <kind> counter[s] on <pronoun> for each " conjunct and parse each
+/// clause, recursing over the remaining conjuncts. Returns the first clause's
+/// count and the further conjuncts' counts (each scaled by its own N).
+fn parse_enters_for_each_conjuncts(
+    text: &str,
+    base_type: &CounterType,
+) -> Option<(QuantityExpr, Vec<QuantityExpr>)> {
+    let Some((before, (count, kind), after)) =
+        nom_primitives::scan_preceded(text, parse_enters_counter_conjunct)
+    else {
+        return Some((parse_enters_for_each_clause(text)?, Vec::new()));
+    };
+    if &kind != base_type {
+        return None;
+    }
+    let first = parse_enters_for_each_clause(before)?;
+    let (next, mut extra) = parse_enters_for_each_conjuncts(after, base_type)?;
+    extra.insert(
+        0,
+        multiply_counter_count_by_for_each(QuantityExpr::Fixed { value: count }, next),
+    );
+    Some((first, extra))
+}
+
+/// "and <N> <kind> counter[s] on <pronoun> for each " — the head of a further
+/// per-each conjunct. Yields the conjunct's count and counter kind.
+fn parse_enters_counter_conjunct(input: &str) -> OracleResult<'_, (i32, CounterType)> {
+    let (rest, _) = tag("and ").parse(input)?;
+    let (rest, count) = alt((
+        value(1, alt((tag("a "), tag("an ")))),
+        map_opt(terminated(nom_primitives::parse_number, tag(" ")), |n| {
+            i32::try_from(n).ok()
+        }),
+    ))
+    .parse(rest)?;
+    let (rest, kind) = nom_primitives::parse_counter_type_typed(rest)?;
+    let (rest, _) = (
+        alt((tag(" counters"), tag(" counter"))),
+        tag(" on "),
+        nom_primitives::parse_object_recipient_pronoun,
+        tag(" for each "),
+    )
+        .parse(rest)?;
+    Ok((rest, (count, kind)))
+}
+
+/// One "for each <filter>" clause of an enters-with tail, with a sentence-final
+/// period trimmed.
+fn parse_enters_for_each_clause(text: &str) -> Option<QuantityExpr> {
+    let clause = match nom_primitives::split_once_on(text, ".") {
         Ok((_, (before_period, after_period))) if after_period.trim().is_empty() => {
             before_period.trim()
         }
-        _ => rest.trim(),
+        _ => text.trim(),
     };
     super::oracle_quantity::parse_for_each_clause_expr(clause)
 }
@@ -5048,7 +5131,13 @@ fn parse_enters_base_plus_additional_for_each(
     // Delegate the " counter[s] on it/them for each <filter>" tail to the
     // existing suffix parser — it consumes the plural "s" and the connective,
     // then parses the for-each filter into the per-each dynamic count.
-    let per_each = parse_enters_counter_for_each_suffix(after_additional_counter)?;
+    let per_each =
+        parse_enters_counter_for_each_suffix(after_additional_counter, &additional_type)?;
+    // A further conjunct would place counters this offset form cannot express.
+    if !per_each.extra.is_empty() {
+        return None;
+    }
+    let per_each = per_each.first;
 
     let inner = if multiplier == 1 {
         per_each
@@ -14631,6 +14720,71 @@ mod tests {
             mismatched, None,
             "a mismatched additional counter type must not compose"
         );
+    }
+
+    /// CR 614.1c + CR 122.1: Ulasht, the Hate Seed — two conjoined "for each"
+    /// placements of the same counter kind sum; a creature that is both red and
+    /// green is counted by both conjuncts (Ulasht ruling).
+    #[test]
+    fn enters_with_conjoined_for_each_counters_sum() {
+        let def = parse_replacement_line(
+            "Ulasht enters with a +1/+1 counter on it for each other red creature you control \
+             and a +1/+1 counter on it for each other green creature you control.",
+            "Ulasht, the Hate Seed",
+        )
+        .expect("conjoined per-each enters-with must parse");
+        let Effect::PutCounter {
+            counter_type,
+            count,
+            target,
+        } = &*def.execute.as_deref().unwrap().effect
+        else {
+            panic!("expected PutCounter");
+        };
+        assert_eq!(counter_type, &CounterType::Plus1Plus1);
+        assert_eq!(target, &TargetFilter::SelfRef);
+        let red = crate::parser::oracle_quantity::parse_for_each_clause_expr(
+            "other red creature you control",
+        )
+        .expect("red clause parses");
+        let green = crate::parser::oracle_quantity::parse_for_each_clause_expr(
+            "other green creature you control",
+        )
+        .expect("green clause parses");
+        assert!(matches!(
+            red,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { .. }
+            }
+        ));
+        assert_eq!(
+            count,
+            &QuantityExpr::Sum {
+                exprs: vec![red, green],
+            }
+        );
+    }
+
+    /// A conjunct placing a different counter kind is a separate placement the
+    /// count cannot express: the tail declines and the base count stays.
+    #[test]
+    fn enters_with_mixed_kind_conjunct_declines_the_for_each_tail() {
+        let def = parse_replacement_line(
+            "This creature enters with a +1/+1 counter on it for each other red creature you \
+             control and a -1/-1 counter on it for each other green creature you control.",
+            "Mixed Hellion",
+        )
+        .expect("enters-with still parses to a replacement");
+        let Effect::PutCounter {
+            counter_type,
+            count,
+            ..
+        } = &*def.execute.as_deref().unwrap().effect
+        else {
+            panic!("expected PutCounter");
+        };
+        assert_eq!(counter_type, &CounterType::Plus1Plus1);
+        assert_eq!(count, &QuantityExpr::Fixed { value: 1 });
     }
 
     /// Reach-guard: a pure per-each enters-with (Aeve — no "plus an additional")

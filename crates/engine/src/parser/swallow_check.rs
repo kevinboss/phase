@@ -6300,24 +6300,154 @@ If you sang a song the whole time you were searching and shuffling, you may unta
     /// `DynamicQty` reports the rejected operand.
     #[test]
     fn dynamic_qty_swallow_carries_the_rejected_operand() {
-        // Chong and Lily, Nomads (second mode, standalone). The operand
-        // is spanned by the marker's own `OperandSpan` and bounded by its own
-        // `end_bounds`; a hand-rolled split would produce a different string.
+        // Phyresis Outbreak. The operand is spanned by the marker's own
+        // `OperandSpan` and bounded by its own `end_bounds`; a hand-rolled split
+        // would produce a different string.
         let parsed = parse_named(
-            "Whenever one or more Bards you control attack, creatures you control get \
-             +1/+0 until end of turn for each lore counter among Sagas you control.",
-            "Chong and Lily, Nomads",
-            &["Creature"],
+            "Each opponent gets a poison counter. Then each creature your opponents control \
+             gets -1/-1 until end of turn for each poison counter its controller has.",
+            "Phyresis Outbreak",
+            &["Sorcery"],
         );
         let warning = only_swallow(&parsed, "DynamicQty");
 
         assert_eq!(
             warning.gap(),
             Some(&ClauseGap::Quantity {
-                operand: "lore counter among sagas you control".to_string()
+                operand: "poison counter its controller has".to_string()
             }),
             "full warning: {warning:?}"
         );
+    }
+
+    /// Chong and Lily, Nomads (second mode, standalone): the counter census
+    /// over Sagas parses, so the line carries no `DynamicQty` swallow.
+    #[test]
+    fn dynamic_qty_counter_census_operand_is_represented() {
+        let parsed = parse_named(
+            "Whenever one or more Bards you control attack, creatures you control get \
+             +1/+0 until end of turn for each lore counter among Sagas you control.",
+            "Chong and Lily, Nomads",
+            &["Creature"],
+        );
+        // Reach guard: the line parsed without an unimplemented effect, so the
+        // swallow audit ran.
+        assert_eq!(parsed.triggers.len(), 1, "{parsed:#?}");
+        assert!(!any_ability_has_unimplemented(&parsed), "{parsed:#?}");
+        assert!(
+            !has_swallowed_detector(&parsed, "DynamicQty"),
+            "{:?}",
+            parsed.parse_warnings
+        );
+    }
+
+    /// The enters-with replacement's Ulasht line, with the per-each conjunct
+    /// count read off its `PutCounter`.
+    fn enters_with_count(parsed: &crate::parser::oracle::ParsedAbilities) -> QuantityExpr {
+        let execute = parsed.replacements[0]
+            .execute
+            .as_deref()
+            .expect("enters-with execute");
+        match execute.effect.as_ref() {
+            Effect::PutCounter { count, .. } => count.clone(),
+            other => panic!("expected PutCounter, got {other:?}"),
+        }
+    }
+
+    /// SW1. CR 614.1c: a mixed-kind conjunct declines the whole per-each tail,
+    /// so the line surfaces as a `DynamicQty` swallow rather than reporting the
+    /// base single counter as supported.
+    #[test]
+    fn enters_with_mixed_kind_for_each_conjunct_is_a_swallow() {
+        // Reach guard: the same-kind conjunct (Ulasht, verbatim) is represented.
+        let ulasht = parse_named(
+            "Ulasht enters with a +1/+1 counter on it for each other red creature you control \
+             and a +1/+1 counter on it for each other green creature you control.\n\
+             {1}, Remove a +1/+1 counter from Ulasht: Choose one —\n\
+             • Ulasht deals 1 damage to target creature.\n\
+             • Create a 1/1 green Saproling creature token.",
+            "Ulasht, the Hate Seed",
+            &["Creature"],
+        );
+        assert!(matches!(
+            enters_with_count(&ulasht),
+            QuantityExpr::Sum { .. }
+        ));
+        assert!(
+            !has_swallowed_detector(&ulasht, "DynamicQty"),
+            "{:?}",
+            ulasht.parse_warnings
+        );
+
+        let mixed = parse_named(
+            "This creature enters with a +1/+1 counter on it for each other red creature you \
+             control and a -1/-1 counter on it for each other green creature you control.",
+            "Mixed Hellion",
+            &["Creature"],
+        );
+        assert!(
+            has_swallowed_detector(&mixed, "DynamicQty"),
+            "{:?}",
+            mixed.parse_warnings
+        );
+    }
+
+    /// SW2a. An enters-with per-each clause whose operand has no quantity reading
+    /// (a cost-paid object's counters) is surfaced, not silently counted as one.
+    #[test]
+    fn enters_with_unparsed_for_each_operand_is_a_swallow() {
+        // Reach guard: a parseable per-each operand is a bare Ref with no swallow.
+        let parseable = parse_named(
+            "This creature enters with a +1/+1 counter on it for each other green creature \
+             you control.",
+            "Green Hellion",
+            &["Creature"],
+        );
+        assert!(matches!(
+            enters_with_count(&parseable),
+            QuantityExpr::Ref { .. }
+        ));
+        assert!(!has_swallowed_detector(&parseable, "DynamicQty"));
+
+        let unparsed = parse_named(
+            "This creature enters with a +1/+1 counter on it for each +1/+1 counter on the \
+             sacrificed creature.",
+            "Sacrifice Hellion",
+            &["Creature"],
+        );
+        assert!(
+            has_swallowed_detector(&unparsed, "DynamicQty"),
+            "{:?}",
+            unparsed.parse_warnings
+        );
+    }
+
+    /// SW2b. An activated self cost rider whose operand has no quantity reading
+    /// installs no discount and is surfaced.
+    #[test]
+    fn activated_cost_rider_with_unparsed_operand_is_a_swallow() {
+        // Reach guard: Deepwood Denizen (verbatim) installs its discount.
+        let deepwood = parse_named(
+            "{5}{G}, {T}: Draw a card. This ability costs {1} less to activate for each +1/+1 \
+             counter on creatures you control.",
+            "Deepwood Denizen",
+            &["Creature"],
+        );
+        assert!(
+            deepwood.abilities[0].cost_reduction.is_some(),
+            "{deepwood:#?}"
+        );
+
+        let unparsed = parse_named(
+            "{5}{G}, {T}: Draw a card. This ability costs {1} less to activate for each +1/+1 \
+             counter on the sacrificed creature.",
+            "Sacrifice Denizen",
+            &["Creature"],
+        );
+        assert!(unparsed.abilities[0].cost_reduction.is_none());
+        // The rider sentence has no cost-reduction reading, so it falls to an
+        // unimplemented effect: the line stays honestly unsupported.
+        assert!(any_ability_has_unimplemented(&unparsed), "{unparsed:#?}");
     }
 
     /// `Replacement_Instead` reports the ANTECEDENT, connector-stripped and

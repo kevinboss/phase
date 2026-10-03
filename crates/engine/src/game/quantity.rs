@@ -1745,7 +1745,12 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::AttackedThisTurn {
                 filter: Some(filter),
                 ..
-            } => filter_uses_recipient(filter),
+            }
+            // CR 613.4c + CR 611.3a: a counter census whose population is
+            // recipient-relative ('other creatures' under an Aura, 'it' under a
+            // grant) varies per affected object.
+            | QuantityRef::CountersOnObjects { filter, .. }
+            | QuantityRef::DistinctCounterKindsAmong { filter } => filter_uses_recipient(filter),
             QuantityRef::ObjectColorCount {
                 scope: ObjectScope::Recipient,
             }
@@ -1798,7 +1803,101 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::ObjectManaValue {
                 scope: ObjectScope::CostPaidObject,
             } => false,
-            _ => false,
+            // Filter-bearing history / aggregate refs: their 'other/another'
+            // contrasts with the ability source (Thunder Salvo, Wolverine);
+            // every printed per-recipient use is a self-static where recipient
+            // == source.
+            QuantityRef::PropertyAggregate(_)
+            | QuantityRef::BattlefieldEntriesThisTurn { .. }
+            | QuantityRef::SpellsCastThisTurn { .. }
+            | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
+            | QuantityRef::SpellsCastThisGame { .. }
+            | QuantityRef::DistinctColorsAmong { .. }
+            | QuantityRef::DamageDealtThisTurn { .. }
+            | QuantityRef::ControlledByEachPlayer { .. }
+            | QuantityRef::EnteredThisTurn { .. }
+            | QuantityRef::ZoneChangeCountThisTurn { .. }
+            | QuantityRef::ZoneChangeAggregateThisTurn { .. }
+            | QuantityRef::FilteredTrackedSetSize { .. }
+            | QuantityRef::CounterAddedThisTurn { .. }
+            | QuantityRef::ZoneCardCount { .. }
+            | QuantityRef::SacrificedThisTurn { .. }
+            | QuantityRef::TokensCreatedThisTurn { .. }
+            | QuantityRef::PlayerCount { .. }
+            | QuantityRef::EventContextPlayerCount { .. } => false,
+            // Scalar, player-scoped and resolution-bound refs, and the
+            // non-recipient scopes / sources of the variants classified above:
+            // none reads the affected object.
+            QuantityRef::HandSize { .. }
+            | QuantityRef::LifeTotal { .. }
+            | QuantityRef::LifeLostThisTurn { .. }
+            | QuantityRef::LifeGainedThisTurn { .. }
+            | QuantityRef::CardsDrawnThisTurn { .. }
+            | QuantityRef::CardsDiscardedThisTurn { .. }
+            | QuantityRef::PlayerActionsThisTurn { .. }
+            | QuantityRef::PartySize { .. }
+            | QuantityRef::DistinctCardTypes { .. }
+            | QuantityRef::SharedCardTypes { .. }
+            | QuantityRef::DistinctSubtypes { .. }
+            | QuantityRef::ManaSpentToCast { .. }
+            | QuantityRef::AttackedThisTurn { .. }
+            | QuantityRef::ObjectColorCount { .. }
+            | QuantityRef::ObjectNameWordCount { .. }
+            | QuantityRef::NameStickerLetterCount { .. }
+            | QuantityRef::ObjectTypelineComponentCount { .. }
+            | QuantityRef::Power { .. }
+            | QuantityRef::BasePower { .. }
+            | QuantityRef::Toughness { .. }
+            | QuantityRef::ObjectManaValue { .. }
+            | QuantityRef::ManaSymbolsInManaCost { .. }
+            | QuantityRef::CountersOn { .. }
+            | QuantityRef::UnspentMana { .. }
+            | QuantityRef::GraveyardSize { .. }
+            | QuantityRef::LifeAboveStarting
+            | QuantityRef::StartingLifeTotal { .. }
+            | QuantityRef::TriggeringDiscoverValue
+            | QuantityRef::TriggeringScryLookCount
+            | QuantityRef::TriggeringScryBottomCount
+            | QuantityRef::PlayerCounter { .. }
+            | QuantityRef::TargetControllerCounter { .. }
+            | QuantityRef::Variable { .. }
+            | QuantityRef::Intensity { .. }
+            | QuantityRef::TargetObjectManaValue { .. }
+            | QuantityRef::SelfManaValue
+            | QuantityRef::TargetZoneCardCount { .. }
+            | QuantityRef::Devotion { .. }
+            | QuantityRef::CardsExiledBySource
+            | QuantityRef::ExiledCardPower { .. }
+            | QuantityRef::BasicLandTypeCount { .. }
+            | QuantityRef::TrackedSetSize
+            | QuantityRef::ExiledFromHandThisResolution
+            | QuantityRef::PreviousEffectAmount { .. }
+            | QuantityRef::PreviousEffectCount
+            | QuantityRef::Speed { .. }
+            | QuantityRef::EventContextAmount
+            | QuantityRef::AttachmentsOnLeavingObject { .. }
+            | QuantityRef::EventContextSourceCostX
+            | QuantityRef::EventContextSourceModesChosen
+            | QuantityRef::CrimesCommittedThisTurn
+            | QuantityRef::BendTypesThisTurn
+            | QuantityRef::LandsPlayedThisTurn { .. }
+            | QuantityRef::TurnsTaken
+            | QuantityRef::ChosenNumber
+            | QuantityRef::PlayerChosenNumber { .. }
+            | QuantityRef::DescendedThisTurn
+            | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
+            | QuantityRef::SpellsCastLastTurn
+            | QuantityRef::DungeonsCompleted
+            | QuantityRef::CostXPaid
+            | QuantityRef::KickerCount
+            | QuantityRef::AdditionalCostPaymentCount
+            | QuantityRef::AdditionalCostPaymentCountFor { .. }
+            | QuantityRef::ConvokedCreatureCount
+            | QuantityRef::TimesCostPaidThisResolution
+            | QuantityRef::ColorsInCommandersColorIdentity
+            | QuantityRef::VoteCount { .. }
+            | QuantityRef::CommanderManaValue { .. }
+            | QuantityRef::CommanderCastFromCommandZoneCount => false,
         },
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
