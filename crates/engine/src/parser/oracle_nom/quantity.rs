@@ -21,6 +21,7 @@ use super::primitives::{
     parse_number,
 };
 use super::target::parse_type_filter_word;
+use crate::parser::oracle_ir::ast::AnaphorNumber;
 use crate::parser::oracle_target::{
     parse_counter_suffix, parse_shared_quality, parse_shared_quality_clause,
     parse_target_with_syntax, parse_type_phrase_folding, parse_type_phrase_folding_with_ctx,
@@ -59,11 +60,17 @@ pub fn parse_quantity_ref_complete(input: &str) -> OracleResult<'_, QuantityRef>
     all_consuming(parse_quantity_ref).parse(input)
 }
 
+/// The context-free complete entry. A caller reaching it has no clause context,
+/// so it cannot tell which object a pronoun names.
 pub fn parse_for_each_clause_ref_complete(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, mut qty) = parse_for_each_clause_ref_complete_deferred(input)?;
-    // CR 608.2k: a caller reaching this entry has no antecedent for a deferred
-    // pronoun, so an unbound counter anaphor names the ability's own object —
-    // what `Source` meant before the scope started carrying provenance.
+    let input = input.trim().trim_end_matches('.');
+    let (rest, mut qty) = all_consuming(parse_for_each_clause_ref).parse(input)?;
+    // CR 608.2k: a deferred counter-COUNT anaphor keeps its established settled
+    // reading here — the ability's own object, what `Source` meant before the
+    // scope started carrying provenance. The counter-KIND census of a pronoun
+    // ("kind of counter on it") has no such reading: `parse_for_each_clause_ref`
+    // declines it, so this entry does too (a parser-scope decision — without a
+    // context there is no antecedent to bind it to).
     settle_deferred_counter_anaphor_ref(&mut qty);
     Ok((rest, qty))
 }
@@ -71,9 +78,24 @@ pub fn parse_for_each_clause_ref_complete(input: &str) -> OracleResult<'_, Quant
 /// CR 611.3a: The provenance-preserving entry. Only `oracle_static` may use it:
 /// its lowering knows the affected set, so it can bind "it" to each recipient
 /// (per-recipient anthem) or to the source (self-referential subject).
+///
+/// The counter-kind census of a pronoun ("kind of counter on it/them") is
+/// accepted here only, as `DistinctCounterKindsAmong { filter: SelfRef }` — a
+/// placeholder the static binder (`bind_counter_anaphor_to_recipient`) keeps for
+/// a self-scoped static and rebinds to each affected object for a per-recipient
+/// one. Both pronoun numbers are accepted: a per-recipient static's "them"
+/// names each affected object in turn.
 pub fn parse_for_each_clause_ref_complete_deferred(input: &str) -> OracleResult<'_, QuantityRef> {
     let input = input.trim().trim_end_matches('.');
-    all_consuming(parse_for_each_clause_ref).parse(input)
+    all_consuming(alt((
+        map(parse_counter_kinds_on_object_pronoun, |_| {
+            QuantityRef::DistinctCounterKindsAmong {
+                filter: TargetFilter::SelfRef,
+            }
+        }),
+        parse_for_each_clause_ref,
+    )))
+    .parse(input)
 }
 
 /// CR 608.2k: Collapse an unbound deferred counter anaphor back to `Source`.
@@ -2303,33 +2325,32 @@ fn parse_bare_mana_values_among_tail(input: &str) -> OracleResult<'_, QuantityRe
     ))
 }
 
+/// CR 122.1: The shared head of a counter-kind census — "kind of counter on " /
+/// "kind of counter among ". Both surface forms are accepted.
+fn parse_counter_kinds_head(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        pair(tag("kind of counter "), alt((tag("on "), tag("among ")))),
+    )
+    .parse(input)
+}
+
 /// CR 122.1: Parse the iteration source "kind of counter on/among <filter>" →
 /// `QuantityRef::DistinctCounterKindsAmong { filter }`. Counter-side analogue of
 /// `parse_distinct_colors_among_tail`. Used by Bribe
 /// Taker's "for each kind of counter on permanents you control" — the filter is
 /// any controlled-permanent type phrase, so the combinator covers the whole
-/// class, not one card. Both "on" and "among" surface forms are accepted. A bare
-/// object pronoun ("kind of counter on it") names the ability's own object
-/// (`SelfRef`), read live or from last known information at resolution.
+/// class, not one card.
+///
+/// CR 608.2k: a bare object pronoun ("kind of counter on it") is declined here.
+/// Which object it names depends on the clause context (the trigger subject, an
+/// earlier object reference), which this context-free combinator cannot see; the
+/// context-carrying entries recognize it through
+/// [`parse_counter_kinds_on_object_pronoun`] and bind the antecedent themselves.
 fn parse_for_each_distinct_counter_kinds_among(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = tag("kind of counter ").parse(input)?;
-    let (rest, _) = alt((tag("on "), tag("among "))).parse(rest)?;
-    // CR 122.1 + CR 608.2k: with no antecedent in the clause, the pronoun names
-    // the object the trigger condition referred to — the ability's own object
-    // ("Whenever this creature deals combat damage to a player, draw a card for
-    // each kind of counter on it", Blitzball Stadium's granted trigger). Same
-    // settled reading as the counter-count sibling
-    // (`settle_deferred_counter_anaphor_ref` → `ObjectScope::Source`); the
-    // resolver reads it through the same live-or-LKI source authority
-    // (CR 608.2h), so a departed source still reports its kinds.
-    if let Ok((after_pronoun, _)) = parse_deferred_counter_pronoun(rest) {
-        return Ok((
-            after_pronoun,
-            QuantityRef::DistinctCounterKindsAmong {
-                filter: TargetFilter::SelfRef,
-            },
-        ));
-    }
+    let (rest, _) = parse_counter_kinds_head(input)?;
+    // The type-phrase fallback below must not reinterpret the pronoun.
+    let (rest, _) = not(super::primitives::parse_object_recipient_pronoun).parse(rest)?;
     let (filter, remainder) = parse_type_phrase_folding(rest);
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -2338,6 +2359,22 @@ fn parse_for_each_distinct_counter_kinds_among(input: &str) -> OracleResult<'_, 
         )));
     }
     Ok(("", QuantityRef::DistinctCounterKindsAmong { filter }))
+}
+
+/// CR 122.1 + CR 608.2k: Recognize the counter-kind census of a bare object
+/// pronoun — "kind of counter on/among it/them/him/her" — and report the
+/// pronoun's grammatical number. The pronoun's referent is NOT decided here: the
+/// caller binds it from its own clause context (an effect's antecedent via
+/// `resolve_it_pronoun`, a static's affected set via its lowering) and declines
+/// when it has none.
+pub(crate) fn parse_counter_kinds_on_object_pronoun(
+    input: &str,
+) -> OracleResult<'_, AnaphorNumber> {
+    preceded(
+        parse_counter_kinds_head,
+        super::primitives::parse_object_recipient_pronoun_number,
+    )
+    .parse(input)
 }
 
 /// CR 201.2 + CR 603.4: Parse "differently named <type-phrase>" after
@@ -14197,20 +14234,65 @@ mod tests {
         }
     }
 
+    /// CR 608.2k: the counter-kind census of a pronoun has no context-free
+    /// reading — which object "it" names is the clause context's to decide —
+    /// so the context-free entry declines it, while the static-only deferred
+    /// entry keeps the `SelfRef` placeholder its binder resolves (both pronoun
+    /// numbers). The explicit self-reference keeps the type-phrase path, which
+    /// declines "~".
     #[test]
-    fn for_each_kind_of_counter_on_a_pronoun_names_the_object_itself() {
-        assert_eq!(
-            parse_for_each_clause_ref_complete("kind of counter on it"),
-            Ok((
-                "",
-                QuantityRef::DistinctCounterKindsAmong {
-                    filter: TargetFilter::SelfRef,
-                }
-            ))
-        );
-        // The explicit self-reference keeps the type-phrase path, which declines
-        // it — the pronoun arm does not widen to "~".
+    fn for_each_kind_of_counter_on_a_pronoun_is_bound_only_by_a_context() {
+        // Reach guard: the non-pronoun census still parses on the same entry.
+        assert!(matches!(
+            parse_for_each_clause_ref_complete("kind of counter on permanents you control"),
+            Ok(("", QuantityRef::DistinctCounterKindsAmong { .. }))
+        ));
+        for text in ["kind of counter on it", "kind of counter among them"] {
+            assert!(
+                parse_for_each_clause_ref_complete(text).is_err(),
+                "{text:?}: no context-free antecedent"
+            );
+            assert!(
+                parse_for_each_clause_ref(text).is_err(),
+                "{text:?}: the type-phrase fallback must not reinterpret the pronoun"
+            );
+            assert_eq!(
+                parse_for_each_clause_ref_complete_deferred(text),
+                Ok((
+                    "",
+                    QuantityRef::DistinctCounterKindsAmong {
+                        filter: TargetFilter::SelfRef,
+                    }
+                )),
+                "{text:?}: the static binder's placeholder"
+            );
+        }
         assert!(parse_for_each_clause_ref_complete("kind of counter on ~").is_err());
+        assert!(parse_for_each_clause_ref_complete_deferred("kind of counter on ~").is_err());
+    }
+
+    /// CR 608.2k: the pronoun census reports the pronoun's number and leaves
+    /// the referent to the caller; a longer word is not a pronoun.
+    #[test]
+    fn counter_kinds_on_object_pronoun_reports_the_pronoun_number() {
+        for (text, number) in [
+            ("kind of counter on it", AnaphorNumber::Singular),
+            ("kind of counter on him", AnaphorNumber::Singular),
+            ("kind of counter on her", AnaphorNumber::Singular),
+            ("kind of counter on them", AnaphorNumber::Plural),
+            ("kind of counter among them", AnaphorNumber::Plural),
+        ] {
+            assert_eq!(
+                parse_counter_kinds_on_object_pronoun(text),
+                Ok(("", number)),
+                "{text:?}"
+            );
+        }
+        assert!(parse_counter_kinds_on_object_pronoun("kind of counter on items").is_err());
+        assert!(
+            parse_counter_kinds_on_object_pronoun("kind of counter on permanents you control")
+                .is_err()
+        );
     }
 
     #[test]

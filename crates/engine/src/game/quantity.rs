@@ -7253,14 +7253,25 @@ pub(crate) fn distinct_counter_kinds_among(
     filter: &TargetFilter,
     filter_ctx: &FilterContext<'_>,
 ) -> Vec<CounterType> {
-    // CR 122.1 + CR 608.2h + CR 608.2k: the ability's own object (the
-    // trigger-condition object a bare "kind of counter on it" names, or the
-    // object choosing a kind of counter it doesn't have) is read
-    // through the same live-or-last-known authority as its counter count
-    // (`QuantityRef::CountersOn { scope: Source }`), so a source that has left
-    // the battlefield ("When this creature dies, …") still reports the kinds it
-    // had rather than dropping out of a battlefield scan.
-    if matches!(filter, TargetFilter::SelfRef) {
+    // CR 122.1 + CR 608.2k: a single named object — the object a bare "kind of
+    // counter on it" names (bound by the parser to the clause's antecedent), or
+    // the object choosing a kind of counter it doesn't have — is read through
+    // the same per-object counter authority as its counter COUNT
+    // (`QuantityRef::CountersOn`, `read_counters_on_scope`), so the census and
+    // the count always agree about which counter map the object contributes.
+    // CR 603.10a + CR 608.2h: an object that has left the battlefield ("When
+    // this creature dies, …", "Whenever another creature you control dies, …")
+    // still reports the kinds it had, from its departure record or last known
+    // information, rather than dropping out of a battlefield scan.
+    let single_object_scope = match filter {
+        TargetFilter::SelfRef => Some(ObjectScope::Source),
+        // CR 603.2: the object the trigger event names / the object receiving
+        // it — the same scopes the counter count reads for these antecedents.
+        TargetFilter::TriggeringSource => Some(ObjectScope::EventSource),
+        TargetFilter::EventTarget => Some(ObjectScope::EventTarget),
+        _ => None,
+    };
+    if let Some(scope) = single_object_scope {
         let ctx = QuantityContext {
             entering: None,
             source: filter_ctx.source_id,
@@ -7271,11 +7282,15 @@ pub(crate) fn distinct_counter_kinds_among(
             spell: None,
             event_amount: None,
         };
-        let kinds = read_counters_on_live_or_lki_scope(
+        let targets = filter_ctx
+            .ability
+            .map_or(&[][..], |ability| ability.targets.as_slice());
+        let kinds = read_counters_on_scope(
             state,
-            ObjectScope::Source,
+            scope,
             ctx,
-            &[],
+            targets,
+            filter_ctx.ability,
             positive_counter_types,
         )
         .unwrap_or_default();
@@ -7616,30 +7631,13 @@ fn counter_total_from_map(counters: &HashMap<CounterType, u32>) -> i32 {
     i32::try_from(crate::types::counter::counter_total(counters)).unwrap_or(i32::MAX)
 }
 
-/// Resolve an ordinary object scope through its live object or its LKI snapshot.
+/// Read the counters on the object an ordinary scope names through its live
+/// object or its LKI snapshot. `None` when the scope names no object.
 ///
 /// CR 122.2 + CR 400.7 + CR 603.10a: When a source has changed zones, its
 /// live counter map has been cleared, so its departure snapshot provides the
 /// pre-exit values. A live battlefield object remains authoritative over a
 /// stale ObjectId-keyed cache entry from an earlier incarnation.
-fn resolve_counters_on_live_or_lki_scope(
-    state: &GameState,
-    scope: ObjectScope,
-    ctx: QuantityContext,
-    targets: &[TargetRef],
-    counter_type: Option<&CounterType>,
-) -> i32 {
-    read_counters_on_live_or_lki_scope(state, scope, ctx, targets, |counters| {
-        counter_count_from_map(counters, counter_type)
-    })
-    .unwrap_or(0)
-}
-
-/// Read the counters on the object an ordinary scope names — the single
-/// authority behind both the counter COUNT (`QuantityRef::CountersOn`) and the
-/// counter-KIND census of the ability's own object
-/// (`QuantityRef::DistinctCounterKindsAmong { filter: SelfRef }`). `None` when
-/// the scope names no object.
 fn read_counters_on_live_or_lki_scope<T>(
     state: &GameState,
     scope: ObjectScope,
@@ -7672,6 +7670,9 @@ fn read_counters_on_live_or_lki_scope<T>(
     live.map(|obj| read(&obj.counters))
 }
 
+/// CR 122.1: The counter COUNT on the object `scope` names
+/// (`QuantityRef::CountersOn`); `counter_type = None` sums every kind. Zero when
+/// the scope names no object.
 fn resolve_counters_on_scope(
     state: &GameState,
     scope: ObjectScope,
@@ -7680,6 +7681,29 @@ fn resolve_counters_on_scope(
     ability: Option<&ResolvedAbility>,
     counter_type: Option<&CounterType>,
 ) -> i32 {
+    read_counters_on_scope(state, scope, ctx, targets, ability, |counters| {
+        counter_count_from_map(counters, counter_type)
+    })
+    .unwrap_or(0)
+}
+
+/// CR 122.1: The single authority for reading ONE object's counters, by the
+/// scope that names it — behind both the counter COUNT
+/// (`QuantityRef::CountersOn`, via [`resolve_counters_on_scope`]) and the
+/// counter-KIND census of a single named object
+/// (`QuantityRef::DistinctCounterKindsAmong`, via
+/// [`distinct_counter_kinds_among`]), so the two can never disagree about which
+/// counter map — live, departure record, or last known information — an object
+/// contributes. `read` sees that map; `None` when the scope names no object (or
+/// names it only through a malformed departure record).
+fn read_counters_on_scope<T>(
+    state: &GameState,
+    scope: ObjectScope,
+    ctx: QuantityContext,
+    targets: &[TargetRef],
+    ability: Option<&ResolvedAbility>,
+    read: impl FnOnce(&HashMap<CounterType, u32>) -> T,
+) -> Option<T> {
     match scope {
         // CR 400.7 + CR 603.10a: On a battlefield departure, EventSource is
         // the event's prior incarnation, not a same-id object that has since
@@ -7692,16 +7716,15 @@ fn resolve_counters_on_scope(
                 .unwrap_or(BattlefieldDepartureCounterContext::NotBattlefieldDeparture)
             {
                 BattlefieldDepartureCounterContext::Present { context } => {
-                    counter_count_from_map(&context.lki.counters, counter_type)
+                    Some(read(&context.lki.counters))
                 }
                 BattlefieldDepartureCounterContext::Absent { object_id } => state
                     .lki_cache
                     .get(&object_id)
-                    .map(|lki| counter_count_from_map(&lki.counters, counter_type))
-                    .unwrap_or(0),
-                BattlefieldDepartureCounterContext::Malformed => 0,
+                    .map(|lki| read(&lki.counters)),
+                BattlefieldDepartureCounterContext::Malformed => None,
                 BattlefieldDepartureCounterContext::NotBattlefieldDeparture => {
-                    resolve_counters_on_live_or_lki_scope(state, scope, ctx, targets, counter_type)
+                    read_counters_on_live_or_lki_scope(state, scope, ctx, targets, read)
                 }
             }
         }
@@ -7712,12 +7735,11 @@ fn resolve_counters_on_scope(
         // `Source`/`Anaphoric` live-with-LKI shape; `object_id_for_scope`
         // reads `ctx.damage_source`).
         | ObjectScope::BatchSource => {
-            resolve_counters_on_live_or_lki_scope(state, scope, ctx, targets, counter_type)
+            read_counters_on_live_or_lki_scope(state, scope, ctx, targets, read)
         }
         ObjectScope::CostPaidObject => ability
             .and_then(|ability| ability.cost_paid_object.as_ref())
-            .map(|snapshot| counter_count_from_map(&snapshot.lki.counters, counter_type))
-            .unwrap_or(0),
+            .map(|snapshot| read(&snapshot.lki.counters)),
         ObjectScope::AmassedArmy => ability
             .and_then(|ability| ability.amassed_army_object.as_ref())
             .map(|snapshot| {
@@ -7725,32 +7747,27 @@ fn resolve_counters_on_scope(
                 // an Army that changed zones and returned is a new object. The
                 // LKI fallbacks below are deliberately ungated (CR 608.2h: they
                 // report the departed Army's recorded counters).
-                let live = snapshot
+                let live_on_battlefield = snapshot
                     .live_object_id(state)
-                    .and_then(|id| state.objects.get(&id));
-                let on_battlefield =
-                    live.is_some_and(|obj| obj.zone == crate::types::zones::Zone::Battlefield);
-                if on_battlefield {
-                    return live
-                        .map(|obj| counter_count_from_map(&obj.counters, counter_type))
-                        .unwrap_or(0);
-                }
-                // CR 608.2h + CR 400.7: departure-time counters for THIS
-                // incarnation. The id-keyed `state.lki_cache` is overwritten on
-                // every departure, so it would report a later incarnation's
-                // counters once the referent has departed again; qualify by the
-                // captured incarnation and fall back to the binding-time
-                // snapshot only when no versioned record exists.
-                state
-                    .lki_by_incarnation
-                    .get(&snapshot.object_id)
-                    .and_then(|history| history.get(&snapshot.incarnation))
-                    .map(|lki| counter_count_from_map(&lki.counters, counter_type))
-                    .unwrap_or_else(|| {
-                        counter_count_from_map(&snapshot.lki.counters, counter_type)
-                    })
-            })
-            .unwrap_or(0),
+                    .and_then(|id| state.objects.get(&id))
+                    .filter(|obj| obj.zone == crate::types::zones::Zone::Battlefield);
+                let counters = match live_on_battlefield {
+                    Some(obj) => &obj.counters,
+                    // CR 608.2h + CR 400.7: departure-time counters for THIS
+                    // incarnation. The id-keyed `state.lki_cache` is overwritten
+                    // on every departure, so it would report a later
+                    // incarnation's counters once the referent has departed
+                    // again; qualify by the captured incarnation and fall back
+                    // to the binding-time snapshot only when no versioned record
+                    // exists.
+                    None => state
+                        .lki_by_incarnation
+                        .get(&snapshot.object_id)
+                        .and_then(|history| history.get(&snapshot.incarnation))
+                        .map_or(&snapshot.lki.counters, |lki| &lki.counters),
+                };
+                read(counters)
+            }),
         // CR 608.2c + CR 122.2 + CR 400.7 + CR 608.2h: "that <permanent>" /
         // "that many" back-reference to the chain-root spell's own target.
         // LIVE counters while that target is still on the battlefield (an
@@ -7775,21 +7792,17 @@ fn resolve_counters_on_scope(
                         _ => None,
                     })
             })
-            .map(|id| {
+            .and_then(|id| {
                 let live = state.objects.get(&id);
                 let on_battlefield = live.is_some_and(|obj| obj.zone == Zone::Battlefield);
-                if !on_battlefield {
-                    if let Some(lki) = state.lki_cache.get(&id) {
-                        return counter_count_from_map(&lki.counters, counter_type);
-                    }
-                }
-                live.map(|obj| counter_count_from_map(&obj.counters, counter_type))
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0),
-        _ => object_for_scope(state, scope, ctx, targets)
-            .map(|obj| counter_count_from_map(&obj.counters, counter_type))
-            .unwrap_or(0),
+                let departed = (!on_battlefield)
+                    .then(|| state.lki_cache.get(&id).map(|lki| &lki.counters))
+                    .flatten();
+                departed
+                    .or_else(|| live.map(|obj| &obj.counters))
+                    .map(read)
+            }),
+        _ => object_for_scope(state, scope, ctx, targets).map(|obj| read(&obj.counters)),
     }
 }
 
@@ -11188,6 +11201,72 @@ mod tests {
         assert_eq!(
             distinct_counter_kinds_among(&state, &filter, &ctx),
             vec![CounterType::Lore, CounterType::Stun],
+        );
+    }
+
+    /// CR 122.1 + CR 603.2 + CR 608.2k: a census bound to the triggering
+    /// source counts the kinds on the object the trigger event names (the
+    /// damage dealer), read through the per-object counter authority — not the
+    /// listener's kinds, and not the event's recipient's. The recipient census
+    /// (`EventTarget`) reads the other side of the same event.
+    #[test]
+    fn distinct_counter_kinds_among_triggering_source_reads_the_event_source() {
+        let mut state = GameState::new_two_player(42);
+        let listener = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Listener".to_string(),
+            Zone::Battlefield,
+        );
+        let dealer = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Dealer".to_string(),
+            Zone::Battlefield,
+        );
+        let recipient = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Recipient".to_string(),
+            Zone::Battlefield,
+        );
+        for (id, kinds) in [
+            (
+                listener,
+                vec![CounterType::Lore, CounterType::Stun, CounterType::Loyalty],
+            ),
+            (dealer, vec![CounterType::Plus1Plus1, CounterType::Stun]),
+            (recipient, vec![CounterType::Lore]),
+        ] {
+            let counters = &mut state.objects.get_mut(&id).unwrap().counters;
+            for kind in kinds {
+                counters.insert(kind, 2);
+            }
+        }
+        state.current_trigger_event = Some(GameEvent::DamageDealt {
+            source_id: dealer,
+            target: TargetRef::Object(recipient),
+            amount: 1,
+            is_combat: true,
+            excess: 0,
+        });
+        let ctx = FilterContext::from_source_with_controller(listener, PlayerId(0));
+
+        assert_eq!(
+            distinct_counter_kinds_among(&state, &TargetFilter::TriggeringSource, &ctx),
+            vec![CounterType::Plus1Plus1, CounterType::Stun],
+        );
+        assert_eq!(
+            distinct_counter_kinds_among(&state, &TargetFilter::EventTarget, &ctx),
+            vec![CounterType::Lore],
+        );
+        assert_eq!(
+            distinct_counter_kinds_among(&state, &TargetFilter::SelfRef, &ctx).len(),
+            3,
+            "reach guard: the listener's own census is its three kinds",
         );
     }
 

@@ -1,8 +1,10 @@
 //! Counter-count quantities bound to a single named object (CR 122.1).
 //!
 //! "for each +1/+1 counter on the creature it targets" (the activation's chosen
-//! target), "for each kind of counter on it" (the object a granted trigger is
-//! on), "for each acquired taste counter on this artifact" (a multi-word counter
+//! target), "for each kind of counter on it" (the object the pronoun's
+//! antecedent names — the creature a granted trigger is on, the creature a
+//! listener's trigger condition refers to, or each creature a per-recipient
+//! static affects), "for each acquired taste counter on this artifact" (a multi-word counter
 //! name on the source), and an enters-with clause whose two "for each"
 //! conjuncts each place counters. Every printed card is staged from its verbatim
 //! Oracle text (MTGJSON `AtomicCards.json`); the synthetic class cards (no
@@ -264,6 +266,104 @@ fn dies_trigger_draws_per_kind_of_counter_the_creature_last_had() {
         library_before - runner.state().players[P0.0 as usize].library.len(),
         2,
         "one card per kind of counter it last had"
+    );
+}
+
+/// Synthetic class card: a listener whose trigger names ANOTHER object — the
+/// creature dealing the damage — so "it" is that creature, not the listener
+/// (no printed card yet).
+const COMBAT_DAMAGE_KIND_CENSUS: &str = "Whenever a creature you control deals combat damage to a player, draw a card for each kind of counter on it.";
+
+/// CR 122.1 + CR 603.2 + CR 608.2k: "it" names the creature the trigger
+/// condition referred to — the attacker that dealt the damage (charge + oil:
+/// two kinds) — not the listener, whose three kinds would draw three.
+#[test]
+fn combat_trigger_on_another_creature_counts_the_damage_dealers_counter_kinds() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let listener = scenario
+        .add_creature_from_oracle(P0, "Census Listener", 1, 1, COMBAT_DAMAGE_KIND_CENSUS)
+        .id();
+    for kind in ["slime", "time", "lore"] {
+        scenario.with_counter(listener, parse_counter_type(kind), 1);
+    }
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
+    scenario.with_counter(attacker, parse_counter_type("charge"), 1);
+    scenario.with_counter(attacker, parse_counter_type("oil"), 2);
+    seed_library(&mut scenario, P0);
+    seed_library(&mut scenario, P1);
+    let mut runner = scenario.build();
+    assert_eq!(
+        runner.state().objects[&listener].counters.len(),
+        3,
+        "reach guard: the listener carries three kinds of its own"
+    );
+
+    runner.pass_both_players();
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(attacker, AttackTarget::Player(P1))],
+            bands: vec![],
+        })
+        .expect("the attacker attacks; the listener stays home");
+    let outcome = runner.combat_damage();
+    assert_eq!(
+        outcome.life_delta(P1),
+        -2,
+        "reach guard: the 2/2 attacker connected"
+    );
+    outcome.assert_hand_drawn(P0, 2);
+}
+
+/// Synthetic class card: a listener whose dies trigger names ANOTHER creature
+/// (no printed card yet).
+const ANOTHER_DIES_KIND_CENSUS: &str =
+    "Whenever another creature you control dies, draw a card for each kind of counter on it.";
+
+/// CR 122.1 + CR 603.10a + CR 608.2h + CR 608.2k: "it" is the creature that
+/// died; its counters ceased to exist in the graveyard, so the census reads the
+/// kinds it had as it last existed on the battlefield (+1/+1 and oil: two) — not
+/// the listener's single kind.
+#[test]
+fn another_creature_dies_trigger_counts_its_last_known_counter_kinds() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let listener = scenario
+        .add_creature_from_oracle(P0, "Census Mourner", 1, 1, ANOTHER_DIES_KIND_CENSUS)
+        .id();
+    scenario.with_counter(listener, parse_counter_type("slime"), 1);
+    let victim = scenario.add_creature(P0, "Victim", 2, 2).id();
+    scenario.with_counter(victim, CounterType::Plus1Plus1, 1);
+    scenario.with_counter(victim, parse_counter_type("oil"), 2);
+    let destroy = scenario
+        .add_spell_to_hand_from_oracle(P0, "Execution", true, DESTROY_TARGET_CREATURE)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    seed_library(&mut scenario, P0);
+    let mut runner = scenario.build();
+    let library_before = runner.state().players[P0.0 as usize].library.len();
+
+    runner.cast(destroy).target_object(victim).resolve();
+    drive_to_empty_stack(&mut runner);
+
+    assert_eq!(
+        runner.state().objects[&victim].zone,
+        Zone::Graveyard,
+        "reach guard: the victim died"
+    );
+    assert!(
+        runner.state().objects[&victim].counters.is_empty(),
+        "reach guard: the live object no longer carries the counters (CR 122.2)"
+    );
+    assert_eq!(
+        runner.state().objects[&listener].zone,
+        Zone::Battlefield,
+        "reach guard: the listener survived to trigger"
+    );
+    assert_eq!(
+        library_before - runner.state().players[P0.0 as usize].library.len(),
+        2,
+        "one card per kind of counter the victim last had"
     );
 }
 

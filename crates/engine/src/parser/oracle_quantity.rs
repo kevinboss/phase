@@ -35,7 +35,8 @@ use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::quantity as nom_quantity;
 use super::oracle_nom::target as nom_target;
 use crate::parser::oracle_effect::counter::normalize_counter_type;
-use crate::parser::oracle_effect::parse_controls_permanent_object;
+use crate::parser::oracle_effect::{parse_controls_permanent_object, resolve_it_pronoun};
+use crate::parser::oracle_ir::ast::AnaphorNumber;
 use crate::parser::oracle_target::{
     parse_target, parse_type_phrase_folding, parse_type_phrase_folding_with_ctx,
 };
@@ -3237,10 +3238,24 @@ fn parse_filtered_tracked_set_this_way(clause: &str) -> Option<QuantityRef> {
     })
 }
 
+/// The context-free entry: a caller reaching it has no clause context, so it
+/// cannot tell which object a pronoun names.
 pub(crate) fn parse_for_each_clause(clause: &str) -> Option<QuantityRef> {
-    let mut qty = parse_for_each_clause_deferred(clause)?;
-    // CR 608.2k: settle a deferred counter anaphor for every caller that has no
-    // antecedent to bind it to. Only `oracle_static`'s lowering knows the
+    // The counter-kind census of a pronoun ("kind of counter on it") gets no
+    // reading here — its antecedent is the clause context's to decide, and this
+    // entry has none (a parser-scope decision). Declined up front: the nom
+    // grammar declines it, but the legacy `parse_quantity_ref` fallback would
+    // otherwise misread "kind of" as a counter name.
+    if counter_kinds_pronoun_number(clause).is_some() {
+        return None;
+    }
+    let mut qty = parse_for_each_clause_with_they_controller(
+        clause,
+        ControllerRef::ScopedPlayer,
+        &ParseContext::default(),
+    )?;
+    // CR 608.2k: settle a deferred counter-COUNT anaphor for every caller that
+    // has no antecedent to bind it to. Only `oracle_static`'s lowering knows the
     // affected set, so it takes the `_deferred` entry below; for everyone else
     // the pronoun names the ability's own object — exactly what `Source` meant
     // before the scope started carrying provenance, so the AST is unchanged.
@@ -3251,12 +3266,70 @@ pub(crate) fn parse_for_each_clause(clause: &str) -> Option<QuantityRef> {
 /// CR 611.3a: The provenance-preserving entry, for the one caller that CAN bind
 /// the anaphor — `oracle_static`, whose `lower_static_ir` knows the affected set
 /// and so knows whether "it" names the source or each affected object.
+///
+/// The counter-kind census of a pronoun (either number) is returned as the
+/// `DistinctCounterKindsAmong { filter: SelfRef }` placeholder that the static
+/// binder (`bind_counter_anaphor_to_recipient`) keeps for a self-scoped static
+/// and rebinds to each affected object for a per-recipient one.
 pub(crate) fn parse_for_each_clause_deferred(clause: &str) -> Option<QuantityRef> {
+    if counter_kinds_pronoun_number(clause).is_some() {
+        return Some(QuantityRef::DistinctCounterKindsAmong {
+            filter: TargetFilter::SelfRef,
+        });
+    }
     parse_for_each_clause_with_they_controller(
         clause,
         ControllerRef::ScopedPlayer,
         &ParseContext::default(),
     )
+}
+
+/// CR 122.1 + CR 608.2k: The grammatical number of the pronoun when the whole
+/// clause is a counter-kind census of a bare object pronoun
+/// ("kind of counter on it" / "… among them"); `None` for any other clause.
+fn counter_kinds_pronoun_number(clause: &str) -> Option<AnaphorNumber> {
+    all_consuming(nom_quantity::parse_counter_kinds_on_object_pronoun)
+        .parse(clause.trim().trim_end_matches('.'))
+        .ok()
+        .map(|(_, number)| number)
+}
+
+/// CR 122.1 + CR 608.2k: The counter-kind census of a pronoun in an effect
+/// clause counts the kinds on the object the pronoun names — the antecedent the
+/// clause context selects (`resolve_it_pronoun`), not always the ability's own
+/// object ("Whenever a creature you control deals combat damage to a player,
+/// draw a card for each kind of counter on it" names the damage dealer).
+/// `None` (fail closed) when the antecedent is one the census cannot represent;
+/// a plural pronoun names no single antecedent object in an effect clause.
+fn counter_kinds_pronoun_census(number: AnaphorNumber, ctx: &ParseContext) -> Option<QuantityRef> {
+    match number {
+        AnaphorNumber::Plural => None,
+        AnaphorNumber::Singular => counter_kinds_census_antecedent(ctx)
+            .map(|filter| QuantityRef::DistinctCounterKindsAmong { filter }),
+    }
+}
+
+/// CR 608.2k + CR 603.2: Map the clause's pronoun antecedent to a census filter
+/// the kinds resolver reads through the per-object counter authority
+/// (`game::quantity::distinct_counter_kinds_among`). Only antecedents with a
+/// faithful single-object reading are admitted; everything else declines.
+fn counter_kinds_census_antecedent(ctx: &ParseContext) -> Option<TargetFilter> {
+    match resolve_it_pronoun(ctx) {
+        // CR 608.2c: under a gated "If you do," sacrifice anchor the pronoun's
+        // referent is resolution-local, which the census cannot represent.
+        TargetFilter::SelfRef if matches!(ctx.subject, Some(TargetFilter::CostPaidObject)) => None,
+        // The ability's own object (a self-referential trigger subject, or no
+        // subject at all).
+        TargetFilter::SelfRef => Some(TargetFilter::SelfRef),
+        // CR 603.2: the object the trigger event names — only inside a
+        // triggered ability, where that event exists.
+        TargetFilter::TriggeringSource if ctx.in_trigger => Some(TargetFilter::TriggeringSource),
+        // The object receiving the triggering event (passive-voice conditions
+        // pin the pronoun here).
+        TargetFilter::EventTarget => Some(TargetFilter::EventTarget),
+        // A parent target, or any other antecedent: no census reading.
+        _ => None,
+    }
 }
 
 /// CR 608.2k: Collapse an unbound deferred counter anaphor back to `Source`.
@@ -3272,13 +3345,19 @@ pub(crate) fn parse_for_each_clause_with_context(
     clause: &str,
     ctx: &ParseContext,
 ) -> Option<QuantityRef> {
+    // CR 608.2k: the counter-kind census of a pronoun binds the antecedent the
+    // caller's context selects — computed from `ctx` itself, since
+    // `for_each_anaphor_context` drops the pronoun antecedent and trigger flag.
+    // A census the context cannot bind declines rather than falling through.
+    if let Some(number) = counter_kinds_pronoun_number(clause) {
+        return counter_kinds_pronoun_census(number, ctx);
+    }
     let they_controller = ctx
         .third_person_player_controller_ref()
         .unwrap_or(ControllerRef::ScopedPlayer);
     let mut qty = parse_for_each_clause_with_they_controller(clause, they_controller, ctx)?;
-    // CR 608.2k: same settle as `parse_for_each_clause` — this context-carrying
-    // entry has no antecedent for the pronoun either, so an unbound anaphor
-    // names the ability's own object.
+    // CR 608.2k: same settle as `parse_for_each_clause` — the counter-COUNT
+    // anaphor keeps its established reading here, the ability's own object.
     settle_deferred_counter_anaphor_ref(&mut qty);
     Some(qty)
 }
@@ -4458,6 +4537,116 @@ mod tests {
             ),
             "plain entry must settle the pronoun to Source, got {qty:?}"
         );
+    }
+
+    /// CR 608.2k: the counter-kind census of a pronoun binds the antecedent the
+    /// clause context selects (`resolve_it_pronoun`), and declines every
+    /// antecedent it cannot represent.
+    #[test]
+    fn kinds_census_pronoun_binds_the_contexts_antecedent() {
+        let census = |filter| Some(QuantityRef::DistinctCounterKindsAmong { filter });
+        let creature_you_control =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+        let trigger_on_another_creature = ParseContext {
+            subject: Some(creature_you_control.clone()),
+            in_trigger: true,
+            ..Default::default()
+        };
+        // Reach guard: the non-pronoun census parses on the same entry.
+        assert!(matches!(
+            parse_for_each_clause_with_context(
+                "kind of counter on permanents you control",
+                &trigger_on_another_creature,
+            ),
+            Some(QuantityRef::DistinctCounterKindsAmong { .. })
+        ));
+        // CR 603.2: a typed trigger subject — "it" is the object the event names.
+        assert_eq!(
+            parse_for_each_clause_with_context(
+                "kind of counter on it",
+                &trigger_on_another_creature
+            ),
+            census(TargetFilter::TriggeringSource)
+        );
+        // A self-referential subject — "it" is the ability's own object.
+        let self_trigger = ParseContext {
+            subject: Some(TargetFilter::SelfRef),
+            in_trigger: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_for_each_clause_with_context("kind of counter on it", &self_trigger),
+            census(TargetFilter::SelfRef)
+        );
+        // A pinned pronoun antecedent wins over the subject.
+        let pinned_event_target = ParseContext {
+            subject: Some(TargetFilter::SelfRef),
+            in_trigger: true,
+            object_pronoun_ref: Some(TargetFilter::EventTarget),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_for_each_clause_with_context("kind of counter on it", &pinned_event_target),
+            census(TargetFilter::EventTarget)
+        );
+        // Antecedents the census cannot represent decline.
+        let pinned_parent_target = ParseContext {
+            object_pronoun_ref: Some(TargetFilter::ParentTarget),
+            in_trigger: true,
+            ..Default::default()
+        };
+        let typed_subject_outside_a_trigger = ParseContext {
+            subject: Some(creature_you_control),
+            ..Default::default()
+        };
+        let sacrifice_anchor = ParseContext {
+            subject: Some(TargetFilter::CostPaidObject),
+            in_trigger: true,
+            ..Default::default()
+        };
+        for (label, ctx) in [
+            ("parent target", &pinned_parent_target),
+            (
+                "typed subject outside a trigger",
+                &typed_subject_outside_a_trigger,
+            ),
+            ("sacrifice anchor", &sacrifice_anchor),
+        ] {
+            assert_eq!(
+                parse_for_each_clause_with_context("kind of counter on it", ctx),
+                None,
+                "{label}"
+            );
+        }
+        // A plural pronoun names no single antecedent object in an effect.
+        assert_eq!(
+            parse_for_each_clause_with_context("kind of counter on them", &self_trigger),
+            None
+        );
+    }
+
+    /// CR 608.2k: with no context there is no antecedent, so the context-free
+    /// entry declines the pronoun census — through every fallback — while the
+    /// static-only deferred entry keeps the `SelfRef` placeholder its binder
+    /// resolves, for both pronoun numbers.
+    #[test]
+    fn kinds_census_pronoun_without_context_declines_or_defers() {
+        // Reach guard: the context-free entry parses the non-pronoun census.
+        assert!(matches!(
+            parse_for_each_clause("kind of counter on permanents you control"),
+            Some(QuantityRef::DistinctCounterKindsAmong { .. })
+        ));
+        assert_eq!(parse_for_each_clause("kind of counter on it"), None);
+        assert_eq!(parse_for_each_clause("kind of counter on them"), None);
+        for text in ["kind of counter on it", "kind of counter on them"] {
+            assert_eq!(
+                parse_for_each_clause_deferred(text),
+                Some(QuantityRef::DistinctCounterKindsAmong {
+                    filter: TargetFilter::SelfRef,
+                }),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

@@ -28519,6 +28519,46 @@ fn combat_tax_self_ref_subject_cant_attack_only() {
     assert!(matches!(scaling, UnlessPayScaling::PerQuantityRef { .. }));
 }
 
+/// CR 611.3a + CR 608.2k: the combat-tax route (`parse_for_each_cost_quantity`)
+/// reads the counter-kind census of a pronoun through the static-only deferred
+/// entry, so its `SelfRef` placeholder reaches the static binder: a
+/// self-referential subject keeps it (the pronoun names the source), and a
+/// per-recipient subject rebinds it to each affected creature.
+#[test]
+fn combat_tax_kinds_census_pronoun_binds_through_the_static_binder() {
+    let census = |def: &StaticDefinition| match extract_unless_pay(def).1 {
+        UnlessPayScaling::PerQuantityRef {
+            quantity: QuantityRef::DistinctCounterKindsAmong { filter },
+        }
+        | UnlessPayScaling::PerAffectedAndQuantityRef {
+            quantity: QuantityRef::DistinctCounterKindsAmong { filter },
+        }
+        | UnlessPayScaling::PerAffectedWithRef {
+            quantity: QuantityRef::DistinctCounterKindsAmong { filter },
+        } => filter,
+        other => panic!("expected a counter-kind census tax, got {other:?}"),
+    };
+
+    let self_tax = parse_static_line(
+        "~ can't attack or block unless you pay {1} for each kind of counter on it.",
+    )
+    .expect("self-referential kinds tax should parse");
+    assert_eq!(self_tax.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(census(&self_tax), TargetFilter::SelfRef);
+
+    let per_recipient_tax = parse_static_line(
+        "Each creature with one or more counters on it can't attack you unless its controller pays {1} for each kind of counter on it.",
+    )
+    .expect("per-recipient kinds tax should parse");
+    assert_ne!(per_recipient_tax.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        census(&per_recipient_tax),
+        TargetFilter::Typed(TypedFilter::permanent().properties(vec![FilterProp::Not {
+            prop: Box::new(FilterProp::Another),
+        }])),
+    );
+}
+
 /// CR 506.3 + CR 508.1d: Propaganda — `defended` field captures the
 /// "you" attack-target scope so the runtime tax only applies to attacks
 /// targeting the static's controller. Regression for issue #302
