@@ -1704,7 +1704,20 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::CardsDiscardedThisTurn { player }
             | QuantityRef::TokensCreatedThisTurn { player, .. }
             | QuantityRef::PlayerActionsThisTurn { player, .. }
-            | QuantityRef::PartySize { player } => player_scope_is_recipient(player),
+            | QuantityRef::PartySize { player }
+            | QuantityRef::GraveyardSize { player }
+            | QuantityRef::StartingLifeTotal { player }
+            | QuantityRef::Speed { player }
+            | QuantityRef::LandsPlayedThisTurn { player, .. }
+            | QuantityRef::PlayerChosenNumber { player }
+            | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { player }
+            // The population filter of these two histories contrasts with the
+            // ability source (see the history arm below); only their player
+            // scope can name the recipient's controller.
+            | QuantityRef::SacrificedThisTurn { player, .. }
+            | QuantityRef::BattlefieldEntriesThisTurn { player, .. } => {
+                player_scope_is_recipient(player)
+            }
             QuantityRef::ObjectCount { filter }
             | QuantityRef::ObjectCountDistinct { filter, .. }
             | QuantityRef::ObjectCountBySharedQuality { filter, .. }
@@ -1749,6 +1762,7 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::ObjectTypelineComponentCount { scope }
             | QuantityRef::Power { scope }
             | QuantityRef::BasePower { scope }
+            | QuantityRef::Intensity { scope }
             | QuantityRef::Toughness { scope }
             | QuantityRef::ObjectManaValue { scope }
             | QuantityRef::ManaSymbolsInManaCost { scope, .. }
@@ -1763,7 +1777,6 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             // every printed per-recipient use is a self-static where recipient
             // == source.
             QuantityRef::PropertyAggregate(_)
-            | QuantityRef::BattlefieldEntriesThisTurn { .. }
             | QuantityRef::SpellsCastThisTurn { .. }
             | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
             | QuantityRef::SpellsCastThisGame { .. }
@@ -1776,28 +1789,24 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::FilteredTrackedSetSize { .. }
             | QuantityRef::CounterAddedThisTurn { .. }
             | QuantityRef::ZoneCardCount { .. }
-            | QuantityRef::SacrificedThisTurn { .. }
             | QuantityRef::PlayerCount { .. }
             | QuantityRef::EventContextPlayerCount { .. } => false,
-            // Scalar, player-scoped and resolution-bound refs, and the
-            // non-recipient sources of the variants classified above: none
-            // reads the affected object.
+            // Scalar and resolution-bound refs with no object or player scope,
+            // and the non-recipient sources of the variants classified above:
+            // none reads the affected object.
             QuantityRef::DistinctCardTypes { .. }
             | QuantityRef::SharedCardTypes { .. }
             | QuantityRef::DistinctSubtypes { .. }
             | QuantityRef::ManaSpentToCast { .. }
             | QuantityRef::AttackedThisTurn { .. }
             | QuantityRef::UnspentMana { .. }
-            | QuantityRef::GraveyardSize { .. }
             | QuantityRef::LifeAboveStarting
-            | QuantityRef::StartingLifeTotal { .. }
             | QuantityRef::TriggeringDiscoverValue
             | QuantityRef::TriggeringScryLookCount
             | QuantityRef::TriggeringScryBottomCount
             | QuantityRef::PlayerCounter { .. }
             | QuantityRef::TargetControllerCounter { .. }
             | QuantityRef::Variable { .. }
-            | QuantityRef::Intensity { .. }
             | QuantityRef::TargetObjectManaValue { .. }
             | QuantityRef::SelfManaValue
             | QuantityRef::TargetZoneCardCount { .. }
@@ -1809,19 +1818,15 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::ExiledFromHandThisResolution
             | QuantityRef::PreviousEffectAmount { .. }
             | QuantityRef::PreviousEffectCount
-            | QuantityRef::Speed { .. }
             | QuantityRef::EventContextAmount
             | QuantityRef::AttachmentsOnLeavingObject { .. }
             | QuantityRef::EventContextSourceCostX
             | QuantityRef::EventContextSourceModesChosen
             | QuantityRef::CrimesCommittedThisTurn
             | QuantityRef::BendTypesThisTurn
-            | QuantityRef::LandsPlayedThisTurn { .. }
             | QuantityRef::TurnsTaken
             | QuantityRef::ChosenNumber
-            | QuantityRef::PlayerChosenNumber { .. }
             | QuantityRef::DescendedThisTurn
-            | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
             | QuantityRef::SpellsCastLastTurn
             | QuantityRef::DungeonsCompleted
             | QuantityRef::CostXPaid
@@ -11860,6 +11865,64 @@ mod tests {
             !quantity_expr_uses_recipient(&source_fixed),
             "SharedCardTypes over ExiledBySource reads no recipient and must not force re-resolution"
         );
+    }
+
+    /// CR 613.4c: every player- or object-scoped read varies per affected
+    /// object exactly when its scope names the recipient (or the recipient's
+    /// controller), whichever variant carries the scope.
+    #[test]
+    fn scoped_reads_use_recipient_exactly_when_their_scope_names_it() {
+        let player_reads = |player: PlayerScope| {
+            vec![
+                QuantityRef::GraveyardSize {
+                    player: player.clone(),
+                },
+                QuantityRef::StartingLifeTotal {
+                    player: player.clone(),
+                },
+                QuantityRef::Speed {
+                    player: player.clone(),
+                },
+                QuantityRef::LandsPlayedThisTurn {
+                    player: player.clone(),
+                    from_zones: None,
+                },
+                QuantityRef::PlayerChosenNumber {
+                    player: player.clone(),
+                },
+                QuantityRef::LoyaltyAbilitiesActivatedThisTurn {
+                    player: player.clone(),
+                },
+                QuantityRef::SacrificedThisTurn {
+                    player: player.clone(),
+                    filter: TargetFilter::Any,
+                },
+                QuantityRef::BattlefieldEntriesThisTurn {
+                    player,
+                    filter: TargetFilter::Any,
+                },
+            ]
+        };
+        for (player, expected) in [
+            (PlayerScope::RecipientController, true),
+            (PlayerScope::Controller, false),
+        ] {
+            for qty in player_reads(player) {
+                assert_eq!(
+                    quantity_expr_uses_recipient(&QuantityExpr::Ref { qty: qty.clone() }),
+                    expected,
+                    "{qty:?}"
+                );
+            }
+        }
+        for (scope, expected) in [(ObjectScope::Recipient, true), (ObjectScope::Source, false)] {
+            let qty = QuantityRef::Intensity { scope };
+            assert_eq!(
+                quantity_expr_uses_recipient(&QuantityExpr::Ref { qty: qty.clone() }),
+                expected,
+                "{qty:?}"
+            );
+        }
     }
 
     /// CR 700.8 + CR 700.8b: party size — building-block test exercising
