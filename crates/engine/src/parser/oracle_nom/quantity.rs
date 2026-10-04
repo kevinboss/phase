@@ -18,7 +18,7 @@ use super::duration::parse_cast_snapshot_suffix;
 use super::error::{oracle_err, OracleResult};
 use super::primitives::{
     parse_article, parse_color, parse_core_type, parse_counter_type_typed, parse_keyword_name,
-    parse_number, scan_at_word_boundaries,
+    parse_number,
 };
 use super::target::parse_type_filter_word;
 use crate::parser::oracle_target::{
@@ -1607,13 +1607,10 @@ pub(crate) fn parse_counters_on_population_with_ctx<'a>(
         return Err(oracle_err(population));
     }
     let rest = population_consumed_rest(population, type_text, remainder)?;
-    if ctx.relative_player_scope.is_none() {
-        let consumed_span = &population[..population.len() - rest.len()];
-        // CR 109.5: with no player context an anaphoric controller has no
-        // referent; the context-aware caller binds it.
-        if scan_at_word_boundaries(consumed_span, parse_anaphoric_player_controller).is_some() {
-            return Err(oracle_err(population));
-        }
+    // CR 109.5: with no player context an anaphoric controller has no
+    // referent; the context-aware caller binds it.
+    if ctx.relative_player_scope.is_none() && population_reads_relative_player(type_text, ctx) {
+        return Err(oracle_err(population));
     }
     Ok((
         rest,
@@ -1624,18 +1621,19 @@ pub(crate) fn parse_counters_on_population_with_ctx<'a>(
     ))
 }
 
-/// CR 109.5: an anaphoric controller phrase — "they control", "that player
-/// controls", "controlled by that player" — whose player is named elsewhere.
-fn parse_anaphoric_player_controller(input: &str) -> OracleResult<'_, ()> {
-    value(
-        (),
-        alt((
-            tag("they control"),
-            tag("that player control"),
-            tag("controlled by that player"),
-        )),
-    )
-    .parse(input)
+/// CR 109.5: whether a population's controller phrase is anaphoric — its
+/// player is named elsewhere ("they control", "that player controls",
+/// "controlled by that player"). The type-phrase reader is the single
+/// authority for controller phrases, so the population is read under two
+/// distinct relative players: an anaphoric phrase binds to each, any other
+/// phrase reads the same under both.
+fn population_reads_relative_player(type_text: &str, ctx: &ParseContext) -> bool {
+    let read_under = |player: ControllerRef| {
+        let mut probe = ctx.clone();
+        probe.relative_player_scope = Some(player);
+        parse_type_phrase_folding_with_ctx(type_text, &mut probe).0
+    };
+    read_under(ControllerRef::DefendingPlayer) != read_under(ControllerRef::TargetPlayer)
 }
 
 /// CR 122.1: Parse "[kind] counters on [object]" after "the number of".
@@ -14120,7 +14118,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_counter_census_declines_determiner_led_single_objects() {
+    fn for_each_counter_census_declines_determiner_and_quantifier_led_phrases() {
         // Reach guard: the population form itself parses.
         for_each_census("+1/+1 counter on creatures you control");
         for text in [
@@ -14162,7 +14160,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_census_declines_players_through_the_content_guard() {
+    fn counter_census_declines_player_populations() {
         // Lumbering Megasloth's player-and-permanent census has no object-only
         // reading. Reach guard: the same head over a permanent population parses.
         assert!(parse_counters_on_population("counter among permanents you control", None).is_ok());
@@ -14260,6 +14258,18 @@ mod tests {
                 .is_err(),
             "context-free head has no referent for 'they control'"
         );
+        // Every anaphoric controller phrase the type-phrase reader knows
+        // declines the same way, present or past tense.
+        for anaphoric in [
+            "the number of +1/+1 counters on creatures that player controls",
+            "the number of +1/+1 counters on creatures controlled by that player",
+            "the number of +1/+1 counters on creatures they controlled",
+        ] {
+            assert!(
+                all_consuming(parse_quantity_ref).parse(anaphoric).is_err(),
+                "{anaphoric:?} has no referent context-free"
+            );
+        }
     }
 
     #[test]

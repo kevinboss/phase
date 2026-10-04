@@ -2162,6 +2162,7 @@ pub(crate) fn quantity_expr_missing_resolution_only_referent(
         QuantityExpr::Ref { qty } => match qty {
             QuantityRef::Power { scope }
             | QuantityRef::BasePower { scope }
+            | QuantityRef::Intensity { scope }
             | QuantityRef::Toughness { scope }
             | QuantityRef::ObjectManaValue { scope }
             | QuantityRef::ObjectColorCount { scope }
@@ -23477,6 +23478,30 @@ mod tests {
             0,
             "no card reads the chain-root target's mana value; the arm fails closed"
         );
+    }
+
+    /// CR 608.2h: `Intensity` is a resolution-only object read like power, so
+    /// a target read with no object target is reported missing for it as for
+    /// power.
+    #[test]
+    fn target_intensity_reports_a_missing_referent_like_power() {
+        let (state, _spell, _target, mut ability) = chain_root_target_fixture();
+        ability.targets.clear();
+        let read = |qty| QuantityExpr::Ref { qty };
+        assert!(quantity_expr_missing_resolution_only_referent(
+            &state,
+            &read(QuantityRef::Power {
+                scope: ObjectScope::Target,
+            }),
+            &ability,
+        ));
+        assert!(quantity_expr_missing_resolution_only_referent(
+            &state,
+            &read(QuantityRef::Intensity {
+                scope: ObjectScope::Target,
+            }),
+            &ability,
+        ));
     }
 
     /// The counter gate must not be pre-empted by the resolution-only referent

@@ -14722,6 +14722,23 @@ mod tests {
         );
     }
 
+    /// A further "and … for each" conjunct after the additional per-each
+    /// clause places counters the base-plus-offset form cannot express, so the
+    /// combinator declines rather than dropping the second conjunct.
+    #[test]
+    fn enters_base_plus_additional_declines_a_further_conjunct() {
+        let conjoined = super::parse_enters_base_plus_additional_for_each(
+            " on it plus an additional +1/+1 counter on it for each artifact you control \
+             and a +1/+1 counter on it for each enchantment you control.",
+            &CounterType::Plus1Plus1,
+            &QuantityExpr::Fixed { value: 1 },
+        );
+        assert_eq!(
+            conjoined, None,
+            "a second per-each conjunct must not be silently dropped"
+        );
+    }
+
     /// CR 614.1c + CR 122.1: Ulasht, the Hate Seed — two conjoined "for each"
     /// placements of the same counter kind sum; a creature that is both red and
     /// green is counted by both conjuncts (Ulasht ruling).

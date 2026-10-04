@@ -5,7 +5,8 @@
 //! the count of counters of the named kind (every kind when untyped) on every
 //! object the population names (`QuantityRef::CountersOnObjects`). Each test
 //! drives the real pipeline on a card staged from its verbatim Oracle text
-//! (MTGJSON `AtomicCards.json`), one per production route that reads the count:
+//! (MTGJSON `AtomicCards.json`) — except the self-spell cost static, which no
+//! printed card phrases this way — one per production route that reads the count:
 //! an activated cost rider, a self-spell cost static, a per-recipient
 //! continuous P/T, an enters-with replacement, resolution effects, a where-X,
 //! and a target-filter quantity.
