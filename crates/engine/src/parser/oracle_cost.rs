@@ -5104,6 +5104,14 @@ mod tests {
                 },
             },
         );
+        // An unanchored population is declined: no cost reduction is produced.
+        assert!(
+            try_parse_cost_reduction(
+                "This ability costs {1} less to activate for each +1/+1 counter on creatures.",
+            )
+            .is_none(),
+            "an unanchored population must not produce a cost reduction"
+        );
     }
 
     /// CR 601.2c + CR 602.2b: Warrior's Blades — the equip discount counts the
