@@ -11928,6 +11928,30 @@ mod tests {
         }
     }
 
+    /// CR 608.2h: `Intensity` is an object read like power — the mirrored
+    /// scope walks see its scope, and a non-source, non-recipient scope is
+    /// resolution-only.
+    #[test]
+    fn intensity_scope_is_seen_by_the_mirrored_scope_walks() {
+        let intensity = |scope| QuantityExpr::Ref {
+            qty: QuantityRef::Intensity { scope },
+        };
+        assert!(quantity_expr_contains_scope(
+            &intensity(ObjectScope::Target),
+            ObjectScope::Target
+        ));
+        assert!(!quantity_expr_contains_scope(
+            &intensity(ObjectScope::Source),
+            ObjectScope::Target
+        ));
+        assert!(quantity_expr_uses_resolution_only_object_scope(&intensity(
+            ObjectScope::Target
+        )));
+        assert!(!quantity_expr_uses_resolution_only_object_scope(
+            &intensity(ObjectScope::Source)
+        ));
+    }
+
     /// CR 700.8 + CR 700.8b: party size — building-block test exercising
     /// `compute_party_size` directly across the full assignment surface.
     /// Verifies that the bipartite-matching maximizes the count for creatures
