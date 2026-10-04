@@ -6344,6 +6344,70 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         );
     }
 
+    /// CR 122.1: a counter-kind census over a single object ("kind(s) of
+    /// counter(s) on ~") has no census arm, so every surface form stays honest
+    /// — a `DynamicQty` swallow naming the operand, an unparsed quantity, or an
+    /// unrecognized condition — instead of being absorbed as a count of a
+    /// counter named "kind of". No printed card names a "kind" counter; these
+    /// lines are synthetic because no printed card currently reaches the route.
+    #[test]
+    fn counter_kind_census_on_one_object_is_never_a_named_counter_count() {
+        let parse_creature = |text: &str| parse_named(text, "Test Card", &["Creature"]);
+        // A counter name serializes as a bare JSON string value; the census
+        // phrase itself only ever appears inside a longer description string.
+        fn names_kind(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::String(s) => matches!(s.as_str(), "kind of" | "kinds of"),
+                serde_json::Value::Array(items) => items.iter().any(names_kind),
+                serde_json::Value::Object(fields) => fields.values().any(names_kind),
+                _ => false,
+            }
+        }
+        let names_kind_counter = |parsed: &crate::parser::oracle::ParsedAbilities| {
+            names_kind(&serde_json::to_value(&parsed.abilities).unwrap())
+                || names_kind(&serde_json::to_value(&parsed.statics).unwrap())
+        };
+
+        // "for each" quantity: an honest DynamicQty swallow (reach guard: the
+        // detector fired with this exact operand).
+        let parsed = parse_creature("{T}: Draw a card for each kind of counter on Test Card.");
+        assert_eq!(
+            only_swallow(&parsed, "DynamicQty").gap(),
+            Some(&ClauseGap::Quantity {
+                operand: "kind of counter on test card".to_string()
+            })
+        );
+        assert!(!names_kind_counter(&parsed), "{:?}", parsed.abilities);
+
+        // "equal to the number of" quantity: an honest unparsed quantity.
+        let parsed = parse_creature(
+            "{T}: You gain life equal to the number of kinds of counters on Test Card.",
+        );
+        assert!(
+            matches!(
+                &*parsed.abilities[0].effect,
+                Effect::Unimplemented { name, .. } if name == "unparsed_quantity"
+            ),
+            "{:?}",
+            parsed.abilities
+        );
+        assert!(!names_kind_counter(&parsed), "{:?}", parsed.abilities);
+
+        // Counter-has condition: unrecognized, not `HasCounters` over "kinds of".
+        let parsed = parse_creature(
+            "As long as there are two or more kinds of counters on Test Card, it has flying.",
+        );
+        assert!(
+            matches!(
+                parsed.statics[0].condition,
+                Some(StaticCondition::Unrecognized { .. })
+            ),
+            "{:?}",
+            parsed.statics
+        );
+        assert!(!names_kind_counter(&parsed), "{:?}", parsed.statics);
+    }
+
     /// Chong and Lily, Nomads (second mode, standalone): the counter census
     /// over Sagas parses, so the line carries no `DynamicQty` swallow.
     #[test]

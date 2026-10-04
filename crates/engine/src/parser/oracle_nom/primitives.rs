@@ -540,6 +540,29 @@ pub fn parse_player_counter_kind(input: &str) -> OracleResult<'_, PlayerCounterK
     .parse(input)
 }
 
+/// CR 122.1: The counter-KIND quantifier "kind of" / "kinds of" — the head of
+/// a counter-kind census ("for each kind of counter on …", "the number of
+/// different kinds of counters among …"). It quantifies over counter kinds; it
+/// never names one (no counter is called "kind"). Lowercase input.
+pub fn parse_counter_kind_quantifier(input: &str) -> OracleResult<'_, ()> {
+    value((), (tag("kind"), opt(tag("s")), tag(" of"))).parse(input)
+}
+
+/// CR 122.1: Guard for open-ended counter-NAME readers — those that slice an
+/// arbitrary phrase before " counter[s]" and map it to `CounterType::Generic`.
+/// Succeeds without consuming unless the input opens with the counter-kind
+/// quantifier (optionally after the "different " determiner) at a word
+/// boundary, so "kind of counter on ~" can never be read as a count of a
+/// counter named "kind of". Lowercase input.
+pub fn not_counter_kind_quantifier(input: &str) -> OracleResult<'_, ()> {
+    not((
+        opt(tag("different ")),
+        parse_counter_kind_quantifier,
+        alt((eof, tag(" "))),
+    ))
+    .parse(input)
+}
+
 /// Parse a counter type: power/toughness counter notation (`+1/+1`,
 /// `-0/-1`, etc.) or one of the named counter types recognized by Oracle text
 /// (`loyalty`, `charge`, `lore`, …).

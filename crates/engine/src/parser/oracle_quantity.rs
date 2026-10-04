@@ -116,7 +116,37 @@ fn parse_counter_quantity_type(raw: &str) -> Option<Option<CounterType>> {
         return saw_quantity_lead_in.then_some(None);
     }
 
+    // CR 122.1: "[different] kind(s) of counter(s) on …" is a counter-kind
+    // census, not a count of a counter named "kind of". Declined here so the
+    // suffix-split callers fail closed instead of manufacturing that name.
+    if names_counter_kind_quantifier(&counter_text.to_lowercase()) {
+        return None;
+    }
+
     Some(Some(normalize_counter_type(counter_text)))
+}
+
+/// CR 122.1: Whether a counter-name slice carries the counter-kind quantifier
+/// ("kind of" / "kinds of") at any word boundary. No counter is named with it,
+/// and the slice reaching the legacy funnel may still carry lead-in words the
+/// strip loop above does not know, so the quantifier is scanned for at every
+/// word boundary rather than only at the start. Lowercase input.
+fn names_counter_kind_quantifier(lower: &str) -> bool {
+    let mut remaining = lower;
+    loop {
+        if nom_primitives::not_counter_kind_quantifier(remaining).is_err() {
+            return true;
+        }
+        match preceded(
+            take_till1(|c: char| c == ' '),
+            tag::<_, _, OracleError<'_>>(" "),
+        )
+        .parse(remaining)
+        {
+            Ok((rest, _)) => remaining = rest,
+            Err(_) => return false,
+        }
+    }
 }
 
 /// CR 119.1 + CR 102.1: "the {highest|lowest} life total among {all players|
@@ -3023,7 +3053,11 @@ fn parse_suspended_card_clause(clause: &str) -> Option<QuantityRef> {
 /// The trailing "s" of "counters" is left to the caller's shared `opt(tag("s"))`
 /// so every characteristic arm pluralizes through one place.
 fn parse_counter_kind_noun(input: &str) -> OracleResult<'_, &str> {
-    recognize((tag("kind"), opt(tag("s")), tag(" of counter"))).parse(input)
+    recognize((
+        nom_primitives::parse_counter_kind_quantifier,
+        tag(" counter"),
+    ))
+    .parse(input)
 }
 
 /// CR 105.1 + CR 205.2 + CR 205.3 + CR 122.1: the distinct-characteristic
@@ -3664,10 +3698,15 @@ fn parse_for_each_clause_with_they_controller(
     if let Some(qty) = parse_quantity_ref(clause) {
         return Some(qty);
     }
-    // Handle singular → plural: "card in your hand" → "cards in your hand"
+    // Handle singular → plural: "card in your hand" → "cards in your hand".
+    // CR 122.1: a counter-kind census head is not a noun to pluralize — the
+    // retry would turn "kinds of" into "kindss of", a slice the counter-name
+    // funnel no longer recognizes as the quantifier.
+    let pluralizable_head =
+        nom_primitives::not_counter_kind_quantifier(&clause.to_lowercase()).is_ok();
     if let Some((first_word, rest)) = clause.split_once(' ') {
         let pluralized = format!("{first_word}s {rest}");
-        if let Some(qty) = parse_quantity_ref(&pluralized) {
+        if let Some(qty) = parse_quantity_ref(&pluralized).filter(|_| pluralizable_head) {
             return Some(qty);
         }
     }
@@ -4645,6 +4684,87 @@ mod tests {
                     filter: TargetFilter::SelfRef,
                 }),
                 "{text:?}"
+            );
+        }
+    }
+
+    /// CR 122.1: "kind(s) of counter(s) on <object>" quantifies over counter
+    /// kinds; no counter is named "kind". Every quantity entry either reads the
+    /// distinct-kinds census (where its grammar binds the object) or declines —
+    /// none counts a counter named "kind of" / "kinds of" / "different kinds of".
+    #[test]
+    fn counter_kind_quantifier_is_never_read_as_a_counter_name() {
+        // Reach guards: the real census phrases and ordinary named counters
+        // still read through the same entries.
+        assert!(matches!(
+            parse_for_each_clause("kind of counter on permanents you control"),
+            Some(QuantityRef::DistinctCounterKindsAmong { .. })
+        ));
+        assert!(matches!(
+            parse_quantity_ref(
+                "the number of different kinds of counters among permanents you control"
+            ),
+            Some(QuantityRef::DistinctCounterKindsAmong { .. })
+        ));
+        for (text, counter_type) in [
+            (
+                "acquired taste counter on ~",
+                CounterType::Generic("acquired taste".into()),
+            ),
+            ("the number of +1/+1 counters on ~", CounterType::Plus1Plus1),
+            ("oil counter on it", CounterType::Generic("oil".into())),
+            ("kind counters on ~", CounterType::Generic("kind".into())),
+        ] {
+            assert_eq!(
+                parse_quantity_ref(text),
+                Some(QuantityRef::CountersOn {
+                    scope: ObjectScope::Source,
+                    counter_type: Some(counter_type),
+                }),
+                "{text:?}"
+            );
+        }
+
+        let census_phrases = [
+            "kind of counter on ~",
+            "kind of counter on it",
+            "kinds of counters on ~",
+            "the number of kinds of counters on ~",
+            "the number of kind of counter on it",
+            "different kinds of counters on ~",
+            "the number of different kinds of counters on ~",
+            "the number of different kinds of counters on it",
+            "kind of counter on that creature",
+            "kinds of counters on that permanent",
+            "kind of counter on target creature",
+        ];
+        for text in census_phrases {
+            assert_eq!(
+                parse_quantity_ref(text),
+                None,
+                "parse_quantity_ref({text:?})"
+            );
+            assert_eq!(
+                parse_cda_quantity(text),
+                None,
+                "parse_cda_quantity({text:?})"
+            );
+            assert_eq!(
+                parse_for_each_clause(text),
+                None,
+                "parse_for_each_clause({text:?})"
+            );
+            // The static-only deferred entry keeps its `SelfRef` placeholder for
+            // the bare pronoun census; every other phrase declines.
+            let expected_deferred = (text == "kind of counter on it").then_some(
+                QuantityRef::DistinctCounterKindsAmong {
+                    filter: TargetFilter::SelfRef,
+                },
+            );
+            assert_eq!(
+                parse_for_each_clause_deferred(text),
+                expected_deferred,
+                "parse_for_each_clause_deferred({text:?})"
             );
         }
     }
