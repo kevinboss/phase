@@ -1597,9 +1597,10 @@ pub(crate) fn parse_counters_on_population_with_ctx<'a>(
     let type_text = population.trim_end_matches('.').trim_end_matches(',');
     let (filter, remainder) = parse_type_phrase_folding_with_ctx(type_text, ctx);
     objects_population_guards(population, &filter)?;
-    // CR 109.2 + CR 122.1: a counter census is read only over a controller- or
-    // zone-anchored population; a bare type word or an object-relative phrase
-    // ('creatures', 'enchanted creature') is declined rather than guessed.
+    // CR 122.1: a counter census is read only over a controller- or
+    // zone-anchored population. A bare type word or an object-relative phrase
+    // ('creatures', 'enchanted creature') is a parser-scope decision: no
+    // printed census uses one, so it is declined (fails closed) until a card does.
     // Players ('players and permanents') never reach here — the type-phrase
     // reader has no player reading, so the content guard refuses first.
     if !filter_is_population_anchored(&filter) {

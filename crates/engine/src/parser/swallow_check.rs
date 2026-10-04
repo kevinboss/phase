@@ -6320,6 +6320,30 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         );
     }
 
+    /// Blue, Loyal Raptor: a kinds census over a named object no census arm
+    /// reads stays an honest `DynamicQty` swallow that names its operand,
+    /// rather than being absorbed as a source counter count.
+    #[test]
+    fn dynamic_qty_swallow_names_an_unread_kinds_census_operand() {
+        let parsed = parse_named(
+            "Partner with Owen Grady, Raptor Trainer (When this creature enters, target \
+             player may put Owen into their hand from their library, then shuffle.)\nFor \
+             each kind of counter on Blue, Loyal Raptor, each other Dinosaur you control \
+             enters with a counter of that kind on it.",
+            "Blue, Loyal Raptor",
+            &["Creature"],
+        );
+        let warning = only_swallow(&parsed, "DynamicQty");
+
+        assert_eq!(
+            warning.gap(),
+            Some(&ClauseGap::Quantity {
+                operand: "kind of counter on blue".to_string()
+            }),
+            "full warning: {warning:?}"
+        );
+    }
+
     /// Chong and Lily, Nomads (second mode, standalone): the counter census
     /// over Sagas parses, so the line carries no `DynamicQty` swallow.
     #[test]
