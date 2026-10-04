@@ -1948,6 +1948,7 @@ pub(crate) fn quantity_expr_uses_resolution_only_object_scope(expr: &QuantityExp
         QuantityExpr::Ref { qty } => match qty {
             QuantityRef::Power { scope }
             | QuantityRef::BasePower { scope }
+            | QuantityRef::Intensity { scope }
             | QuantityRef::Toughness { scope }
             | QuantityRef::ObjectManaValue { scope }
             | QuantityRef::ObjectColorCount { scope }
@@ -2000,6 +2001,7 @@ pub(crate) fn quantity_expr_contains_scope(expr: &QuantityExpr, scope: ObjectSco
         match qty {
             QuantityRef::Power { scope: s }
             | QuantityRef::BasePower { scope: s }
+            | QuantityRef::Intensity { scope: s }
             | QuantityRef::Toughness { scope: s }
             | QuantityRef::ObjectManaValue { scope: s }
             | QuantityRef::ObjectColorCount { scope: s }
@@ -7250,8 +7252,9 @@ pub(crate) fn distinct_counter_kinds_among(
     filter: &TargetFilter,
     filter_ctx: &FilterContext<'_>,
 ) -> Vec<CounterType> {
-    // CR 122.1 + CR 608.2h + CR 608.2k: the ability's own object ("each kind of
-    // counter on ~", or the trigger-condition object a bare "it" names) is read
+    // CR 122.1 + CR 608.2h + CR 608.2k: the ability's own object (the
+    // trigger-condition object a bare "kind of counter on it" names, or the
+    // object choosing a kind of counter it doesn't have) is read
     // through the same live-or-last-known authority as its counter count
     // (`QuantityRef::CountersOn { scope: Source }`), so a source that has left
     // the battlefield ("When this creature dies, …") still reports the kinds it
