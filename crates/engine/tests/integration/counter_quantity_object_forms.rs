@@ -271,7 +271,7 @@ fn dies_trigger_draws_per_kind_of_counter_the_creature_last_had() {
 /// census of each affected creature (no printed card yet). Both pronoun
 /// numbers are exercised.
 const PER_RECIPIENT_KIND_ANTHEMS: [&str; 2] = [
-    "Creatures you control get +1/+1 for each kind of counter on it.",
+    "Each creature you control gets +1/+1 for each kind of counter on it.",
     "Creatures you control get +1/+1 for each kind of counter on them.",
 ];
 

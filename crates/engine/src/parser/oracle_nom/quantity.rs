@@ -14130,7 +14130,7 @@ mod tests {
         ] {
             assert!(
                 parse_counters_on_population(text, Some(ControllerRef::ScopedPlayer)).is_err(),
-                "{text:?} names a single object and must not read as a population"
+                "{text:?} is determiner- or quantifier-led and must not read as a population"
             );
             assert!(
                 !matches!(
