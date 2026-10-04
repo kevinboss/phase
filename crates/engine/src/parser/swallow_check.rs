@@ -6425,7 +6425,7 @@ If you sang a song the whole time you were searching and shuffling, you may unta
     /// An activated self cost rider whose operand has no quantity reading
     /// installs no discount and is surfaced.
     #[test]
-    fn activated_cost_rider_with_unparsed_operand_is_a_swallow() {
+    fn activated_cost_rider_with_unparsed_operand_is_unimplemented() {
         // Reach guard: Deepwood Denizen (verbatim) installs its discount.
         let deepwood = parse_named(
             "{5}{G}, {T}: Draw a card. This ability costs {1} less to activate for each +1/+1 \

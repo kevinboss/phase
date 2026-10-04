@@ -137,8 +137,8 @@ fn warriors_blades_equip_costs_less_per_counter_on_its_target() {
     );
 }
 
-/// CR 601.2h: the counterless creature leaves Equip at {3}, which one
-/// mana can't pay — the activation is reversed to priority with nothing paid.
+/// CR 601.2h + CR 733.1: the counterless creature leaves Equip at {3}, which
+/// one mana can't pay — the activation is reversed with nothing paid.
 #[test]
 fn warriors_blades_equip_on_a_counterless_target_is_unaffordable() {
     let mut board = blades_board();

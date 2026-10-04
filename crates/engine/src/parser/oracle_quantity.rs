@@ -9221,6 +9221,22 @@ mod tests {
                 ),
             })
         );
+        // "the total number of" heads the same census.
+        assert_eq!(
+            parse_quantity_ref_with_context(
+                "the total number of +1/+1 counters on creatures they control",
+                &mut ParseContext {
+                    relative_player_scope: Some(ControllerRef::DefendingPlayer),
+                    ..Default::default()
+                },
+            ),
+            Some(QuantityRef::CountersOnObjects {
+                counter_type: Some(CounterType::Plus1Plus1),
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::DefendingPlayer)
+                ),
+            })
+        );
     }
 
     #[test]
