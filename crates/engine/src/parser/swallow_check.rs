@@ -7245,10 +7245,14 @@ If you sang a song the whole time you were searching and shuffling, you may unta
             "Sacrifice Hellion",
             &["Creature"],
         );
-        assert!(
-            has_swallowed_detector(&unparsed, "DynamicQty"),
-            "{:?}",
-            unparsed.parse_warnings
+        // Reach guard: the enters-with replacement itself parsed.
+        assert!(!unparsed.replacements.is_empty(), "{unparsed:#?}");
+        // The swallow names the dropped operand, not some other clause.
+        assert_eq!(
+            only_swallow(&unparsed, "DynamicQty").gap(),
+            Some(&ClauseGap::Quantity {
+                operand: "+1/+1 counter on the sacrificed creature".to_string()
+            }),
         );
     }
 
