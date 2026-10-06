@@ -37404,3 +37404,93 @@ fn kinds_census_pronoun_in_a_trigger_on_another_object_is_unimplemented() {
         );
     }
 }
+
+/// CR 603.1 + CR 608.2k + CR 109.1: a trigger condition is `SourceOnly` when
+/// it names the ability's own object and no other object — a player
+/// participant or no second participant at all. A second object recorded in a
+/// typed slot or named only in the text, a condition qualifier, and a
+/// condition whose subject is not the source are all `NotSourceOnly`.
+#[test]
+fn trigger_condition_objects_is_source_only_only_without_a_second_object() {
+    let classify = |condition: &str| {
+        let (_, def) = parse_trigger_condition(condition, &mut ParseContext::default());
+        trigger_condition_objects(condition, &def)
+    };
+    for condition in [
+        "whenever ~ deals combat damage to a player",
+        "whenever ~ deals combat damage to an opponent",
+        "when ~ dies",
+        "whenever ~ attacks",
+        "whenever ~ attacks a player",
+        "whenever ~ blocks",
+        "whenever ~ becomes blocked",
+        "whenever ~ is dealt damage",
+        "when ~ enters",
+        "whenever ~ becomes tapped",
+        "whenever one or more counters are put on ~",
+    ] {
+        assert_eq!(
+            classify(condition),
+            TriggerConditionObjects::SourceOnly,
+            "{condition:?}"
+        );
+    }
+    for condition in [
+        // A second object in a typed event slot.
+        "whenever ~ blocks a creature",
+        "whenever ~ becomes blocked by a creature",
+        "whenever ~ becomes attached to a creature",
+        "whenever ~ deals combat damage to a player or planeswalker",
+        "whenever ~ becomes the target of a spell",
+        "whenever ~ becomes the target of an ability",
+        "whenever ~ attacks a planeswalker",
+        // A second object the event parser records in no slot.
+        "whenever ~ fights a creature",
+        "whenever ~ crews a vehicle",
+        "whenever ~ becomes blocked by two or more creatures",
+        "whenever ~ deals damage to a token",
+        "whenever ~ is dealt damage by a source an opponent controls",
+        // A condition qualifier is not proven object-free.
+        "whenever ~ attacks alone",
+        // The subject is not the source.
+        "whenever a creature you control deals combat damage to a player",
+        "whenever you cast a creature spell",
+    ] {
+        assert_eq!(
+            classify(condition),
+            TriggerConditionObjects::NotSourceOnly,
+            "{condition:?}"
+        );
+    }
+}
+
+/// CR 109.1: the object-noun detector reads a type or subtype head noun, or a
+/// non-type object noun, only as a whole word; players and other words are
+/// not objects.
+#[test]
+fn object_head_noun_matches_whole_object_nouns_only() {
+    for input in [
+        "creature",
+        "creatures you control",
+        "vehicle",
+        "spell",
+        "token",
+        "tokens",
+        "source an opponent controls",
+        "ability",
+        "object",
+    ] {
+        assert!(parse_object_head_noun(input).is_ok(), "{input:?}");
+    }
+    for input in [
+        "player",
+        "opponent",
+        "tokenize",
+        "sourced",
+        "combat damage",
+        "counters",
+        "dies",
+    ] {
+        assert!(parse_object_head_noun(input).is_err(), "{input:?}");
+    }
+}

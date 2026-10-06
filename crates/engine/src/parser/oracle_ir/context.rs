@@ -164,6 +164,42 @@ impl TriggerZoneChangeProvenance {
     }
 }
 
+/// Parser-only provenance: which objects the enclosing trigger's CONDITION
+/// names, as classified from that condition's parsed `TriggerDefinition` and
+/// its text (`oracle_trigger::trigger_condition_objects`).
+///
+// CR 603.1 + CR 608.2k: a triggered ability is "[When/Whenever/At] [trigger
+// condition], [effect]", and an effect's untargeted reference to an object the
+// trigger condition referred to keeps naming that object. When the condition
+// names the ability's own object and NO other object, a bare "it" in the
+// effect can only be that object; when the condition names a second object
+// ("blocks a creature", "becomes attached to a creature", "becomes the target
+// of a spell"), "it" is ambiguous between the two and the parser must not pick
+// one. A player the condition names ("deals combat damage to a player") is
+// not an object, so it leaves the reading unambiguous.
+///
+/// A typed provenance rather than a bool: "no enclosing trigger condition was
+/// classified" (a non-trigger parse, an independent body with its own event)
+/// and "a trigger condition that is not source-only" are different facts, and
+/// consumers must match `SourceOnly` EXPLICITLY — every other value fails
+/// closed. Ordinary `Clone` preserves it (the same body continues);
+/// [`ParseContext::clone_for_independent_body`] resets it, because a reflexive
+/// or nested body has its own trigger event that this value does not describe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum TriggerConditionObjects {
+    /// No enclosing trigger condition was classified for this parse.
+    #[default]
+    Unestablished,
+    /// The condition names the ability's own object and no other object; any
+    /// second participant it names is a player.
+    SourceOnly,
+    /// The condition names an object other than the ability's own object, or
+    /// carries a shape (an unrecognized event, a condition qualifier, a
+    /// disjunctive zone-change clause) the classifier does not prove free of
+    /// one.
+    NotSourceOnly,
+}
+
 /// Unified parsing context — threaded through all parser branches for
 /// pronoun/reference resolution ("it", "that creature", "that many").
 ///
@@ -668,6 +704,14 @@ pub(crate) struct ParseContext {
     /// [`Self::clone_for_independent_body`] or [`Self::clone_throwaway`]. See
     /// [`TriggerZoneChangeProvenance`].
     pub trigger_zone_change: TriggerZoneChangeProvenance,
+    /// CR 603.1 + CR 608.2k: which objects the enclosing trigger's condition
+    /// names. Set once, when the trigger body's effect context is built
+    /// (`parse_trigger_line_with_index_ir`); `Unestablished` via
+    /// `derive(Default)` everywhere else. Consumed by the kinds-census pronoun
+    /// gate (`oracle_quantity::kinds_census_pronoun_self_antecedent`), which
+    /// reads "it" as the ability's own object only under `SourceOnly`. See
+    /// [`TriggerConditionObjects`].
+    pub trigger_condition_objects: TriggerConditionObjects,
 }
 
 impl ParseContext {
@@ -755,6 +799,10 @@ impl ParseContext {
     pub fn clone_for_independent_body(&self) -> Self {
         Self {
             trigger_zone_change: TriggerZoneChangeProvenance::none(),
+            // CR 603.12: the independent body's trigger event is not the
+            // enclosing condition, so that condition's object classification
+            // does not describe it.
+            trigger_condition_objects: TriggerConditionObjects::Unestablished,
             ..self.clone()
         }
     }
@@ -872,6 +920,38 @@ mod tests {
             ctx.trigger_zone_change.as_pair(),
             Some((Zone::Battlefield, Zone::Graveyard)),
             "neither named operation may disturb the source context"
+        );
+    }
+
+    /// CR 603.1 + CR 603.12: the condition-object classification defaults to
+    /// `Unestablished`, continues through an ordinary clone and a throwaway
+    /// sub-parse of the same body, and resets for an independent body, whose
+    /// own trigger event it does not describe.
+    #[test]
+    fn trigger_condition_objects_follow_the_body_they_describe() {
+        assert_eq!(
+            ParseContext::default().trigger_condition_objects,
+            TriggerConditionObjects::Unestablished
+        );
+        let ctx = ParseContext {
+            trigger_condition_objects: TriggerConditionObjects::SourceOnly,
+            ..Default::default()
+        };
+        assert_eq!(
+            ctx.clone().trigger_condition_objects,
+            TriggerConditionObjects::SourceOnly
+        );
+        assert_eq!(
+            ctx.clone_throwaway().trigger_condition_objects,
+            TriggerConditionObjects::SourceOnly
+        );
+        assert_eq!(
+            ctx.clone_for_independent_body().trigger_condition_objects,
+            TriggerConditionObjects::Unestablished
+        );
+        assert_eq!(
+            ctx.trigger_condition_objects,
+            TriggerConditionObjects::SourceOnly
         );
     }
 }

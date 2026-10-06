@@ -25,7 +25,7 @@ use nom::multi::separated_list1;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
-use super::oracle_ir::context::ParseContext;
+use super::oracle_ir::context::{ParseContext, TriggerConditionObjects};
 use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::condition::{
     inject_controller_you, parse_life_total_comparator, parse_spell_history_filter,
@@ -3357,21 +3357,26 @@ pub(crate) fn counter_kinds_pronoun_number(clause: &str) -> Option<AnaphorNumber
 /// CR 608.2k + CR 608.2h: The single antecedent an effect clause's
 /// counter-kind census of "it" may bind to — the ability's own object — and
 /// only when the context POSITIVELY establishes that object as the antecedent:
-/// a triggered ability whose condition names its own object ("Whenever this
-/// creature deals combat damage to a player", "When this creature dies"), with
-/// no nearer object reference anywhere in the chain. CR 608.2h reads the
-/// source's current or last-known counters, which the per-object counter
-/// authority provides for exactly this object.
+/// a triggered ability whose condition names its own object and no other
+/// object ("Whenever this creature deals combat damage to a player", "When
+/// this creature dies"), with no nearer object reference anywhere in the
+/// chain. CR 608.2h reads the source's current or last-known counters, which
+/// the per-object counter authority provides for exactly this object.
 ///
 /// Every other antecedent fails closed (`None`): a typed or attached trigger
-/// subject (the event's object), a pinned pronoun (a cast spell, an event
-/// recipient, a parent target), an earlier instruction's target or created
-/// token, a prior mass population, exile set, or chosen object, and any
-/// non-triggered ability (a cost-paid object such as a sacrificed or exiled
-/// card is the nearer antecedent there). The census reads none of those.
+/// subject (the event's object), a condition that also names a second object
+/// ("blocks a creature", "becomes attached to a creature" — "it" could be
+/// either), a pinned pronoun (a cast spell, an event recipient, a parent
+/// target), an earlier instruction's target or created token, a prior mass
+/// population, exile set, or chosen object, and any non-triggered ability (a
+/// cost-paid object such as a sacrificed or exiled card is the nearer
+/// antecedent there). The census reads none of those.
 pub(crate) fn kinds_census_pronoun_self_antecedent(ctx: &ParseContext) -> Option<TargetFilter> {
     let names_own_object = ctx.in_trigger
         && ctx.subject == Some(TargetFilter::SelfRef)
+        // CR 603.1 + CR 608.2k: the condition names no object besides the
+        // source, so "it" cannot name a second one.
+        && ctx.trigger_condition_objects == TriggerConditionObjects::SourceOnly
         && ctx.object_pronoun_ref.is_none()
         && resolve_it_pronoun(ctx) == TargetFilter::SelfRef;
     let chain_names_no_nearer_object = !ctx.parent_target_available
@@ -4619,13 +4624,15 @@ mod tests {
 
     /// CR 608.2k + CR 608.2h: the census pronoun binds only a context that
     /// POSITIVELY names the ability's own object — a self-referential trigger
-    /// subject with no nearer object anywhere in the chain. Every other
-    /// context declines; the shared quantity entry never reads the pronoun.
+    /// subject whose condition names no other object, with no nearer object
+    /// anywhere in the chain. Every other context declines; the shared
+    /// quantity entry never reads the pronoun.
     #[test]
     fn kinds_census_pronoun_self_antecedent_requires_the_abilitys_own_object() {
         let self_trigger = ParseContext {
             subject: Some(TargetFilter::SelfRef),
             in_trigger: true,
+            trigger_condition_objects: TriggerConditionObjects::SourceOnly,
             ..Default::default()
         };
         assert_eq!(
@@ -4682,6 +4689,20 @@ mod tests {
                 "non-trigger SelfRef",
                 ParseContext {
                     in_trigger: false,
+                    ..self_trigger.clone()
+                },
+            ),
+            (
+                "condition names a second object",
+                ParseContext {
+                    trigger_condition_objects: TriggerConditionObjects::NotSourceOnly,
+                    ..self_trigger.clone()
+                },
+            ),
+            (
+                "condition objects unestablished",
+                ParseContext {
+                    trigger_condition_objects: TriggerConditionObjects::Unestablished,
                     ..self_trigger.clone()
                 },
             ),

@@ -6762,6 +6762,94 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         }
     }
 
+    /// CR 603.1 + CR 608.2k + CR 109.1: when a self trigger's condition also
+    /// names a second object, "it" could be either object, so the census gets
+    /// no reading and the clause is an explicit gap. That holds whether the
+    /// second object is recorded in a typed event slot ("blocks a creature",
+    /// "becomes the target of a spell", "attacks a planeswalker") or only in the
+    /// condition's text ("fights a creature", "crews a Vehicle", "deals damage
+    /// to a token"). The same events naming no second object keep their reading
+    /// (`kinds_census_pronoun_of_the_abilitys_own_object_is_read`).
+    #[test]
+    fn kinds_census_pronoun_in_a_trigger_naming_a_second_object_is_unimplemented() {
+        for (text, types) in [
+            // The second object is recorded in a typed event slot.
+            (
+                "Whenever this creature blocks a creature, draw a card for each kind of counter \
+                 on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature becomes blocked by a creature, draw a card for each kind \
+                 of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this Equipment becomes attached to a creature, draw a card for each \
+                 kind of counter on it.",
+                &["Artifact"][..],
+            ),
+            (
+                "Whenever this creature deals combat damage to a creature, draw a card for each \
+                 kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature deals combat damage to a player or planeswalker, draw a \
+                 card for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature becomes the target of a spell, draw a card for each kind \
+                 of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature becomes the target of an ability, draw a card for each \
+                 kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature attacks a planeswalker, draw a card for each kind of \
+                 counter on it.",
+                &["Creature"][..],
+            ),
+            // The second object is named only in the condition's text.
+            (
+                "Whenever this creature fights a creature, draw a card for each kind of counter \
+                 on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature crews a Vehicle, draw a card for each kind of counter on \
+                 it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature becomes blocked by two or more creatures, draw a card \
+                 for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature is dealt damage by a creature, draw a card for each kind \
+                 of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature deals damage to a token, draw a card for each kind of \
+                 counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature is dealt damage by a source an opponent controls, draw a \
+                 card for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+        ] {
+            assert_kinds_census_gap(text, types, "counter_kinds_pronoun_antecedent");
+        }
+    }
+
     /// CR 118.12a + CR 608.2k: a combat tax whose census pronoun names each
     /// affected creature (not the source permanent) gets no census reading;
     /// the line stays an honest `DynamicQty` swallow naming the operand.
@@ -6815,6 +6903,32 @@ If you sang a song the whole time you were searching and shuffling, you may unta
             ),
             (
                 "Whenever this creature attacks, you gain 1 life for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            // Events whose condition names no object besides the source: a
+            // player participant, or no second participant at all.
+            (
+                "Whenever this creature attacks a player, draw a card for each kind of counter \
+                 on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature deals combat damage to an opponent, draw a card for each \
+                 kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature blocks, draw a card for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature becomes blocked, draw a card for each kind of counter on \
+                 it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature is dealt damage, draw a card for each kind of counter on \
+                 it.",
                 &["Creature"][..],
             ),
             (
