@@ -87,11 +87,12 @@ fn spell_cost_scaled_by_an_unbound_counter_kind_census_is_unsupported() {
 
 /// CR 119.4 + CR 601.2f: "Pay N life for each <unbound census>" is an
 /// unimplemented cost — never the flat "Pay N life" — and the card is
-/// unsupported; Hand of Vecna's readable multiplier is the control.
+/// unsupported; a readable multiplier (the shape of Hand of Vecna's equip
+/// cost) is the control.
 #[test]
 fn pay_life_scaled_by_an_unbound_counter_kind_census_is_unsupported() {
     let control = face(
-        "Hand of Vecna",
+        "Pay Life Control",
         "{T}, Pay 1 life for each card in your hand: Draw a card.",
         &[],
     );
