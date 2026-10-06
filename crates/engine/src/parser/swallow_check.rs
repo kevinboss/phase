@@ -6408,6 +6408,30 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         assert!(!names_kind_counter(&parsed), "{:?}", parsed.statics);
     }
 
+    /// CR 608.2k: when "it" names an earlier instruction's target, the kinds
+    /// census has no faithful reading, so the clause stays an honest
+    /// `DynamicQty` swallow naming its operand — never a census of the
+    /// source's own kinds.
+    #[test]
+    fn kinds_census_pronoun_after_a_targeted_instruction_is_an_honest_swallow() {
+        for text in [
+            "Whenever this creature attacks, put a +1/+1 counter on target creature, then \
+             draw a card for each kind of counter on it.",
+            "Put a +1/+1 counter on target creature. Draw a card for each kind of counter on \
+             it.",
+        ] {
+            let parsed = parse_named(text, "Synthetic Census", &["Creature"]);
+            let warning = only_swallow(&parsed, "DynamicQty");
+            assert_eq!(
+                warning.gap(),
+                Some(&ClauseGap::Quantity {
+                    operand: "kind of counter on it".to_string()
+                }),
+                "{text:?}: {warning:?}"
+            );
+        }
+    }
+
     /// Chong and Lily, Nomads (second mode, standalone): the counter census
     /// over Sagas parses, so the line carries no `DynamicQty` swallow.
     #[test]

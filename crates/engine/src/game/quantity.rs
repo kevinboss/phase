@@ -7265,10 +7265,9 @@ pub(crate) fn distinct_counter_kinds_among(
     // information, rather than dropping out of a battlefield scan.
     let single_object_scope = match filter {
         TargetFilter::SelfRef => Some(ObjectScope::Source),
-        // CR 603.2: the object the trigger event names / the object receiving
-        // it — the same scopes the counter count reads for these antecedents.
+        // CR 603.2: the object the trigger event names — the same scope the
+        // counter count reads for this antecedent.
         TargetFilter::TriggeringSource => Some(ObjectScope::EventSource),
-        TargetFilter::EventTarget => Some(ObjectScope::EventTarget),
         _ => None,
     };
     if let Some(scope) = single_object_scope {
@@ -11207,8 +11206,7 @@ mod tests {
     /// CR 122.1 + CR 603.2 + CR 608.2k: a census bound to the triggering
     /// source counts the kinds on the object the trigger event names (the
     /// damage dealer), read through the per-object counter authority — not the
-    /// listener's kinds, and not the event's recipient's. The recipient census
-    /// (`EventTarget`) reads the other side of the same event.
+    /// listener's kinds, and not the event's recipient's.
     #[test]
     fn distinct_counter_kinds_among_triggering_source_reads_the_event_source() {
         let mut state = GameState::new_two_player(42);
@@ -11258,10 +11256,6 @@ mod tests {
         assert_eq!(
             distinct_counter_kinds_among(&state, &TargetFilter::TriggeringSource, &ctx),
             vec![CounterType::Plus1Plus1, CounterType::Stun],
-        );
-        assert_eq!(
-            distinct_counter_kinds_among(&state, &TargetFilter::EventTarget, &ctx),
-            vec![CounterType::Lore],
         );
         assert_eq!(
             distinct_counter_kinds_among(&state, &TargetFilter::SelfRef, &ctx).len(),

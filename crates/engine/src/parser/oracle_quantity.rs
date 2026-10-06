@@ -3352,16 +3352,24 @@ fn counter_kinds_census_antecedent(ctx: &ParseContext) -> Option<TargetFilter> {
         // CR 608.2c: under a gated "If you do," sacrifice anchor the pronoun's
         // referent is resolution-local, which the census cannot represent.
         TargetFilter::SelfRef if matches!(ctx.subject, Some(TargetFilter::CostPaidObject)) => None,
+        // CR 608.2k: an earlier instruction's object ("Put a +1/+1 counter on
+        // target creature. Draw a card for each kind of counter on it.") is the
+        // antecedent, not the ability's own object; the census has no
+        // last-known reading for it, so it declines.
+        TargetFilter::SelfRef
+            if ctx.parent_target_available || ctx.chain_declared_object_target.is_some() =>
+        {
+            None
+        }
         // The ability's own object (a self-referential trigger subject, or no
         // subject at all).
         TargetFilter::SelfRef => Some(TargetFilter::SelfRef),
         // CR 603.2: the object the trigger event names — only inside a
         // triggered ability, where that event exists.
         TargetFilter::TriggeringSource if ctx.in_trigger => Some(TargetFilter::TriggeringSource),
-        // The object receiving the triggering event (passive-voice conditions
-        // pin the pronoun here).
-        TargetFilter::EventTarget => Some(TargetFilter::EventTarget),
-        // A parent target, or any other antecedent: no census reading.
+        // A parent target, the triggering event's recipient (the per-object
+        // counter reader has no last-known reading for it, CR 608.2h), or any
+        // other antecedent: no census reading.
         _ => None,
     }
 }
@@ -4617,18 +4625,26 @@ mod tests {
             parse_for_each_clause_with_context("kind of counter on it", &self_trigger),
             census(TargetFilter::SelfRef)
         );
-        // A pinned pronoun antecedent wins over the subject.
+        // Antecedents the census cannot represent decline: a pinned event
+        // recipient (no last-known reading), an earlier instruction's object
+        // (a parent target, or a chain-declared target), a pinned parent target,
+        // a typed subject outside a trigger, and a sacrifice anchor.
         let pinned_event_target = ParseContext {
             subject: Some(TargetFilter::SelfRef),
             in_trigger: true,
             object_pronoun_ref: Some(TargetFilter::EventTarget),
             ..Default::default()
         };
-        assert_eq!(
-            parse_for_each_clause_with_context("kind of counter on it", &pinned_event_target),
-            census(TargetFilter::EventTarget)
-        );
-        // Antecedents the census cannot represent decline.
+        let earlier_parent_target = ParseContext {
+            parent_target_available: true,
+            ..Default::default()
+        };
+        let chain_declared_target = ParseContext {
+            subject: Some(TargetFilter::SelfRef),
+            in_trigger: true,
+            chain_declared_object_target: Some(TargetFilter::Typed(TypedFilter::creature())),
+            ..Default::default()
+        };
         let pinned_parent_target = ParseContext {
             object_pronoun_ref: Some(TargetFilter::ParentTarget),
             in_trigger: true,
@@ -4644,6 +4660,9 @@ mod tests {
             ..Default::default()
         };
         for (label, ctx) in [
+            ("event recipient", &pinned_event_target),
+            ("earlier parent target", &earlier_parent_target),
+            ("chain-declared target", &chain_declared_target),
             ("parent target", &pinned_parent_target),
             (
                 "typed subject outside a trigger",
