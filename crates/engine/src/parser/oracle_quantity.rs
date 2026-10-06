@@ -3371,10 +3371,12 @@ pub(crate) fn counter_kinds_pronoun_number(clause: &str) -> Option<AnaphorNumber
 /// population, exile set, or chosen object, and any non-triggered ability (a
 /// cost-paid object such as a sacrificed or exiled card is the nearer
 /// antecedent there). The census reads none of those. Nor does it read inside
-/// a delayed-trigger body (CR 603.7): that body resolves later, when a source
-/// that left the battlefield has no counters (CR 122.2) and no last-known
-/// information to read — `ParseContext::enter_delayed_trigger_body` resets the
-/// condition classification there, so `SourceOnly` never holds.
+/// a delayed-trigger body (CR 603.7): that body resolves later, and the engine
+/// freezes a delayed trigger's counter COUNT at creation but takes no census
+/// snapshot, so by then a source that left the battlefield would read its new
+/// object's empty counters (CR 400.7 + CR 122.2) —
+/// `ParseContext::enter_delayed_trigger_body` resets the condition
+/// classification there, so `SourceOnly` never holds.
 pub(crate) fn kinds_census_pronoun_self_antecedent(ctx: &ParseContext) -> Option<TargetFilter> {
     let names_own_object = ctx.in_trigger
         && ctx.subject == Some(TargetFilter::SelfRef)

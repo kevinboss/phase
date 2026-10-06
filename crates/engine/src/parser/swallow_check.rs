@@ -7131,6 +7131,25 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         }
     }
 
+    /// The census multiplies a fixed base only. A dynamic base ("that much
+    /// life", "X life", "life equal to its power", "that many cards") has no
+    /// product with a second dynamic quantity, so the clause is an explicit gap
+    /// rather than the bare base with the "for each" dropped.
+    #[test]
+    fn kinds_census_pronoun_on_a_dynamic_base_is_unimplemented() {
+        for text in [
+            "Whenever this creature deals combat damage to a player, you gain that much life \
+             for each kind of counter on it.",
+            "When this creature dies, you gain life equal to its power for each kind of \
+             counter on it.",
+            "When this creature enters, you lose X life for each kind of counter on it.",
+            "Whenever this creature deals combat damage to a player, draw that many cards for \
+             each kind of counter on it.",
+        ] {
+            assert_kinds_census_gap(text, &["Creature"], "counter_kinds_pronoun_antecedent");
+        }
+    }
+
     /// Chong and Lily, Nomads (second mode, standalone): the counter census
     /// over Sagas parses, so the line carries no `DynamicQty` swallow.
     #[test]

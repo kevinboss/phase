@@ -18931,17 +18931,24 @@ fn kinds_census_controller_effect(
     let census = QuantityExpr::Ref {
         qty: QuantityRef::DistinctCounterKindsAmong { filter },
     };
-    let effect = match ast {
-        NumericImperativeAst::Draw { .. }
-        | NumericImperativeAst::GainLife { .. }
-        | NumericImperativeAst::LoseLife { .. }
-        | NumericImperativeAst::Scry { .. }
-        | NumericImperativeAst::Surveil { .. }
-        | NumericImperativeAst::Mill { .. } => {
-            imperative::lower_numeric_imperative_ast(ast.with_for_each_quantity(census))
+    // The census multiplies a fixed base ("draw a card", "you gain 2 life").
+    // A dynamic base ("that much life", "X life", "life equal to its power")
+    // has no product form with a second dynamic quantity, so the for-each
+    // would be dropped and the bare base kept — decline instead.
+    let base_amount = match &ast {
+        NumericImperativeAst::Draw { count, .. }
+        | NumericImperativeAst::Scry { count }
+        | NumericImperativeAst::Surveil { count }
+        | NumericImperativeAst::Mill { count } => count,
+        NumericImperativeAst::GainLife { amount } | NumericImperativeAst::LoseLife { amount } => {
+            amount
         }
-        _ => return None,
+        NumericImperativeAst::Pump { .. } => return None,
     };
+    if !matches!(base_amount, QuantityExpr::Fixed { value } if *value >= 1) {
+        return None;
+    }
+    let effect = imperative::lower_numeric_imperative_ast(ast.with_for_each_quantity(census));
     let effect = thread_for_each_subject(effect, base, ctx);
     census_recipient_is_controller(&effect).then_some(effect)
 }
