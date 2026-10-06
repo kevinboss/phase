@@ -6494,6 +6494,136 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         }
     }
 
+    /// Whether any object anywhere in the parse carries `"type": ty` (an
+    /// effect, cost, or quantity variant name).
+    fn parse_has_type(parsed: &crate::parser::oracle::ParsedAbilities, ty: &str) -> bool {
+        fn walk(value: &serde_json::Value, ty: &str) -> bool {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    fields.get("type").and_then(serde_json::Value::as_str) == Some(ty)
+                        || fields.values().any(|v| walk(v, ty))
+                }
+                serde_json::Value::Array(items) => items.iter().any(|v| walk(v, ty)),
+                _ => false,
+            }
+        }
+        walk(&serde_json::to_value(parsed).unwrap(), ty)
+    }
+
+    /// CR 608.2c + CR 608.2k: the census of "it" is read only as the FIRST
+    /// instruction of the ability — any earlier instruction (a search, a
+    /// reveal and move, a discard, a draw) may introduce the object the
+    /// pronoun names, so a later census is an explicit gap. The earlier
+    /// instruction itself still parses (reach guard), and a census that IS
+    /// first keeps its reading while a second census after it does not.
+    #[test]
+    fn kinds_census_pronoun_after_any_earlier_instruction_is_unimplemented() {
+        for (text, earlier) in [
+            (
+                "When this creature enters, search your library for a creature card, reveal \
+                 it, put it into your hand, then shuffle. You gain 1 life for each kind of \
+                 counter on it.",
+                "SearchLibrary",
+            ),
+            (
+                "Whenever this creature attacks, reveal the top card of your library and put \
+                 it into your hand. You gain 1 life for each kind of counter on it.",
+                "RevealTop",
+            ),
+            (
+                "When this creature enters, discard a card, then draw a card for each kind of \
+                 counter on it.",
+                "Discard",
+            ),
+            (
+                "Whenever this creature attacks, draw a card, then you gain 1 life for each \
+                 kind of counter on it.",
+                "Draw",
+            ),
+            (
+                "When this creature dies, you may pay {1}. If you do, draw a card for each \
+                 kind of counter on it.",
+                "PayCost",
+            ),
+        ] {
+            assert_kinds_census_gap(text, &["Creature"], "counter_kinds_pronoun_antecedent");
+            let parsed = parse_named(text, "Synthetic Census", &["Creature"]);
+            assert!(
+                parse_has_type(&parsed, earlier),
+                "{text:?}: reach guard — the earlier {earlier} instruction parsed"
+            );
+        }
+
+        // The first census reads the ability's own object; the second sentence's
+        // census follows an instruction and is a gap.
+        let parsed = parse_named(
+            "When this creature dies, draw a card for each kind of counter on it. You gain 1 \
+             life for each kind of counter on it.",
+            "Synthetic Census",
+            &["Creature"],
+        );
+        assert_eq!(
+            kinds_census_filters(&parsed),
+            vec![serde_json::to_value(TargetFilter::SelfRef).unwrap()],
+        );
+        assert_eq!(
+            unimplemented_names(&parsed),
+            vec!["counter_kinds_pronoun_antecedent".to_string()],
+        );
+    }
+
+    /// CR 608.2k + CR 109.5: the census of "it" is read only for an instruction
+    /// whose recipient is the ability's controller ("you", stated or implicit).
+    /// A player named through an object (a target's or blocked creature's
+    /// controller or owner), a targeted or event player, a peeled player scope
+    /// ("each player", "each opponent", "starting with you, each player"), and a
+    /// non-controller "may" actor are all explicit gaps — never a census whose
+    /// recipient silently became "you" or an object-derived player.
+    #[test]
+    fn kinds_census_pronoun_for_a_non_controller_recipient_is_unimplemented() {
+        for text in [
+            "Whenever this creature attacks, target creature's controller loses 1 life for \
+             each kind of counter on it.",
+            "Whenever this creature attacks, the controller of target creature draws a card \
+             for each kind of counter on it.",
+            "Whenever this creature blocks a creature, that creature's controller loses 1 life \
+             for each kind of counter on it.",
+            "Whenever this creature attacks, target artifact's owner mills a card for each kind \
+             of counter on it.",
+            "When this creature dies, target permanent's controller gains 1 life for each kind \
+             of counter on it.",
+            "Whenever this creature becomes blocked by a creature, that creature's controller \
+             loses 1 life for each kind of counter on it.",
+            "Whenever this creature attacks, defending player loses 1 life for each kind of \
+             counter on it.",
+            "Whenever this creature attacks, target opponent loses 1 life for each kind of \
+             counter on it.",
+            "Whenever this creature attacks, target player draws a card for each kind of \
+             counter on it.",
+            "Whenever this creature deals combat damage to a player, that player mills a card \
+             for each kind of counter on it.",
+            "Whenever this creature deals combat damage to a player, they draw a card for each \
+             kind of counter on it.",
+            "When this creature dies, its controller draws a card for each kind of counter on \
+             it.",
+            "When this creature dies, its owner draws a card for each kind of counter on it.",
+            "Whenever this creature attacks, each player draws a card for each kind of counter \
+             on it.",
+            "Whenever this creature attacks, each opponent gains 1 life for each kind of \
+             counter on it.",
+            "When this creature enters, each opponent loses 1 life for each kind of counter on \
+             it, then you gain 1 life for each kind of counter on it.",
+            "When this creature enters, starting with you, each player draws a card for each \
+             kind of counter on it.",
+            "Whenever this creature attacks, an opponent may draw a card for each kind of \
+             counter on it.",
+            "Whenever this creature attacks, each opponent may draw a card for each kind of \
+             counter on it.",
+        ] {
+            assert_kinds_census_gap(text, &["Creature"], "counter_kinds_pronoun_antecedent");
+        }
+    }
+
     /// CR 608.2k + CR 608.2h: the counter-kind census of "it" is read only for
     /// the ability's own object. Every other antecedent — a pumped or damaged
     /// target, a mass-pump recipient, a cost-paid object, a typed or attached
@@ -6699,6 +6829,34 @@ If you sang a song the whole time you were searching and shuffling, you may unta
                  a card for each kind of counter on it\" and it can't be blocked this turn.",
                 &["Artifact"][..],
             ),
+            // The controller as the recipient, stated or implicit, across the
+            // player-recipient numeric instructions; a census that is the first
+            // instruction keeps its reading whatever follows it.
+            (
+                "Whenever this creature attacks, you lose 1 life for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature attacks, scry 1 for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "When this creature dies, surveil 1 for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "When this creature dies, mill a card for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "When this creature dies, you may draw a card for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "When this creature dies, draw a card for each kind of counter on it, then put \
+                 a +1/+1 counter on target creature.",
+                &["Creature"][..],
+            ),
         ] {
             let parsed = parse_named(text, "Test Card", types);
             assert_eq!(
@@ -6738,6 +6896,88 @@ If you sang a song the whole time you were searching and shuffling, you may unta
             &["Creature"],
         );
         assert_eq!(unimplemented_names(&doubling), Vec::<String>::new());
+    }
+
+    /// CR 608.2k + CR 611.3a: in a continuous static, the census pronoun names
+    /// the static's subject only when it agrees with the subject's number (its
+    /// verb agreement): "Each creature … gets … on it", "Creatures … get … on
+    /// them", "Enchanted/Equipped creature gets … on it", "This creature gets …
+    /// on it" read — per recipient, or the source for a self static. A singular
+    /// "it" after a plural subject ("Other creatures you control get … on it")
+    /// names some other object, and a plural "them" after a singular subject
+    /// names no affected object: no census is read, and the dropped operand
+    /// stays an honest `DynamicQty` swallow.
+    #[test]
+    fn kinds_census_pronoun_in_a_static_must_agree_with_its_subject() {
+        let per_recipient = serde_json::to_value(TargetFilter::Typed(
+            crate::types::ability::TypedFilter::permanent().properties(vec![
+                crate::types::ability::FilterProp::Not {
+                    prop: Box::new(crate::types::ability::FilterProp::Another),
+                },
+            ]),
+        ))
+        .unwrap();
+        let self_ref = serde_json::to_value(TargetFilter::SelfRef).unwrap();
+        for (text, filter) in [
+            (
+                "Each creature you control gets +1/+1 for each kind of counter on it.",
+                &per_recipient,
+            ),
+            (
+                "Each other creature you control gets +1/+1 for each kind of counter on it.",
+                &per_recipient,
+            ),
+            (
+                "Creatures you control get +1/+1 for each kind of counter on them.",
+                &per_recipient,
+            ),
+            (
+                "Equipped creature gets +1/+1 for each kind of counter on it.",
+                &per_recipient,
+            ),
+            (
+                "Creatures you control get +1/+1 for each kind of counter on them and +1/+0 for \
+                 each kind of counter on them.",
+                &per_recipient,
+            ),
+            (
+                "This creature gets +1/+1 for each kind of counter on it.",
+                &self_ref,
+            ),
+        ] {
+            let parsed = parse_named(text, "Test Card", &["Creature"]);
+            let found = kinds_census_filters(&parsed);
+            assert!(
+                !found.is_empty() && found.iter().all(|f| f == filter),
+                "{text:?}: {found:?}"
+            );
+        }
+        for text in [
+            "Other creatures you control get +1/+1 for each kind of counter on it.",
+            "Creatures you control get +1/+1 for each kind of counter on it.",
+            "Other creatures you control get +1/+1 for each kind of counter on it and have \
+             trample.",
+            "Creatures you control get +1/+1 for each kind of counter on it and +1/+0 for each \
+             kind of counter on it.",
+            "Each creature you control gets +1/+1 for each kind of counter on them.",
+            "This creature gets +1/+1 for each kind of counter on them.",
+            "Enchanted creature gets +1/+1 for each kind of counter on them.",
+        ] {
+            let parsed = parse_named(text, "Test Card", &["Creature"]);
+            assert_eq!(
+                kinds_census_filters(&parsed),
+                Vec::<serde_json::Value>::new(),
+                "{text:?}"
+            );
+            // Reach guard: the static parsed and the swallow audit named the
+            // dropped census operand.
+            assert!(!parsed.statics.is_empty(), "{text:?}");
+            assert!(
+                has_swallowed_detector(&parsed, "DynamicQty"),
+                "{text:?}: {:?}",
+                parsed.parse_warnings
+            );
+        }
     }
 
     /// Chong and Lily, Nomads (second mode, standalone): the counter census

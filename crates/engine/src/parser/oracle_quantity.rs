@@ -131,7 +131,12 @@ fn parse_counter_quantity_type(raw: &str) -> Option<Option<CounterType>> {
 /// and the slice reaching the legacy funnel may still carry lead-in words the
 /// strip loop above does not know, so the quantifier is scanned for at every
 /// word boundary rather than only at the start. Lowercase input.
-fn names_counter_kind_quantifier(lower: &str) -> bool {
+///
+/// Also the decline guard of the open-ended object-count fallbacks (the
+/// cost-modification "for each <type phrase>" reader): a counter-kind census
+/// those fallbacks reach is one the census readers declined, never a type
+/// phrase.
+pub(crate) fn names_counter_kind_quantifier(lower: &str) -> bool {
     let mut remaining = lower;
     loop {
         if nom_primitives::not_counter_kind_quantifier(remaining).is_err() {
@@ -2633,8 +2638,15 @@ pub(crate) fn parse_for_each_clause_expr(clause: &str) -> Option<QuantityExpr> {
 /// CR 611.3a: The provenance-preserving entry, for the one caller that CAN bind
 /// the anaphor — `oracle_static`, whose `lower_static_ir` knows the affected set
 /// and so knows whether "it" names the source or each affected object.
-pub(crate) fn parse_for_each_clause_expr_deferred(clause: &str) -> Option<QuantityExpr> {
-    parse_for_each_clause_expr_with_parser(clause, parse_for_each_clause_deferred)
+/// `subject_number` is the static subject's verb-agreement number (see
+/// `parse_for_each_clause_deferred`).
+pub(crate) fn parse_for_each_clause_expr_deferred(
+    clause: &str,
+    subject_number: Option<AnaphorNumber>,
+) -> Option<QuantityExpr> {
+    parse_for_each_clause_expr_with_parser(clause, move |segment| {
+        parse_for_each_clause_deferred(segment, subject_number)
+    })
 }
 
 /// "Other spell(s) cast this turn" (Storm Entity class): all spells cast this
@@ -3301,15 +3313,29 @@ pub(crate) fn parse_for_each_clause(clause: &str) -> Option<QuantityRef> {
 /// the anaphor — `oracle_static`, whose `lower_static_ir` knows the affected set
 /// and so knows whether "it" names the source or each affected object.
 ///
-/// The counter-kind census of a pronoun (either number) is returned as the
-/// `DistinctCounterKindsAmong { filter: SelfRef }` placeholder that the static
-/// binder (`bind_counter_anaphor_to_recipient`) keeps for a self-scoped static
-/// and rebinds to each affected object for a per-recipient one.
-pub(crate) fn parse_for_each_clause_deferred(clause: &str) -> Option<QuantityRef> {
-    if counter_kinds_pronoun_number(clause).is_some() {
-        return Some(QuantityRef::DistinctCounterKindsAmong {
-            filter: TargetFilter::SelfRef,
-        });
+/// `subject_number` is the grammatical number of the static's subject as its
+/// verb agreement states it ("Each creature you control gets" / "Creatures you
+/// control get"); `None` when the caller saw no agreeing verb.
+///
+/// CR 608.2k + CR 611.3a: the counter-kind census of a pronoun is returned as
+/// the `DistinctCounterKindsAmong { filter: SelfRef }` placeholder that the
+/// static binder (`bind_counter_anaphor_to_recipient`) keeps for a self-scoped
+/// static and rebinds to each affected object for a per-recipient one — but
+/// only when the pronoun agrees in number with that subject, which is when it
+/// names the subject's object(s). A singular "it" after a plural subject
+/// ("Other creatures you control get … on it") names some other object, and a
+/// plural "them" after a singular subject names no affected object; both
+/// decline, as does a census whose subject number is unknown.
+pub(crate) fn parse_for_each_clause_deferred(
+    clause: &str,
+    subject_number: Option<AnaphorNumber>,
+) -> Option<QuantityRef> {
+    if let Some(pronoun_number) = counter_kinds_pronoun_number(clause) {
+        return (subject_number == Some(pronoun_number)).then_some(
+            QuantityRef::DistinctCounterKindsAmong {
+                filter: TargetFilter::SelfRef,
+            },
+        );
     }
     parse_for_each_clause_with_they_controller(
         clause,
@@ -4563,7 +4589,7 @@ mod tests {
     /// when the static modifies only the object printing it.
     #[test]
     fn for_each_any_counter_on_pronoun_defers() {
-        let qty = parse_for_each_clause_deferred("counter on it");
+        let qty = parse_for_each_clause_deferred("counter on it", None);
         assert!(
             matches!(
                 qty,
@@ -4750,7 +4776,8 @@ mod tests {
     /// CR 608.2k: with no context there is no antecedent, so the context-free
     /// entry declines the pronoun census — through every fallback — while the
     /// static-only deferred entry keeps the `SelfRef` placeholder its binder
-    /// resolves, for both pronoun numbers.
+    /// resolves only when the pronoun agrees in number with the static's
+    /// subject; a mismatched or unknown subject number declines.
     #[test]
     fn kinds_census_pronoun_without_context_declines_or_defers() {
         // Reach guard: the context-free entry parses the non-pronoun census.
@@ -4760,13 +4787,33 @@ mod tests {
         ));
         assert_eq!(parse_for_each_clause("kind of counter on it"), None);
         assert_eq!(parse_for_each_clause("kind of counter on them"), None);
-        for text in ["kind of counter on it", "kind of counter on them"] {
+        let placeholder = Some(QuantityRef::DistinctCounterKindsAmong {
+            filter: TargetFilter::SelfRef,
+        });
+        for (text, subject_number, expected) in [
+            (
+                "kind of counter on it",
+                Some(AnaphorNumber::Singular),
+                placeholder.clone(),
+            ),
+            (
+                "kind of counter on them",
+                Some(AnaphorNumber::Plural),
+                placeholder.clone(),
+            ),
+            ("kind of counter on it", Some(AnaphorNumber::Plural), None),
+            (
+                "kind of counter on them",
+                Some(AnaphorNumber::Singular),
+                None,
+            ),
+            ("kind of counter on it", None, None),
+            ("kind of counter on them", None, None),
+        ] {
             assert_eq!(
-                parse_for_each_clause_deferred(text),
-                Some(QuantityRef::DistinctCounterKindsAmong {
-                    filter: TargetFilter::SelfRef,
-                }),
-                "{text:?}"
+                parse_for_each_clause_deferred(text, subject_number),
+                expected,
+                "{text:?} after a {subject_number:?} subject"
             );
         }
     }
@@ -4838,14 +4885,15 @@ mod tests {
                 "parse_for_each_clause({text:?})"
             );
             // The static-only deferred entry keeps its `SelfRef` placeholder for
-            // the bare pronoun census; every other phrase declines.
+            // the bare pronoun census after an agreeing (singular) subject;
+            // every other phrase declines.
             let expected_deferred = (text == "kind of counter on it").then_some(
                 QuantityRef::DistinctCounterKindsAmong {
                     filter: TargetFilter::SelfRef,
                 },
             );
             assert_eq!(
-                parse_for_each_clause_deferred(text),
+                parse_for_each_clause_deferred(text, Some(AnaphorNumber::Singular)),
                 expected_deferred,
                 "parse_for_each_clause_deferred({text:?})"
             );
@@ -4856,7 +4904,7 @@ mod tests {
     fn for_each_singular_counter_on_self() {
         // Singular "counter on it" (not "counters on it") — same deferred
         // referent, exercising the singular arm of the counter-word axis.
-        let qty = parse_for_each_clause_deferred("blight counter on it").unwrap();
+        let qty = parse_for_each_clause_deferred("blight counter on it", None).unwrap();
         assert!(
             matches!(qty, QuantityRef::CountersOn { scope: ObjectScope::Anaphoric, counter_type: Some(ref counter_type) } if *counter_type == CounterType::Generic("blight".to_string())),
             "singular counter form should defer the pronoun, got {qty:?}"
