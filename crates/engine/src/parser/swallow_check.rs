@@ -6408,28 +6408,336 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         assert!(!names_kind_counter(&parsed), "{:?}", parsed.statics);
     }
 
+    /// Every `DistinctCounterKindsAmong` census filter anywhere in the parse
+    /// (abilities, triggers, statics, replacements), as serialized JSON.
+    fn kinds_census_filters(
+        parsed: &crate::parser::oracle::ParsedAbilities,
+    ) -> Vec<serde_json::Value> {
+        fn walk(value: &serde_json::Value, found: &mut Vec<serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if fields.get("type").and_then(serde_json::Value::as_str)
+                        == Some("DistinctCounterKindsAmong")
+                    {
+                        found.push(fields["filter"].clone());
+                    }
+                    fields.values().for_each(|v| walk(v, found));
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(&serde_json::to_value(parsed).unwrap(), &mut found);
+        found
+    }
+
+    /// The name of every `Effect::Unimplemented` anywhere in the parse.
+    fn unimplemented_names(parsed: &crate::parser::oracle::ParsedAbilities) -> Vec<String> {
+        fn walk(value: &serde_json::Value, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if fields.get("type").and_then(serde_json::Value::as_str)
+                        == Some("Unimplemented")
+                    {
+                        if let Some(name) = fields.get("name").and_then(serde_json::Value::as_str) {
+                            found.push(name.to_string());
+                        }
+                    }
+                    fields.values().for_each(|v| walk(v, found));
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(&serde_json::to_value(parsed).unwrap(), &mut found);
+        found
+    }
+
+    /// Asserts the line reads no counter-kind census at all and carries the
+    /// named explicit gap — never a dropped "for each" (a bare `Draw { 1 }`),
+    /// which the `DynamicQty` detector cannot see once any `QuantityRef` sits
+    /// in the unit.
+    fn assert_kinds_census_gap(text: &str, types: &[&str], gap: &str) {
+        let parsed = parse_named(text, "Synthetic Census", types);
+        assert_eq!(
+            kinds_census_filters(&parsed),
+            Vec::<serde_json::Value>::new(),
+            "{text:?}: no census may be read"
+        );
+        assert!(
+            unimplemented_names(&parsed).iter().any(|name| name == gap),
+            "{text:?}: expected an Unimplemented {gap:?}, got {:?}",
+            unimplemented_names(&parsed)
+        );
+    }
+
     /// CR 608.2k: when "it" names an earlier instruction's target, the kinds
-    /// census has no faithful reading, so the clause stays an honest
-    /// `DynamicQty` swallow naming its operand — never a census of the
-    /// source's own kinds.
+    /// census has no faithful reading, so the clause is an explicit gap —
+    /// never a census of the source's own kinds, and never a bare draw.
     #[test]
-    fn kinds_census_pronoun_after_a_targeted_instruction_is_an_honest_swallow() {
-        for text in [
-            "Whenever this creature attacks, put a +1/+1 counter on target creature, then \
-             draw a card for each kind of counter on it.",
-            "Put a +1/+1 counter on target creature. Draw a card for each kind of counter on \
-             it.",
+    fn kinds_census_pronoun_after_a_targeted_instruction_is_unimplemented() {
+        for (text, types) in [
+            (
+                "Whenever this creature attacks, put a +1/+1 counter on target creature, then \
+                 draw a card for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Put a +1/+1 counter on target creature. Draw a card for each kind of counter \
+                 on it.",
+                &["Sorcery"][..],
+            ),
         ] {
-            let parsed = parse_named(text, "Synthetic Census", &["Creature"]);
-            let warning = only_swallow(&parsed, "DynamicQty");
+            assert_kinds_census_gap(text, types, "counter_kinds_pronoun_antecedent");
+        }
+    }
+
+    /// CR 608.2k + CR 608.2h: the counter-kind census of "it" is read only for
+    /// the ability's own object. Every other antecedent — a pumped or damaged
+    /// target, a mass-pump recipient, a cost-paid object, a typed or attached
+    /// trigger subject, a cast spell, a created token, a host-less Aura — and
+    /// every per-object iteration is an explicit gap.
+    #[test]
+    fn kinds_census_pronoun_without_a_self_antecedent_is_unimplemented() {
+        const ANTECEDENT: &str = "counter_kinds_pronoun_antecedent";
+        const ITERATION: &str = "counter_kinds_pronoun_iteration";
+        for (text, types, gap) in [
+            // Object recipients: the pronoun names the pumped/damaged object.
+            (
+                "Target creature gets +1/+1 until end of turn for each kind of counter on it.",
+                &["Instant"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Test Card deals 1 damage to target creature for each kind of counter on it.",
+                &["Instant"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Whenever this creature attacks, target creature you control gets +1/+0 until \
+                 end of turn for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Whenever a creature you control attacks, target creature gets +1/+1 until end \
+                 of turn for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Whenever a creature you control becomes blocked, it gets +1/+1 until end of \
+                 turn for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Each creature you control gets +1/+1 until end of turn for each kind of \
+                 counter on it.",
+                &["Instant"][..],
+                ANTECEDENT,
+            ),
+            // A pump conjoined with a keyword grant reaches the granted-continuous
+            // route, whose static-only placeholder would read the SOURCE's kinds.
+            (
+                "Target creature gets +1/+1 for each kind of counter on it and gains trample \
+                 until end of turn.",
+                &["Instant"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Creatures you control get +1/+1 for each kind of counter on them and gain \
+                 trample until end of turn.",
+                &["Instant"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Target creature you control gets +1/+1 for each kind of counter on it until \
+                 end of turn and gains trample.",
+                &["Instant"][..],
+                ANTECEDENT,
+            ),
+            // Cost-paid objects: not a triggered ability's own object.
+            (
+                "{T}, Sacrifice another creature: Draw a card for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "{T}, Exile a creature card from your graveyard: Draw a card for each kind of \
+                 counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            // Per-object iterations: "it" is each iterated creature.
+            (
+                "At the beginning of your upkeep, for each creature you control, draw a card \
+                 for each kind of counter on it.",
+                &["Creature"][..],
+                ITERATION,
+            ),
+            (
+                "Whenever this creature attacks, for each creature you control, draw a card \
+                 for each kind of counter on it.",
+                &["Creature"][..],
+                ITERATION,
+            ),
+            // Trigger antecedents other than the ability's own object.
+            (
+                "Whenever a creature you control becomes the target of a spell an opponent \
+                 controls, draw a card for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Whenever a creature you control deals combat damage to a player, draw a card \
+                 for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Whenever another creature you control dies, draw a card for each kind of \
+                 counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Whenever you cast a creature spell, draw a card for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Whenever equipped creature deals combat damage to a player, draw a card for \
+                 each kind of counter on it.",
+                &["Artifact"][..],
+                ANTECEDENT,
+            ),
+            (
+                "Enchant creature\nAt the beginning of your upkeep, draw a card for each kind \
+                 of counter on it.",
+                &["Enchantment"][..],
+                ANTECEDENT,
+            ),
+            // A created token is the nearer antecedent.
+            (
+                "When this creature enters, create a 1/1 white Soldier creature token. Draw a \
+                 card for each kind of counter on it.",
+                &["Creature"][..],
+                ANTECEDENT,
+            ),
+        ] {
+            assert_kinds_census_gap(text, types, gap);
+        }
+    }
+
+    /// CR 118.12a + CR 608.2k: a combat tax whose census pronoun names each
+    /// affected creature (not the source permanent) gets no census reading;
+    /// the line stays an honest `DynamicQty` swallow naming the operand.
+    #[test]
+    fn kinds_census_pronoun_on_a_non_self_combat_tax_is_an_honest_swallow() {
+        for (text, types) in [
+            (
+                "Each creature with one or more counters on it can't attack you unless its \
+                 controller pays {1} for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Enchant creature\nEnchanted creature can't attack unless its controller pays \
+                 {1} for each kind of counter on it.",
+                &["Enchantment"][..],
+            ),
+        ] {
+            let parsed = parse_named(text, "Synthetic Census", types);
             assert_eq!(
-                warning.gap(),
-                Some(&ClauseGap::Quantity {
-                    operand: "kind of counter on it".to_string()
-                }),
-                "{text:?}: {warning:?}"
+                kinds_census_filters(&parsed),
+                Vec::<serde_json::Value>::new(),
+                "{text:?}"
+            );
+            // Reach guard: the swallow detector ran and named the dropped tail.
+            assert!(
+                has_swallowed_detector(&parsed, "DynamicQty"),
+                "{text:?}: {:?}",
+                parsed.parse_warnings
             );
         }
+    }
+
+    /// CR 608.2k + CR 608.2h: when the antecedent is positively the ability's
+    /// own object, the census reads that object (`SelfRef`): a self-referential
+    /// trigger (including Blitzball Stadium's granted one, verbatim), a self
+    /// dies trigger, a player-recipient life gain, and a self combat tax. The
+    /// non-pronoun census keeps its typed reading, and "double the number of
+    /// each kind of counter on it" is not the census grammar at all.
+    #[test]
+    fn kinds_census_pronoun_of_the_abilitys_own_object_is_read() {
+        let self_ref = serde_json::to_value(TargetFilter::SelfRef).unwrap();
+        for (text, types) in [
+            (
+                "Whenever this creature deals combat damage to a player, draw a card for each \
+                 kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "When this creature dies, draw a card for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Whenever this creature attacks, you gain 1 life for each kind of counter on it.",
+                &["Creature"][..],
+            ),
+            (
+                "Test Card can't attack or block unless you pay {1} for each kind of counter \
+                 on it.",
+                &["Creature"][..],
+            ),
+            (
+                "When this artifact enters, support X. (Put a +1/+1 counter on each of up to X \
+                 target creatures.)\nGo for the Goal! — {3}, {T}: Until end of turn, target \
+                 creature gains \"Whenever this creature deals combat damage to a player, draw \
+                 a card for each kind of counter on it\" and it can't be blocked this turn.",
+                &["Artifact"][..],
+            ),
+        ] {
+            let parsed = parse_named(text, "Test Card", types);
+            assert_eq!(
+                kinds_census_filters(&parsed),
+                vec![self_ref.clone()],
+                "{text:?}"
+            );
+            assert_eq!(
+                unimplemented_names(&parsed),
+                Vec::<String>::new(),
+                "{text:?}"
+            );
+        }
+
+        let typed = parse_named(
+            "Target creature gets +1/+1 until end of turn for each kind of counter on \
+             permanents you control.",
+            "Test Card",
+            &["Instant"],
+        );
+        // One census per pumped stat (power and toughness).
+        let permanents_you_control = serde_json::to_value(TargetFilter::Typed(
+            crate::types::ability::TypedFilter::permanent()
+                .controller(crate::types::ability::ControllerRef::You),
+        ))
+        .unwrap();
+        assert_eq!(
+            kinds_census_filters(&typed),
+            vec![permanents_you_control.clone(), permanents_you_control],
+        );
+        assert_eq!(unimplemented_names(&typed), Vec::<String>::new());
+
+        let doubling = parse_named(
+            "Whenever a modified creature you control attacks, double the number of each kind \
+             of counter on it.",
+            "Test Card",
+            &["Creature"],
+        );
+        assert_eq!(unimplemented_names(&doubling), Vec::<String>::new());
     }
 
     /// Chong and Lily, Nomads (second mode, standalone): the counter census

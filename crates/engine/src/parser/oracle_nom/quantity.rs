@@ -80,22 +80,14 @@ pub fn parse_for_each_clause_ref_complete(input: &str) -> OracleResult<'_, Quant
 /// (per-recipient anthem) or to the source (self-referential subject).
 ///
 /// The counter-kind census of a pronoun ("kind of counter on it/them") is
-/// accepted here only, as `DistinctCounterKindsAmong { filter: SelfRef }` — a
-/// placeholder the static binder (`bind_counter_anaphor_to_recipient`) keeps for
-/// a self-scoped static and rebinds to each affected object for a per-recipient
-/// one. Both pronoun numbers are accepted: a per-recipient static's "them"
-/// names each affected object in turn.
+/// declined here like everywhere else on this grammar: its only consumer, the
+/// combat-tax cost quantity, reads that census itself and only for a tax on the
+/// source permanent (`oracle_static::evasion::parse_combat_tax_body`). The
+/// static anthem / continuous route takes its own placeholder through
+/// `oracle_quantity::parse_for_each_clause_deferred`.
 pub fn parse_for_each_clause_ref_complete_deferred(input: &str) -> OracleResult<'_, QuantityRef> {
     let input = input.trim().trim_end_matches('.');
-    all_consuming(alt((
-        map(parse_counter_kinds_on_object_pronoun, |_| {
-            QuantityRef::DistinctCounterKindsAmong {
-                filter: TargetFilter::SelfRef,
-            }
-        }),
-        parse_for_each_clause_ref,
-    )))
-    .parse(input)
+    all_consuming(parse_for_each_clause_ref).parse(input)
 }
 
 /// CR 608.2k: Collapse an unbound deferred counter anaphor back to `Source`.
@@ -14234,12 +14226,11 @@ mod tests {
         }
     }
 
-    /// CR 608.2k: the counter-kind census of a pronoun has no context-free
-    /// reading — which object "it" names is the clause context's to decide —
-    /// so the context-free entry declines it, while the static-only deferred
-    /// entry keeps the `SelfRef` placeholder its binder resolves (both pronoun
-    /// numbers). The explicit self-reference keeps the type-phrase path, which
-    /// declines "~".
+    /// CR 608.2k: the counter-kind census of a pronoun has no reading on
+    /// either complete entry — which object "it" names is the clause context's
+    /// to decide — so both decline it (the combat-tax consumer of the deferred
+    /// entry reads a self tax's census itself). The explicit self-reference
+    /// keeps the type-phrase path, which declines "~".
     #[test]
     fn for_each_kind_of_counter_on_a_pronoun_is_bound_only_by_a_context() {
         // Reach guard: the non-pronoun census still parses on the same entry.
@@ -14256,15 +14247,9 @@ mod tests {
                 parse_for_each_clause_ref(text).is_err(),
                 "{text:?}: the type-phrase fallback must not reinterpret the pronoun"
             );
-            assert_eq!(
-                parse_for_each_clause_ref_complete_deferred(text),
-                Ok((
-                    "",
-                    QuantityRef::DistinctCounterKindsAmong {
-                        filter: TargetFilter::SelfRef,
-                    }
-                )),
-                "{text:?}: the static binder's placeholder"
+            assert!(
+                parse_for_each_clause_ref_complete_deferred(text).is_err(),
+                "{text:?}: the deferred entry has no antecedent either"
             );
         }
         assert!(parse_for_each_clause_ref_complete("kind of counter on ~").is_err());

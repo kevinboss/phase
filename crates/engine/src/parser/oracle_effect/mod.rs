@@ -10176,6 +10176,19 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     if counter_unless_payment_is_unsupported(text) {
         return parsed_unless_payment_unsupported_clause(text);
     }
+    // CR 608.2k + CR 608.2h: the single choke point for the counter-kind census
+    // of a pronoun ("for each kind of counter on it/them"). Only the for-each
+    // effect dispatch may read it — and only for the ability's own object — so
+    // no pump, mass pump, granted-continuous, or damage route ever sees the
+    // grammar; anything that dispatch cannot faithfully read is an explicit gap.
+    if super::oracle_quantity::has_kinds_pronoun_census_tail(text) {
+        return try_parse_for_each_effect(text, ctx).unwrap_or_else(|| {
+            parsed_clause(Effect::unimplemented(
+                "counter_kinds_pronoun_antecedent",
+                text,
+            ))
+        });
+    }
     // CR 102.2 + CR 102.3 + CR 608.2c: "For each opponent, choose [up to one]
     // <type> that player controls" — the controller chooses one permanent per
     // opponent (Ultimate Magic: Meteor). Lowers to `ChooseFromZone { zone_owner:
@@ -18089,6 +18102,9 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
     let for_each_clause = &tp.lower[for_each_idx + "for each ".len()..];
     let (base_no_duration, base_duration) = strip_trailing_duration(base_tp.original);
     let quantity_ctx = for_each_quantity_context(base_no_duration, ctx);
+    let numeric_base_storage = subject::strip_subject_clause(base_no_duration);
+    let numeric_base = numeric_base_storage.as_deref().unwrap_or(base_no_duration);
+    let numeric_base_lower = numeric_base.to_lowercase();
 
     // Parse the "for each" clause into a QuantityExpr. Try the full clause
     // before stripping duration-like suffixes: "this turn" is part of
@@ -18097,7 +18113,60 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
     let (for_each_no_duration, stripped_for_each_duration) =
         strip_trailing_duration(for_each_clause);
     let for_each_stripped = for_each_no_duration.trim_end_matches('.');
-    let (quantity, for_each_duration, reference_clause) = if let Some(quantity) =
+
+    // CR 608.2k + CR 608.2h: the counter-kind census of a pronoun ("for each
+    // kind of counter on it") is read only where its antecedent is positively
+    // the ability's own object (`kinds_census_pronoun_self_antecedent`) and the
+    // effect is a player-recipient numeric instruction, whose "it" can name no
+    // object but that one. Every other form — a plural pronoun, an object
+    // recipient (pump, damage), or any other antecedent — is an explicit gap,
+    // never a dropped "for each" that would leave the bare base count.
+    let kinds_census = [
+        (for_each_full, None),
+        (for_each_stripped, stripped_for_each_duration.clone()),
+    ]
+    .into_iter()
+    .find_map(|(clause, duration)| {
+        super::oracle_quantity::counter_kinds_pronoun_number(clause)
+            .map(|number| (number, duration, clause))
+    });
+    let census_quantity = match kinds_census {
+        None => None,
+        Some((number, census_duration, census_clause)) => {
+            let player_recipient =
+                imperative::parse_numeric_imperative_ast(numeric_base, &numeric_base_lower)
+                    .is_some_and(|ast| {
+                        matches!(
+                            ast,
+                            NumericImperativeAst::Draw { .. }
+                                | NumericImperativeAst::GainLife { .. }
+                                | NumericImperativeAst::LoseLife { .. }
+                                | NumericImperativeAst::Scry { .. }
+                                | NumericImperativeAst::Surveil { .. }
+                                | NumericImperativeAst::Mill { .. }
+                        )
+                    });
+            let antecedent = super::oracle_quantity::kinds_census_pronoun_self_antecedent(ctx);
+            match (number, player_recipient, antecedent) {
+                (AnaphorNumber::Singular, true, Some(filter)) => Some((
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::DistinctCounterKindsAmong { filter },
+                    },
+                    census_duration,
+                    census_clause,
+                )),
+                _ => {
+                    return Some(parsed_clause(Effect::unimplemented(
+                        "counter_kinds_pronoun_antecedent",
+                        text,
+                    )))
+                }
+            }
+        }
+    };
+    let (quantity, for_each_duration, reference_clause) = if let Some(census) = census_quantity {
+        census
+    } else if let Some(quantity) =
         parse_for_each_clause_expr_with_context(for_each_full, &quantity_ctx)
     {
         (quantity, None, for_each_full)
@@ -18114,9 +18183,6 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
     // → "gets +2/+0" with duration=UntilEndOfTurn). Duration often appears between
     // the base effect and the "for each" clause.
     let duration = base_duration.or(for_each_duration);
-    let numeric_base_storage = subject::strip_subject_clause(base_no_duration);
-    let numeric_base = numeric_base_storage.as_deref().unwrap_or(base_no_duration);
-    let numeric_base_lower = numeric_base.to_lowercase();
 
     if let Some(effect) = parse_energy_gain_base(&numeric_base_lower, quantity.clone()) {
         return Some(ParsedEffectClause {
@@ -41158,6 +41224,19 @@ fn parse_effect_chain_ir_body(
             unimplemented_clause(
                 &mut builder,
                 "where_x_binding",
+                normalized_text,
+                chunk.boundary_after,
+            );
+            continue;
+        }
+        // CR 608.2c + CR 608.2k: a "for each <object>, …" iteration whose body
+        // census reads "kind of counter on it/them" binds the pronoun to each
+        // iterated object, which a single-number `repeat_for` count cannot carry
+        // (and the body's own reading would bind the wrong object). Fail closed.
+        if repeat_for.is_some() && super::oracle_quantity::has_kinds_pronoun_census_tail(&text) {
+            unimplemented_clause(
+                &mut builder,
+                "counter_kinds_pronoun_iteration",
                 normalized_text,
                 chunk.boundary_after,
             );

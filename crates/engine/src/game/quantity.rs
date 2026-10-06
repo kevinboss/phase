@@ -7253,24 +7253,17 @@ pub(crate) fn distinct_counter_kinds_among(
     filter: &TargetFilter,
     filter_ctx: &FilterContext<'_>,
 ) -> Vec<CounterType> {
-    // CR 122.1 + CR 608.2k: a single named object — the object a bare "kind of
-    // counter on it" names (bound by the parser to the clause's antecedent), or
-    // the object choosing a kind of counter it doesn't have — is read through
-    // the same per-object counter authority as its counter COUNT
+    // CR 122.1 + CR 608.2k: the ability's own object — what a bare "kind of
+    // counter on it" names (the parser binds it only to that object), or the
+    // object choosing a kind of counter it doesn't have — is read through the
+    // same per-object counter authority as its counter COUNT
     // (`QuantityRef::CountersOn`, `read_counters_on_scope`), so the census and
     // the count always agree about which counter map the object contributes.
-    // CR 603.10a + CR 608.2h: an object that has left the battlefield ("When
-    // this creature dies, …", "Whenever another creature you control dies, …")
-    // still reports the kinds it had, from its departure record or last known
-    // information, rather than dropping out of a battlefield scan.
-    let single_object_scope = match filter {
-        TargetFilter::SelfRef => Some(ObjectScope::Source),
-        // CR 603.2: the object the trigger event names — the same scope the
-        // counter count reads for this antecedent.
-        TargetFilter::TriggeringSource => Some(ObjectScope::EventSource),
-        _ => None,
-    };
-    if let Some(scope) = single_object_scope {
+    // CR 603.10a + CR 608.2h: a source that has left the battlefield ("When
+    // this creature dies, …") still reports the kinds it had, from its
+    // departure record or last known information, rather than dropping out of
+    // a battlefield scan.
+    if matches!(filter, TargetFilter::SelfRef) {
         let ctx = QuantityContext {
             entering: None,
             source: filter_ctx.source_id,
@@ -7286,7 +7279,7 @@ pub(crate) fn distinct_counter_kinds_among(
             .map_or(&[][..], |ability| ability.targets.as_slice());
         let kinds = read_counters_on_scope(
             state,
-            scope,
+            ObjectScope::Source,
             ctx,
             targets,
             filter_ctx.ability,
@@ -11200,67 +11193,6 @@ mod tests {
         assert_eq!(
             distinct_counter_kinds_among(&state, &filter, &ctx),
             vec![CounterType::Lore, CounterType::Stun],
-        );
-    }
-
-    /// CR 122.1 + CR 603.2 + CR 608.2k: a census bound to the triggering
-    /// source counts the kinds on the object the trigger event names (the
-    /// damage dealer), read through the per-object counter authority — not the
-    /// listener's kinds, and not the event's recipient's.
-    #[test]
-    fn distinct_counter_kinds_among_triggering_source_reads_the_event_source() {
-        let mut state = GameState::new_two_player(42);
-        let listener = create_object(
-            &mut state,
-            CardId(1),
-            PlayerId(0),
-            "Listener".to_string(),
-            Zone::Battlefield,
-        );
-        let dealer = create_object(
-            &mut state,
-            CardId(2),
-            PlayerId(0),
-            "Dealer".to_string(),
-            Zone::Battlefield,
-        );
-        let recipient = create_object(
-            &mut state,
-            CardId(3),
-            PlayerId(1),
-            "Recipient".to_string(),
-            Zone::Battlefield,
-        );
-        for (id, kinds) in [
-            (
-                listener,
-                vec![CounterType::Lore, CounterType::Stun, CounterType::Loyalty],
-            ),
-            (dealer, vec![CounterType::Plus1Plus1, CounterType::Stun]),
-            (recipient, vec![CounterType::Lore]),
-        ] {
-            let counters = &mut state.objects.get_mut(&id).unwrap().counters;
-            for kind in kinds {
-                counters.insert(kind, 2);
-            }
-        }
-        state.current_trigger_event = Some(GameEvent::DamageDealt {
-            source_id: dealer,
-            target: TargetRef::Object(recipient),
-            amount: 1,
-            is_combat: true,
-            excess: 0,
-        });
-        let ctx = FilterContext::from_source_with_controller(listener, PlayerId(0));
-
-        assert_eq!(
-            distinct_counter_kinds_among(&state, &TargetFilter::TriggeringSource, &ctx),
-            vec![CounterType::Plus1Plus1, CounterType::Stun],
-        );
-        assert_eq!(
-            distinct_counter_kinds_among(&state, &TargetFilter::SelfRef, &ctx).len(),
-            3,
-            "reach guard: the listener's own census is its three kinds",
         );
     }
 

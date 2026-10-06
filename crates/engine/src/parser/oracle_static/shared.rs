@@ -891,8 +891,9 @@ impl GrantedCastKeywordKind {
 /// counter read, so a static that reads counters on `~` AND on its recipient
 /// keeps both referents: the explicit `Source` read is never touched. The
 /// counter-kind census of a pronoun ("for each kind of counter on it") reaches
-/// this pass as the `SelfRef` placeholder the static-only deferred entry emits,
-/// and is bound by the same pass (see `bind_anaphoric_counter_ref`).
+/// this pass as a `SelfRef` placeholder — from the anthem / continuous route's
+/// deferred entry, or from a combat tax on the source permanent itself — and is
+/// bound by the same pass (see `bind_anaphoric_counter_ref`).
 ///
 /// This is the quantity-axis twin of `StaticCondition::RecipientHasCounters`
 /// (the recipient analog of `HasCounters` on the condition axis) — the two
@@ -961,11 +962,13 @@ fn bind_anaphoric_counters_in_condition(cond: &mut StaticCondition, bound: Objec
 ///
 /// Two pronoun forms reach it. The counter COUNT ("for each +1/+1 counter on
 /// it") parks the pronoun on `ObjectScope::Anaphoric`. The counter-KIND census
-/// ("for each kind of counter on it/them") arrives as `SelfRef`, the placeholder
-/// the static-only deferred entries (`parse_for_each_clause_ref_complete_deferred`,
-/// `oracle_quantity::parse_for_each_clause_deferred`) emit for a pronoun of
-/// either number — the context-free entries decline the pronoun census, and an
-/// explicit "~" is declined by every census entry.
+/// ("for each kind of counter on it/them") arrives as `SelfRef`: the
+/// placeholder the anthem / continuous route's deferred entry
+/// (`oracle_quantity::parse_for_each_clause_deferred`) emits for a pronoun of
+/// either number, or a combat tax's census, which `parse_combat_tax_body` reads
+/// only for a tax on the source permanent itself (so it stays `SelfRef`). Every
+/// other entry declines the pronoun census, and an explicit "~" is declined by
+/// every census entry.
 ///
 /// CR 611.3a + CR 613.4c: a self-scoped static keeps `SelfRef` (the pronoun
 /// names the source). In a per-recipient static the pronoun names each affected

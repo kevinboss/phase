@@ -37355,31 +37355,20 @@ fn count_qualified_blocks_preserves_article_qualified_shapes() {
     }
 }
 
-/// CR 608.2k + CR 603.2: the counter-kind census of "it" in a trigger effect
-/// binds the antecedent the trigger condition selects. A trigger on another
-/// object ("a creature you control", "another creature you control") names
-/// that object — the triggering source — not the listener; a self-referential
-/// condition (Blitzball Stadium's granted "Whenever this creature deals combat
-/// damage to a player, draw a card for each kind of counter on it") names the
-/// ability's own object.
+/// CR 608.2k + CR 608.2h: the counter-kind census of "it" in a trigger whose
+/// condition names the ability's own object reads that object — Blitzball
+/// Stadium's granted "Whenever this creature deals combat damage to a player,
+/// draw a card for each kind of counter on it", and a self dies trigger.
 #[test]
-fn kinds_census_pronoun_in_a_trigger_binds_the_condition_antecedent() {
-    let census_count = |filter| QuantityExpr::Ref {
-        qty: QuantityRef::DistinctCounterKindsAmong { filter },
+fn kinds_census_pronoun_in_a_self_trigger_binds_the_abilitys_own_object() {
+    let census_count = QuantityExpr::Ref {
+        qty: QuantityRef::DistinctCounterKindsAmong {
+            filter: TargetFilter::SelfRef,
+        },
     };
-    for (text, expected) in [
-        (
-            "Whenever a creature you control deals combat damage to a player, draw a card for each kind of counter on it.",
-            TargetFilter::TriggeringSource,
-        ),
-        (
-            "Whenever another creature you control dies, draw a card for each kind of counter on it.",
-            TargetFilter::TriggeringSource,
-        ),
-        (
-            "Whenever this creature deals combat damage to a player, draw a card for each kind of counter on it",
-            TargetFilter::SelfRef,
-        ),
+    for text in [
+        "Whenever this creature deals combat damage to a player, draw a card for each kind of counter on it",
+        "When this creature dies, draw a card for each kind of counter on it.",
     ] {
         let trigger = parse_trigger_line(text, "Synthetic Census");
         let execute = trigger.execute.as_deref().expect("trigger body");
@@ -37387,6 +37376,31 @@ fn kinds_census_pronoun_in_a_trigger_binds_the_condition_antecedent() {
         let Effect::Draw { count, .. } = execute.effect.as_ref() else {
             panic!("{text:?}: expected a draw, got {:?}", execute.effect);
         };
-        assert_eq!(*count, census_count(expected), "{text:?}");
+        assert_eq!(*count, census_count, "{text:?}");
+    }
+}
+
+/// CR 608.2k + CR 603.2: a trigger on ANOTHER object ("a creature you
+/// control", "another creature you control", "equipped creature", a cast
+/// spell) names that object, which the census does not read — an explicit
+/// gap, never the listener's own kinds and never a bare one-card draw.
+#[test]
+fn kinds_census_pronoun_in_a_trigger_on_another_object_is_unimplemented() {
+    for text in [
+        "Whenever a creature you control deals combat damage to a player, draw a card for each kind of counter on it.",
+        "Whenever another creature you control dies, draw a card for each kind of counter on it.",
+        "Whenever equipped creature deals combat damage to a player, draw a card for each kind of counter on it.",
+        "Whenever you cast a creature spell, draw a card for each kind of counter on it.",
+    ] {
+        let trigger = parse_trigger_line(text, "Synthetic Census");
+        let execute = trigger.execute.as_deref().expect("trigger body");
+        assert!(
+            matches!(
+                execute.effect.as_ref(),
+                Effect::Unimplemented { name, .. } if name == "counter_kinds_pronoun_antecedent"
+            ),
+            "{text:?}: expected the antecedent gap, got {:?}",
+            execute.effect
+        );
     }
 }
