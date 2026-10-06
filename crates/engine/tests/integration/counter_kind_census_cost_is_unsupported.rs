@@ -92,7 +92,7 @@ fn spell_cost_scaled_by_an_unbound_counter_kind_census_is_unsupported() {
 #[test]
 fn pay_life_scaled_by_an_unbound_counter_kind_census_is_unsupported() {
     let control = face(
-        "Pay Life Control",
+        "Census Life Control",
         "{T}, Pay 1 life for each card in your hand: Draw a card.",
         &[],
     );
