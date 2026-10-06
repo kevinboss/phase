@@ -7256,9 +7256,14 @@ pub(crate) fn distinct_counter_kinds_among(
     // CR 122.1 + CR 608.2k: the ability's own object — what a bare "kind of
     // counter on it" names (the parser binds it only to that object), or the
     // object choosing a kind of counter it doesn't have — is read through the
-    // same per-object counter authority as its counter COUNT
-    // (`QuantityRef::CountersOn`, `read_counters_on_scope`), so the census and
-    // the count always agree about which counter map the object contributes.
+    // same per-object reader as its counter COUNT (`read_counters_on_scope` at
+    // `ObjectScope::Source`, as `QuantityRef::CountersOn` reads it), so a census
+    // and a count read at the same moment see the same counter map. They are
+    // not read at the same moment everywhere: a delayed trigger freezes its
+    // count at creation (`snapshot_quantity_ref`) but takes no census
+    // snapshot, so the parser accepts the census only where this read is the
+    // ability's own object at that ability's own resolution — never in a
+    // delayed-trigger body (`ParseContext::enter_delayed_trigger_body`).
     // CR 603.10a + CR 608.2h: a source that has left the battlefield ("When
     // this creature dies, …") still reports the kinds it had, from its
     // departure record or last known information, rather than dropping out of

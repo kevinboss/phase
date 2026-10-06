@@ -42436,6 +42436,9 @@ fn parse_effect_chain_ir_body(
         });
         if let Some(prefix_condition) = prefix_delayed {
             let (inner_text, inner_multi_target) = strip_any_number_quantifier(text_after_prefix);
+            // CR 603.7: the inner chain is the body of a delayed triggered
+            // ability that resolves later, on its own trigger event.
+            ctx.enter_delayed_trigger_body();
             let inner_ir = parse_effect_chain_ir(&inner_text, kind, ctx);
             let mut inner_def = lower_effect_chain_ir(&inner_ir);
             if let Some(spec) = inner_multi_target {
@@ -42600,6 +42603,11 @@ fn parse_effect_chain_ir_body(
         }
 
         let (text_no_temporal, delayed_condition) = strip_temporal_suffix(&text);
+        if delayed_condition.is_some() {
+            // CR 603.7: assembly wraps this clause in `CreateDelayedTrigger`, so
+            // it is the body of a delayed triggered ability that resolves later.
+            ctx.enter_delayed_trigger_body();
+        }
         let (text_no_qty, mut multi_target) = strip_any_number_quantifier(text_no_temporal);
         let retained_type_clause = {
             let lower = text_no_qty.to_lowercase();

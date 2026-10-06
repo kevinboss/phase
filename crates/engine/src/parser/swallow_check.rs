@@ -6763,6 +6763,42 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         }
     }
 
+    /// CR 603.7 + CR 122.2 + CR 608.2h: a census inside the body of a delayed
+    /// triggered ability is read when that ability resolves, by which time a
+    /// source that left the battlefield is a new object with no counters and its
+    /// last-known information is gone — so the census of "it" has no faithful
+    /// reading there and the clause is an explicit gap, whether the delay is a
+    /// leading or a trailing phrase. The `CreateDelayedTrigger` wrapper itself
+    /// still parses (reach guard).
+    #[test]
+    fn kinds_census_pronoun_in_a_delayed_trigger_body_is_unimplemented() {
+        for text in [
+            "When this creature dies, at the beginning of the next end step, draw a card for \
+             each kind of counter on it.",
+            "When this creature leaves the battlefield, at the beginning of the next end step, \
+             draw a card for each kind of counter on it.",
+            "When this creature is exiled, at the beginning of the next end step, draw a card \
+             for each kind of counter on it.",
+            "When this creature dies, at the beginning of your next upkeep, draw a card for \
+             each kind of counter on it.",
+            "When this creature dies, draw a card for each kind of counter on it at the \
+             beginning of the next end step.",
+            "When this creature dies, you gain 1 life for each kind of counter on it at the \
+             beginning of your next upkeep.",
+            // The source stays on the battlefield here, but the delayed body is
+            // still not the enclosing trigger's own resolution; it fails closed.
+            "When this creature enters, at the beginning of the next end step, draw a card for \
+             each kind of counter on it.",
+        ] {
+            assert_kinds_census_gap(text, &["Creature"], "counter_kinds_pronoun_antecedent");
+            let parsed = parse_named(text, "Synthetic Census", &["Creature"]);
+            assert!(
+                parse_has_type(&parsed, "CreateDelayedTrigger"),
+                "{text:?}: reach guard — the delayed trigger itself parsed"
+            );
+        }
+    }
+
     /// CR 603.1 + CR 608.2k + CR 109.1: when a self trigger's condition also
     /// names a second object, "it" could be either object, so the census gets
     /// no reading and the clause is an explicit gap. That holds whether the

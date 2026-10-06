@@ -184,7 +184,9 @@ impl TriggerZoneChangeProvenance {
 /// consumers must match `SourceOnly` EXPLICITLY — every other value fails
 /// closed. Ordinary `Clone` preserves it (the same body continues);
 /// [`ParseContext::clone_for_independent_body`] resets it, because a reflexive
-/// or nested body has its own trigger event that this value does not describe.
+/// or nested body has its own trigger event that this value does not describe,
+/// and [`ParseContext::enter_delayed_trigger_body`] resets it for the same
+/// reason in the body of a delayed triggered ability the chain creates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum TriggerConditionObjects {
     /// No enclosing trigger condition was classified for this parse.
@@ -820,6 +822,22 @@ impl ParseContext {
         }
     }
 
+    /// CR 603.7 + CR 608.2h: enter the body of a DELAYED triggered ability the
+    /// chain creates ("at the beginning of the next end step, …", "… at the
+    /// beginning of your next upkeep").
+    ///
+    /// The delayed ability resolves later, on its own trigger event, so the
+    /// enclosing trigger's condition classification no longer describes what
+    /// the body's "it" names — and by then a source that left the battlefield
+    /// is a new object (CR 400.7) whose counters ceased to exist (CR 122.2).
+    /// Resetting the classification to `Unestablished` makes every consumer
+    /// that requires `SourceOnly` (the kinds-census pronoun gate) fail closed
+    /// in the body. In place rather than a clone: the delayed body is parsed on
+    /// the chunk's own context, whose other state that chunk keeps.
+    pub fn enter_delayed_trigger_body(&mut self) {
+        self.trigger_condition_objects = TriggerConditionObjects::Unestablished;
+    }
+
     /// Execute `f` with a temporary relative-player scope, restoring the prior
     /// value on return. Replaces thread-local ScopeGuard RAII pattern.
     #[allow(dead_code)] // Available for nested-scope uses (e.g., nested triggers).
@@ -965,6 +983,13 @@ mod tests {
         assert_eq!(
             ctx.trigger_condition_objects,
             TriggerConditionObjects::SourceOnly
+        );
+        // CR 603.7: a delayed body resolves on its own later trigger event.
+        let mut delayed_body = ctx.clone();
+        delayed_body.enter_delayed_trigger_body();
+        assert_eq!(
+            delayed_body.trigger_condition_objects,
+            TriggerConditionObjects::Unestablished
         );
     }
 }

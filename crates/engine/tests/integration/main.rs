@@ -199,6 +199,7 @@ mod counter_anaphor_binds_to_recipient;
 mod counter_anaphor_created_token_binding;
 mod counter_double_redirect_choice;
 mod counter_kind_census_cost_is_unsupported;
+mod counter_kind_census_on_another_object_is_unsupported;
 mod counter_quantity_object_forms;
 mod counter_recipient_exact_count;
 mod counter_rider_tail_8762;
