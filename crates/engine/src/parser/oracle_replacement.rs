@@ -4283,9 +4283,7 @@ fn parse_enters_with_counters(
             // overrides below replace the count wholesale, so composed with a
             // per-each tail they would drop it. Decline the whole replacement
             // instead.
-            if nom_primitives::split_once_on(work_text, "equal to ").is_ok()
-                || nom_primitives::split_once_on(work_text, ", where x is ").is_ok()
-            {
+            if enters_counter_amount_override_present(work_text) {
                 return None;
             }
             count_expr = match (tail, count_expr) {
@@ -4336,6 +4334,19 @@ fn parse_enters_with_counters(
             return None;
         }
         None => {}
+    }
+    // CR 107.3 + CR 614.1c: the "equal to" / "where X is" overrides below
+    // rewrite only the single-counter `count_expr`; a conjoined counter list
+    // publishes its own entries, so a dynamic entry would keep its bare
+    // `CostXPaid` and the override's quantity would be silently dropped. The
+    // list has no per-entry binding for the override, so decline the whole
+    // replacement. A fixed-only list is unaffected.
+    if counter_entries
+        .as_deref()
+        .is_some_and(counter_entries_have_dynamic_count)
+        && enters_counter_amount_override_present(work_text)
+    {
+        return None;
     }
     // CR 122.6: For "a number of counters equal to [quantity]" and the
     // sibling shorthand "counters on it equal to [quantity]", parse the
@@ -5082,14 +5093,25 @@ fn enters_counter_amount_is_dynamic(
     count_expr: &QuantityExpr,
     counter_entries: Option<&[(CounterType, QuantityExpr)]>,
 ) -> bool {
-    std::iter::once(count_expr)
-        .chain(
-            counter_entries
-                .into_iter()
-                .flatten()
-                .map(|(_, count)| count),
-        )
-        .any(|count| !matches!(count, QuantityExpr::Fixed { .. }))
+    !matches!(count_expr, QuantityExpr::Fixed { .. })
+        || counter_entries.is_some_and(counter_entries_have_dynamic_count)
+}
+
+/// Whether any element of a conjoined counter list places a dynamic number of
+/// counters.
+fn counter_entries_have_dynamic_count(entries: &[(CounterType, QuantityExpr)]) -> bool {
+    entries
+        .iter()
+        .any(|(_, count)| !matches!(count, QuantityExpr::Fixed { .. }))
+}
+
+/// CR 107.3 + CR 614.1c: Whether the clause carries an amount override — an
+/// "equal to <quantity>" count or a ", where X is <quantity>" definition —
+/// that `parse_enters_with_counters` applies to the single-counter count
+/// wholesale.
+fn enters_counter_amount_override_present(work_text: &str) -> bool {
+    nom_primitives::split_once_on(work_text, "equal to ").is_ok()
+        || nom_primitives::split_once_on(work_text, ", where x is ").is_ok()
 }
 
 /// CR 107.3: The text before a trailing ", where X is …" clause. That clause
@@ -5110,14 +5132,14 @@ fn enters_counter_sentence_has_per_each_connective(after_counter: &str) -> bool 
     nom_primitives::scan_at_word_boundaries(sentence, parse_enters_per_each_connective).is_some()
 }
 
-/// CR 614.1c + CR 614.12: Parse the " counter[s] on <pronoun> for each
-/// <filter>[ and <N> <kind> counter[s] on <pronoun> for each <filter>]…" tail
-/// of an enters-with clause. Every conjunct must name `base_type` — a conjunct
-/// placing a different kind of counter is a separate placement this count
-/// cannot express, so this parser returns `None`. `parse_enters_with_counters`
-/// then declines the whole replacement when the leading amount is dynamic;
-/// a fixed leading amount keeps its count, and the `DynamicQty` swallow
-/// detector surfaces the unread tail.
+/// CR 614.1c + CR 614.12: Parse the "[s] on <pronoun> for each <filter>[ and
+/// <N> <kind> counter[s] on <pronoun> for each <filter>]…" tail of an
+/// enters-with clause (the slice after its "<type> counter" token). Every
+/// conjunct must name `base_type` — a conjunct placing a different kind of
+/// counter is a separate placement this count cannot express, so this parser
+/// returns `None`. `parse_enters_with_counters` then declines the whole
+/// replacement when the leading amount is dynamic; a fixed leading amount keeps
+/// its count, and the `DynamicQty` swallow detector surfaces the unread tail.
 fn parse_enters_counter_for_each_suffix(
     after_counter: &str,
     base_type: &CounterType,

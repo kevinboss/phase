@@ -11,8 +11,11 @@
 //! Controls, per test:
 //! * the further-conjunct and single-clause tests pair the dynamic line with a
 //!   fixed amount over the same populations that stays represented — exact
-//!   count shape, no coverage gap, no swallowed clause; the further-conjunct
-//!   control (`FIXED_COMPOUND`) also places its counters at runtime;
+//!   count shape, no coverage gap, no gap-producing parse warning; the
+//!   further-conjunct control (`FIXED_COMPOUND`) also places its counters at
+//!   runtime;
+//! * the amount-override counter-list test pairs its dynamic lines with a
+//!   represented fixed counter list (exact placements);
 //! * the mixed-kind, other-kind-bonus, counter-list and unread-connective tests
 //!   pair it with a fixed amount over the same text whose dropped tail the
 //!   `DynamicQty` swallow detector surfaces — honest, but not represented;
@@ -29,11 +32,17 @@
 //! that surfaces the unread tail behind a FIXED amount cannot see it, and the
 //! replacement must decline instead.
 //!
+//! A conjoined counter list with a dynamic element and an amount override
+//! ("…, where X is …" / "… equal to …") is declined too: the override rewrites
+//! only the single-counter count, so the list would publish its element's bare
+//! `CostXPaid` with the override's quantity dropped.
+//!
 //! Unsupported is shown through the public coverage authority
 //! (`card_face_gaps`, via `assert_unsupported`) — except where the declined
 //! line falls through to the effect parser's verb-less for-each put-counter
-//! arm (issue #9659: an X base plus an additional counter of another kind, an
-//! X counter list, a comma before "plus"). There no enters-with replacement is
+//! arm (issue #9659: an X base plus an additional counter of another kind, a
+//! counter list led by an X amount, a comma before "plus"). There no
+//! enters-with replacement is
 //! published and the line is surfaced by the `Replacement` swallow detector,
 //! which whole-card coverage reads (`assert_declined_to_replacement_swallow`).
 //!
@@ -139,15 +148,16 @@ fn enters_with_placements(face: &CardFace) -> Vec<(CounterType, QuantityExpr)> {
 }
 
 /// Assert the face is represented: no coverage gap from `card_face_gaps` AND no
-/// swallowed clause — whole-card coverage also reads `parse_warnings`, which
-/// `card_face_gaps` ignores.
+/// gap-producing parse warning. Whole-card coverage also reads
+/// `parse_warnings`, which `card_face_gaps` ignores, and turns every
+/// `SwallowedClause`, `TargetFallback`, and `CascadeLoss` into a gap
+/// (`parse_warning_gap_label`); only `IgnoredRemainder` produces none.
 fn assert_represented(face: &CardFace) {
     assert_eq!(card_face_gaps(face), Vec::<String>::new(), "{}", face.name);
     assert!(
-        !face
-            .parse_warnings
+        face.parse_warnings
             .iter()
-            .any(|warning| matches!(warning, OracleDiagnostic::SwallowedClause { .. })),
+            .all(|warning| matches!(warning, OracleDiagnostic::IgnoredRemainder { .. })),
         "{}: {:?}",
         face.name,
         face.parse_warnings
@@ -484,6 +494,43 @@ fn dynamic_amount_with_an_unread_per_each_connective_is_declined() {
 
         assert_declined(dynamic);
     }
+}
+
+/// CR 107.3 + CR 614.1c: a conjoined counter list with a dynamic element and an
+/// amount override — a ", where X is …" definition or an "equal to …" count —
+/// is unsupported: the override binds only the single-counter count, so the
+/// list would publish the element's bare `CostXPaid` and drop the override's
+/// quantity. A fixed counter list is the represented control.
+#[test]
+fn dynamic_counter_list_with_an_amount_override_is_unsupported() {
+    let control = face(
+        "Fixed Hellion",
+        "This creature enters with a +1/+1 counter and two charge counters on it.",
+    );
+    assert_eq!(
+        enters_with_placements(&control),
+        vec![
+            (CounterType::Plus1Plus1, QuantityExpr::Fixed { value: 1 }),
+            (
+                CounterType::Generic("charge".to_string()),
+                QuantityExpr::Fixed { value: 2 },
+            ),
+        ]
+    );
+    assert_represented(&control);
+
+    assert_unsupported(
+        "This creature enters with a +1/+1 counter and X charge counters on it, where X is the \
+         number of creatures you control.",
+    );
+    assert_unsupported(
+        "This creature enters with X +1/+1 counters and a charge counter on it, where X is the \
+         number of creatures you control.",
+    );
+    assert_unsupported(
+        "This creature enters with a +1/+1 counter and X charge counters on it equal to the \
+         number of creatures you control.",
+    );
 }
 
 /// CR 107.3 + CR 614.1c: an X defined by a trailing "where X is" clause is
