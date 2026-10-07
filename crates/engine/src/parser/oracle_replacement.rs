@@ -5105,10 +5105,9 @@ fn counter_entries_have_dynamic_count(entries: &[(CounterType, QuantityExpr)]) -
         .any(|(_, count)| !matches!(count, QuantityExpr::Fixed { .. }))
 }
 
-/// CR 107.3 + CR 614.1c: Whether the clause carries an amount override — an
-/// "equal to <quantity>" count or a ", where X is <quantity>" definition —
-/// that `parse_enters_with_counters` applies to the single-counter count
-/// wholesale.
+/// Whether the clause carries an amount override — an "equal to <quantity>"
+/// count or a ", where X is <quantity>" definition — that
+/// `parse_enters_with_counters` applies to the single-counter count wholesale.
 fn enters_counter_amount_override_present(work_text: &str) -> bool {
     nom_primitives::split_once_on(work_text, "equal to ").is_ok()
         || nom_primitives::split_once_on(work_text, ", where x is ").is_ok()
