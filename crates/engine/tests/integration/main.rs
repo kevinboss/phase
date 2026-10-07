@@ -338,6 +338,7 @@ mod emrakul_control_turn_crash;
 #[cfg(feature = "proptest")]
 mod engine_invariants;
 mod enlightened_tutor_regression;
+mod enters_with_dynamic_leading_amount_per_each;
 mod equipment_attach_event_context;
 mod equipment_etb_attach_parent_target;
 mod erratic_mutation;

@@ -4275,20 +4275,43 @@ fn parse_enters_with_counters(
     let counter_type_raw = counter_type_raw.trim();
     let counter_type =
         crate::parser::oracle_effect::counter::normalize_counter_type(counter_type_raw);
-    if let Some(combined) =
-        parse_enters_base_plus_additional_for_each(after_counter, &counter_type, &count_expr)
-    {
-        count_expr = combined;
-    } else if let Some(terms) = parse_enters_counter_for_each_suffix(after_counter, &counter_type) {
-        let first = multiply_counter_count_by_for_each(count_expr, terms.first);
-        // CR 614.1c + CR 122.1: each 'for each' conjunct places its own counters;
-        // an object matching both is counted by both (Ulasht ruling).
-        count_expr = if terms.extra.is_empty() {
-            first
-        } else {
-            QuantityExpr::Sum {
-                exprs: std::iter::once(first).chain(terms.extra).collect(),
+    // CR 107.3: a trailing ", where X is …" clause defines X; it is not part of
+    // the per-each tail, so the tail is read from the text before it.
+    let tail_text = nom_primitives::split_once_on(after_counter, ", where x is ")
+        .map_or(after_counter, |(_, (before, _))| before);
+    if let Some(tail) = parse_enters_per_each_tail(tail_text, &counter_type) {
+        // CR 107.3 + CR 614.1c: the "equal to" / "where X is" amount overrides
+        // below replace the count wholesale, so composed with a per-each tail
+        // they would drop it. Decline the whole replacement instead.
+        if nom_primitives::split_once_on(work_text, "equal to ").is_ok()
+            || nom_primitives::split_once_on(work_text, ", where x is ").is_ok()
+        {
+            return None;
+        }
+        count_expr = match (tail, count_expr) {
+            (EntersPerEachTail::ForEach(terms), QuantityExpr::Fixed { value: leading }) => {
+                terms.total(leading)
             }
+            // CR 107.1 + CR 614.1c: "<amount> counters on it for each <filter>"
+            // places the leading amount once per object, so the total is the
+            // product of the amount and a game-state count. `QuantityExpr` scales
+            // only by a constant (`Multiply { factor: i32 }`), so a dynamic
+            // amount ("X", "twice X", "that many") has no faithful encoding.
+            // Decline the WHOLE replacement here, before any count is
+            // published: the line surfaces as an unsupported gap, never as a
+            // supported count that drops the amount (X=3 over two other red and
+            // one other green creature is 3×2+1=7, never 2+1).
+            (EntersPerEachTail::ForEach(_), _) => return None,
+            // CR 107.1 + CR 122.1: under "plus an additional … for each" the
+            // leading amount is an addend placed once, so a dynamic base still
+            // composes faithfully as a sum.
+            (
+                EntersPerEachTail::BasePlusAdditional {
+                    multiplier,
+                    per_each,
+                },
+                base,
+            ) => base_plus_additional_total(base, multiplier, per_each),
         };
     }
     // CR 122.6: For "a number of counters equal to [quantity]" and the
@@ -4762,17 +4785,18 @@ fn parse_enters_with_where_x_suffix(text: &str) -> Option<QuantityExpr> {
     crate::parser::oracle_quantity::parse_event_context_quantity(trimmed)
 }
 
-fn multiply_counter_count_by_for_each(
-    count_expr: QuantityExpr,
-    for_each_count: QuantityExpr,
-) -> QuantityExpr {
-    match count_expr {
-        QuantityExpr::Fixed { value: 1 } => for_each_count,
-        QuantityExpr::Fixed { value } => QuantityExpr::Multiply {
-            factor: value,
+/// Scale a per-each count by a constant number of counters per object. The
+/// factor is an integer by construction: `parse_enters_with_counters` declines a
+/// dynamic per-object amount before anything is scaled, so no amount is ever
+/// dropped here.
+fn scale_for_each_count(factor: i32, for_each_count: QuantityExpr) -> QuantityExpr {
+    if factor == 1 {
+        for_each_count
+    } else {
+        QuantityExpr::Multiply {
+            factor,
             inner: Box::new(for_each_count),
-        },
-        _ => for_each_count,
+        }
     }
 }
 
@@ -5033,10 +5057,7 @@ fn parse_enters_for_each_conjuncts(
     }
     let first = parse_enters_for_each_clause(before)?;
     let (next, mut extra) = parse_enters_for_each_conjuncts(after, base_type)?;
-    extra.insert(
-        0,
-        multiply_counter_count_by_for_each(QuantityExpr::Fixed { value: count }, next),
-    );
+    extra.insert(0, scale_for_each_count(count, next));
     Some((first, extra))
 }
 
@@ -5074,34 +5095,102 @@ fn parse_enters_for_each_clause(text: &str) -> Option<QuantityExpr> {
     super::oracle_quantity::parse_for_each_clause_expr(clause)
 }
 
+/// The per-each tail of an enters-with counter clause, read independently of
+/// the clause's leading amount. `parse_enters_with_counters` combines the two,
+/// declining a dynamic amount wherever it would be a factor.
+enum EntersPerEachTail {
+    /// "… counter[s] on <pronoun> for each <filter>[ and <N> <kind> counter[s]
+    /// on <pronoun> for each <filter>]…": the leading amount is the number of
+    /// counters per object of the first clause.
+    ForEach(EntersForEachTerms),
+    /// "… counter[s] on <pronoun> plus <an|M> additional <kind> counter[s] on
+    /// <pronoun> for each <filter>": the leading amount is a base placed once,
+    /// plus `multiplier` counters per object.
+    BasePlusAdditional {
+        multiplier: i32,
+        per_each: QuantityExpr,
+    },
+}
+
+impl EntersForEachTerms {
+    /// CR 107.1 + CR 122.1: the total counters placed for a fixed number of
+    /// counters per object of the first clause — `leading × first + Σ
+    /// conjuncts`. Each 'for each' conjunct places its own counters, so an
+    /// object matching both is counted by both (Ulasht ruling).
+    fn total(self, leading: i32) -> QuantityExpr {
+        let first = scale_for_each_count(leading, self.first);
+        if self.extra.is_empty() {
+            first
+        } else {
+            QuantityExpr::Sum {
+                exprs: std::iter::once(first).chain(self.extra).collect(),
+            }
+        }
+    }
+}
+
+/// CR 107.1 + CR 122.1: `base + multiplier × per_each` for the "plus an
+/// additional … for each" tail. A fixed base folds into an `Offset`; a dynamic
+/// base (an addend, never a factor) is summed.
+fn base_plus_additional_total(
+    base: QuantityExpr,
+    multiplier: i32,
+    per_each: QuantityExpr,
+) -> QuantityExpr {
+    let inner = scale_for_each_count(multiplier, per_each);
+    match base {
+        QuantityExpr::Fixed { value: 0 } => inner,
+        QuantityExpr::Fixed { value: offset } => QuantityExpr::Offset {
+            inner: Box::new(inner),
+            offset,
+        },
+        base => QuantityExpr::Sum {
+            exprs: vec![base, inner],
+        },
+    }
+}
+
+/// CR 614.1c: Read the per-each tail following the FIRST "<type> counter" token
+/// of an enters-with clause, in either shape. `None` means the clause has no
+/// per-each tail this grammar reads.
+fn parse_enters_per_each_tail(
+    after_counter: &str,
+    counter_type: &CounterType,
+) -> Option<EntersPerEachTail> {
+    parse_enters_base_plus_additional_for_each(after_counter, counter_type)
+        .map(
+            |(multiplier, per_each)| EntersPerEachTail::BasePlusAdditional {
+                multiplier,
+                per_each,
+            },
+        )
+        .or_else(|| {
+            parse_enters_counter_for_each_suffix(after_counter, counter_type)
+                .map(EntersPerEachTail::ForEach)
+        })
+}
+
 /// Parse the "<type> counter[s] on it/them plus an additional <M> <type>
-/// counter[s] on it/them for each <filter>" enters-with pattern into the total
-/// count expression (base + M × per-each dynamic count).
+/// counter[s] on it/them for each <filter>" enters-with tail into its per-each
+/// multiplier M and per-each dynamic count; the base is the clause's leading
+/// amount, composed by [`base_plus_additional_total`].
 ///
 /// CR 122.1 + CR 614.1c: an "enters with N counters plus an additional counter
-/// for each <filter>" replacement places a fixed base plus a per-object bonus.
+/// for each <filter>" replacement places a base plus a per-object bonus.
 /// CR 107.1: only integer amounts — the total resolves as `base + M * count`.
 ///
 /// `after_counter` is the slice immediately after the FIRST "<type> counter"
 /// token (same contract as [`parse_enters_counter_for_each_suffix`], which the
 /// tail is delegated to so " counter" is consumed exactly once). Parameterized
-/// over the base N (`base_count_expr`), the per-each multiplier M, and the
-/// `for each` filter. The additional counter type must equal the base type;
-/// otherwise the two clauses name different counters and this pattern does not
-/// apply (caller falls back). Returns `None` (not this pattern) when any token
-/// fails to match, so a non-matching input leaves the caller's existing
-/// single-suffix path intact.
+/// over the per-each multiplier M and the `for each` filter; the base is
+/// supplied by the caller. The additional counter type must equal the base
+/// type; otherwise the two clauses name different counters and this pattern
+/// does not apply. Returns `None` (not this pattern) when any token fails to
+/// match, so a non-matching input leaves the single-suffix shape to be tried.
 fn parse_enters_base_plus_additional_for_each(
     after_counter: &str,
     base_counter_type: &CounterType,
-    base_count_expr: &QuantityExpr,
-) -> Option<QuantityExpr> {
-    // The base only composes as a fixed integer offset; a dynamic base does not
-    // occur in this "base plus additional per-each" class.
-    let QuantityExpr::Fixed { value: base } = base_count_expr else {
-        return None;
-    };
-
+) -> Option<(i32, QuantityExpr)> {
     // Consume the optional plural "s" of the base counter word, then the base
     // recipient (any pronoun in `nom_primitives::parse_object_recipient_pronoun`)
     // and the " plus " bridge to the additional clause.
@@ -5118,8 +5207,11 @@ fn parse_enters_base_plus_additional_for_each(
 
     // Per-each multiplier M: "an additional" (M = 1) or "<N> additional" (M > 1).
     let (rest, multiplier) = alt((
-        value(1u32, tag::<_, _, OracleError<'_>>("an additional ")),
-        terminated(nom_primitives::parse_number, tag(" additional ")),
+        value(1, tag::<_, _, OracleError<'_>>("an additional ")),
+        map_opt(
+            terminated(nom_primitives::parse_number, tag(" additional ")),
+            |n| i32::try_from(n).ok(),
+        ),
     ))
     .parse(rest)
     .ok()?;
@@ -5144,25 +5236,7 @@ fn parse_enters_base_plus_additional_for_each(
     if !per_each.extra.is_empty() {
         return None;
     }
-    let per_each = per_each.first;
-
-    let inner = if multiplier == 1 {
-        per_each
-    } else {
-        QuantityExpr::Multiply {
-            factor: multiplier as i32,
-            inner: Box::new(per_each),
-        }
-    };
-
-    Some(if *base == 0 {
-        inner
-    } else {
-        QuantityExpr::Offset {
-            inner: Box::new(inner),
-            offset: *base,
-        }
-    })
+    Some((multiplier, per_each.first))
 }
 
 fn parse_for_each_convoked_creature_clause(
@@ -14836,8 +14910,14 @@ mod tests {
         let matching = super::parse_enters_base_plus_additional_for_each(
             " on it plus an additional +1/+1 counter on it for each artifact you control.",
             &CounterType::Plus1Plus1,
-            &QuantityExpr::Fixed { value: 1 },
-        );
+        )
+        .map(|(multiplier, per_each)| {
+            super::base_plus_additional_total(
+                QuantityExpr::Fixed { value: 1 },
+                multiplier,
+                per_each,
+            )
+        });
         assert!(
             matches!(matching, Some(QuantityExpr::Offset { offset: 1, .. })),
             "matching counter types compose to Offset, got {matching:?}"
@@ -14846,8 +14926,14 @@ mod tests {
         let mismatched = super::parse_enters_base_plus_additional_for_each(
             " on it plus an additional stun counter on it for each artifact you control.",
             &CounterType::Plus1Plus1,
-            &QuantityExpr::Fixed { value: 1 },
-        );
+        )
+        .map(|(multiplier, per_each)| {
+            super::base_plus_additional_total(
+                QuantityExpr::Fixed { value: 1 },
+                multiplier,
+                per_each,
+            )
+        });
         assert_eq!(
             mismatched, None,
             "a mismatched additional counter type must not compose"
@@ -14863,8 +14949,14 @@ mod tests {
             " on it plus an additional +1/+1 counter on it for each artifact you control \
              and a +1/+1 counter on it for each enchantment you control.",
             &CounterType::Plus1Plus1,
-            &QuantityExpr::Fixed { value: 1 },
-        );
+        )
+        .map(|(multiplier, per_each)| {
+            super::base_plus_additional_total(
+                QuantityExpr::Fixed { value: 1 },
+                multiplier,
+                per_each,
+            )
+        });
         assert_eq!(
             conjoined, None,
             "a second per-each conjunct must not be silently dropped"
