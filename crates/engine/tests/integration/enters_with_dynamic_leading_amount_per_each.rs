@@ -6,9 +6,19 @@
 //! quantities (`Multiply` scales by a constant factor). The whole replacement
 //! is declined; it never becomes a supported count that drops the leading
 //! amount (X=3 over two other red and one other green creature must be
-//! 3×2+1=7, never 2+1). Each case is paired with a fixed leading amount over
-//! the same populations, which stays represented with no gap and places its
-//! counters at runtime.
+//! 3×2+1=7, never 2+1).
+//!
+//! Controls, per test:
+//! * the further-conjunct and single-clause tests pair the dynamic line with a
+//!   fixed amount over the same populations that stays represented — exact
+//!   count shape, no coverage gap, no swallowed clause; the further-conjunct
+//!   control (`FIXED_COMPOUND`) also places its counters at runtime;
+//! * the mixed-kind, other-kind-bonus, counter-list and unread-connective tests
+//!   pair it with a fixed amount over the same text whose dropped tail the
+//!   `DynamicQty` swallow detector surfaces — honest, but not represented;
+//! * the unreadable-operand test's fixed control is pinned in `swallow_check`
+//!   (`enters_with_unparsed_for_each_operand_is_a_swallow`); the where-X test
+//!   has no fixed control.
 //!
 //! The same holds when the clause's sentence carries a per-each connective
 //! ("for each" / "plus") that no tail parser reads — an operand with no
@@ -29,15 +39,19 @@
 //!
 //! Under "plus an additional … for each" the leading amount is an addend, not
 //! a factor, so a dynamic base composes faithfully as a sum and stays
-//! supported. Synthetic class cards (no printed card yet), except Sheriff of
-//! Safe Passage (verbatim Oracle text).
+//! represented, with Sheriff of Safe Passage as its control, and places its
+//! counters at runtime. A conjoined counter list whose later element carries
+//! its own count arithmetic ("and X plus one charge counters on it") has no
+//! per-each tail and stays represented. Synthetic class cards (no printed card
+//! yet), except Sheriff of Safe Passage (verbatim Oracle text).
 
 use engine::game::coverage::card_face_gaps;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{
-    ControllerRef, Effect, FilterProp, QuantityExpr, QuantityRef, TargetFilter, TypedFilter,
+    AbilityDefinition, ControllerRef, Effect, FilterProp, QuantityExpr, QuantityRef, TargetFilter,
+    TypedFilter,
 };
 use engine::types::card::CardFace;
 use engine::types::counter::CounterType;
@@ -101,6 +115,43 @@ fn enters_with_counts(face: &CardFace) -> Vec<QuantityExpr> {
             _ => None,
         })
         .collect()
+}
+
+/// Every counter placement of the face's enters-with replacements, walking each
+/// execute chain (a conjoined counter list chains one `PutCounter` per element).
+fn enters_with_placements(face: &CardFace) -> Vec<(CounterType, QuantityExpr)> {
+    let mut placements = Vec::new();
+    for def in &face.replacements {
+        let mut next: Option<&AbilityDefinition> = def.execute.as_deref();
+        while let Some(ability) = next {
+            if let Effect::PutCounter {
+                counter_type,
+                count,
+                ..
+            } = ability.effect.as_ref()
+            {
+                placements.push((counter_type.clone(), count.clone()));
+            }
+            next = ability.sub_ability.as_deref();
+        }
+    }
+    placements
+}
+
+/// Assert the face is represented: no coverage gap from `card_face_gaps` AND no
+/// swallowed clause — whole-card coverage also reads `parse_warnings`, which
+/// `card_face_gaps` ignores.
+fn assert_represented(face: &CardFace) {
+    assert_eq!(card_face_gaps(face), Vec::<String>::new(), "{}", face.name);
+    assert!(
+        !face
+            .parse_warnings
+            .iter()
+            .any(|warning| matches!(warning, OracleDiagnostic::SwallowedClause { .. })),
+        "{}: {:?}",
+        face.name,
+        face.parse_warnings
+    );
 }
 
 /// Assert the line is unsupported: no counter placement is claimed, the whole
@@ -188,7 +239,7 @@ fn dynamic_amount_per_each_with_a_further_conjunct_is_unsupported() {
         ),
         "reach guard: {counts:?}"
     );
-    assert_eq!(card_face_gaps(&control), Vec::<String>::new());
+    assert_represented(&control);
 
     assert_unsupported(DYNAMIC_COMPOUND);
     assert_unsupported(
@@ -216,7 +267,7 @@ fn dynamic_amount_for_each_single_clause_is_unsupported() {
         ),
         "reach guard: {counts:?}"
     );
-    assert_eq!(card_face_gaps(&control), Vec::<String>::new());
+    assert_represented(&control);
 
     assert_unsupported(
         "This creature enters with X +1/+1 counters on it for each other creature you control.",
@@ -242,7 +293,7 @@ fn dynamic_base_plus_additional_for_each_sums_base_and_bonus() {
         ),
         "reach guard: {counts:?}"
     );
-    assert_eq!(card_face_gaps(&sheriff), Vec::<String>::new());
+    assert_represented(&sheriff);
 
     let dynamic = face("Dynamic Hellion", DYNAMIC_BASE_PLUS_ADDITIONAL);
     assert_eq!(
@@ -266,7 +317,36 @@ fn dynamic_base_plus_additional_for_each_sums_base_and_bonus() {
             ],
         }]
     );
-    assert_eq!(card_face_gaps(&dynamic), Vec::<String>::new());
+    assert_represented(&dynamic);
+}
+
+/// CR 614.1c + CR 107.3m: a conjoined counter list whose later element carries
+/// its own count arithmetic ("and X plus one charge counters on it") has no
+/// per-each tail: the list reads every element, so the line stays represented
+/// with both placements — its "plus" is the element's count, not a per-each
+/// connective.
+#[test]
+fn counter_list_element_count_arithmetic_stays_represented() {
+    let list = face(
+        "Arithmetic Hellion",
+        "This creature enters with a +1/+1 counter and X plus one charge counters on it.",
+    );
+    assert_eq!(
+        enters_with_placements(&list),
+        vec![
+            (CounterType::Plus1Plus1, QuantityExpr::Fixed { value: 1 }),
+            (
+                CounterType::Generic("charge".to_string()),
+                QuantityExpr::Offset {
+                    inner: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::CostXPaid,
+                    }),
+                    offset: 1,
+                },
+            ),
+        ]
+    );
+    assert_represented(&list);
 }
 
 /// CR 614.1c: a dynamic amount per object of a per-each operand with no

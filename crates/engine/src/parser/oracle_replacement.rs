@@ -4244,7 +4244,8 @@ fn parse_enters_with_counters(
     // so handing it the unstripped text is strictly more permissive — it also
     // picks up "an additional +1/+1 counter and a lifelink counter on it", which
     // the strip likewise used to break.
-    let counter_entries = parse_enters_counter_entries(after_with);
+    let (counter_entries, after_counter_list) =
+        parse_enters_counter_entries_with_rest(after_with).unzip();
     // Detect dynamic count: "a number of [type] counters ... equal to [qty]"
     let after_prefix = tag::<_, _, OracleError<'_>>("a number of ")
         .parse(after_additional)
@@ -4275,10 +4276,7 @@ fn parse_enters_with_counters(
     let counter_type_raw = counter_type_raw.trim();
     let counter_type =
         crate::parser::oracle_effect::counter::normalize_counter_type(counter_type_raw);
-    // CR 107.3: a trailing ", where X is …" clause defines X; it is not part of
-    // the per-each tail, so the tail is read from the text before it.
-    let tail_text = nom_primitives::split_once_on(after_counter, ", where x is ")
-        .map_or(after_counter, |(_, (before, _))| before);
+    let tail_text = before_where_x_definition(after_counter);
     match parse_enters_per_each_tail(tail_text, &counter_type) {
         Some(tail) => {
             // CR 107.3 + CR 614.1c: the "equal to" / "where X is" amount
@@ -4327,9 +4325,13 @@ fn parse_enters_with_counters(
         // the amount being a quantity reference itself, the `DynamicQty`
         // swallow detector cannot see that drop. Decline the whole replacement.
         // A fixed amount keeps its count, and the `DynamicQty` swallow detector
-        // surfaces the unread tail.
+        // surfaces the unread tail. For a counter list only the text after the
+        // list is scanned: an element's own count arithmetic ("and X plus one
+        // charge counters") is read by the list, not a per-each connective.
         None if enters_counter_amount_is_dynamic(&count_expr, counter_entries.as_deref())
-            && enters_counter_sentence_has_per_each_connective(tail_text) =>
+            && enters_counter_sentence_has_per_each_connective(
+                after_counter_list.map_or(tail_text, before_where_x_definition),
+            ) =>
         {
             return None;
         }
@@ -5052,6 +5054,28 @@ fn parse_enters_per_each_head(after_counter: &str) -> OracleResult<'_, EntersPer
     parse_enters_per_each_connective(rest)
 }
 
+/// The per-each head ([`parse_enters_per_each_head`]) opening "for each".
+fn parse_enters_for_each_head(after_counter: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        verify(parse_enters_per_each_head, |connective| {
+            matches!(connective, EntersPerEachConnective::ForEach)
+        }),
+    )
+    .parse(after_counter)
+}
+
+/// The per-each head ([`parse_enters_per_each_head`]) opening "plus".
+fn parse_enters_plus_head(after_counter: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        verify(parse_enters_per_each_head, |connective| {
+            matches!(connective, EntersPerEachConnective::Plus)
+        }),
+    )
+    .parse(after_counter)
+}
+
 /// Whether an enters-with clause places any dynamic number of counters: its
 /// leading amount, or any element of a conjoined counter list.
 fn enters_counter_amount_is_dynamic(
@@ -5068,11 +5092,18 @@ fn enters_counter_amount_is_dynamic(
         .any(|count| !matches!(count, QuantityExpr::Fixed { .. }))
 }
 
+/// CR 107.3: The text before a trailing ", where X is …" clause. That clause
+/// defines X; it is not part of the counter clause's per-each tail.
+fn before_where_x_definition(text: &str) -> &str {
+    nom_primitives::split_once_on(text, ", where x is ").map_or(text, |(_, (before, _))| before)
+}
+
 /// Whether the rest of the counter clause's sentence carries a per-each
 /// connective ("for each" / "plus") at any word boundary. `after_counter` is
-/// the slice after the clause's first "<type> counter" token, with any
-/// ", where X is …" definition already cut; the scan stops at the first
-/// sentence end, so a later sentence's "for each" never counts.
+/// the slice after the clause's counters — its first "<type> counter" token,
+/// or the end of a conjoined counter list — with any ", where X is …"
+/// definition already cut; the scan stops at the first sentence end, so a
+/// later sentence's "for each" never counts.
 fn enters_counter_sentence_has_per_each_connective(after_counter: &str) -> bool {
     let sentence = nom_primitives::split_once_on(after_counter, ".")
         .map_or(after_counter, |(_, (before, _))| before);
@@ -5091,10 +5122,7 @@ fn parse_enters_counter_for_each_suffix(
     after_counter: &str,
     base_type: &CounterType,
 ) -> Option<EntersForEachTerms> {
-    let Ok((rest, EntersPerEachConnective::ForEach)) = parse_enters_per_each_head(after_counter)
-    else {
-        return None;
-    };
+    let (rest, ()) = parse_enters_for_each_head(after_counter).ok()?;
     if let Ok((rest, qty)) = parse_for_each_convoked_creature_clause(rest) {
         if rest.trim().is_empty() {
             return Some(EntersForEachTerms {
@@ -5139,13 +5167,7 @@ fn parse_enters_counter_conjunct(input: &str) -> OracleResult<'_, (u32, CounterT
     ))
     .parse(rest)?;
     let (rest, kind) = nom_primitives::parse_counter_type_typed(rest)?;
-    let (rest, _) = (
-        tag(" counter"),
-        verify(parse_enters_per_each_head, |connective| {
-            matches!(connective, EntersPerEachConnective::ForEach)
-        }),
-    )
-        .parse(rest)?;
+    let (rest, _) = (tag(" counter"), parse_enters_for_each_head).parse(rest)?;
     Ok((rest, (count, kind)))
 }
 
@@ -5260,10 +5282,7 @@ fn parse_enters_base_plus_additional_for_each(
 ) -> Option<(u32, QuantityExpr)> {
     // Consume the optional plural "s" of the base counter word, then the base
     // recipient and the " plus " bridge to the additional clause.
-    let Ok((rest, EntersPerEachConnective::Plus)) = parse_enters_per_each_head(after_counter)
-    else {
-        return None;
-    };
+    let (rest, ()) = parse_enters_plus_head(after_counter).ok()?;
 
     // Per-each multiplier M: "an additional" (M = 1) or "<N> additional" (M > 1).
     let (rest, multiplier) = alt((
@@ -5277,16 +5296,15 @@ fn parse_enters_base_plus_additional_for_each(
     // describe different counters and this composition does not apply.
     let (rest, additional_type) = nom_primitives::parse_counter_type_typed(rest).ok()?;
     let (after_additional_counter, _) =
-        alt((tag::<_, _, OracleError<'_>>(" counters"), tag(" counter")))
-            .parse(rest)
-            .ok()?;
+        tag::<_, _, OracleError<'_>>(" counter").parse(rest).ok()?;
     if &additional_type != base_counter_type {
         return None;
     }
 
-    // Delegate the " counter[s] on it/them for each <filter>" tail to the
-    // existing suffix parser — it consumes the plural "s" and the connective,
-    // then parses the for-each filter into the per-each dynamic count.
+    // Delegate the "[s] on <recipient pronoun> for each <filter>" tail to the
+    // existing suffix parser — its shared head consumes the plural "s", the
+    // recipient, and the connective, then it parses the for-each filter into
+    // the per-each dynamic count.
     let per_each =
         parse_enters_counter_for_each_suffix(after_additional_counter, &additional_type)?;
     // A further conjunct would place counters this offset form cannot express.
@@ -5334,12 +5352,9 @@ fn strip_additional_counter_qualifier(input: &str) -> &str {
         .map_or(input, |(rest, _)| rest)
 }
 
-fn parse_enters_counter_entries(after_with: &str) -> Option<Vec<(CounterType, QuantityExpr)>> {
-    parse_enters_counter_entries_with_rest(after_with).map(|(entries, _rest)| entries)
-}
-
-/// As [`parse_enters_counter_entries`], but also returns the text left AFTER the
-/// list's `" on it"` terminator.
+/// Parse a conjoined "enters with" counter list ("two +1/+1 counters and a
+/// lifelink counter on it") into its `(counter_type, count)` entries — at least
+/// two — and the text left AFTER the list's `" on it"` terminator.
 ///
 /// The remainder is what lets a caller tell a complete clause from one that
 /// still has a printed instruction attached — "…counter and deathtouch counter
@@ -5620,7 +5635,7 @@ fn parse_whenever_you_cast_enters_with(
     let (spell_typed, rest) = parse_cast_enters_with_prefix(norm_lower)?;
 
     // A CONJOINED counter list ("an additional +1/+1 counter and deathtouch
-    // counter on it") routes through `parse_enters_counter_entries` — the same
+    // counter on it") routes through `parse_enters_counter_entries_with_rest` — the same
     // reader the self-ETB replacement path uses, so this grammar has ONE
     // authority instead of the bespoke single-counter parse below. The bespoke
     // parse stays as the fallback for everything the list reader declines.
@@ -5651,7 +5666,7 @@ fn parse_whenever_you_cast_enters_with(
         // fewer counters.
         //
         // This gate is scoped to THIS route on purpose. The self-ETB path shares
-        // `parse_enters_counter_entries` and has always tolerated a trailing
+        // `parse_enters_counter_entries_with_rest` and has always tolerated a trailing
         // rider; tightening it there would fail closed on the nine Invasion
         // kicker cards and drop the counters they place today (#7721), trading a
         // partial parse for no parse at all.
@@ -25099,7 +25114,7 @@ mod tests {
     /// The `Fixed`-only gate on the list route is what keeps the two count axes
     /// apart; without it this count silently becomes `CostXPaid`.
     /// The shared-list route must not publish a trigger for a clause it only
-    /// half-consumed. `parse_enters_counter_entries` stops at `" on it"`, so a
+    /// half-consumed. `parse_enters_counter_entries_with_rest` stops at `" on it"`, so a
     /// printed instruction after it ("… on it and with haste") would otherwise
     /// be dropped while this route returned a complete-looking
     /// `AddTargetReplacement` — a rules-bearing sentence reported as fully
