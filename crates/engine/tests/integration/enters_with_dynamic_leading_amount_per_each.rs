@@ -39,7 +39,7 @@
 //! per-each tail and stays represented.
 //!
 //! Controls, per test:
-//! * the further-conjunct and single-clause tests pair the dynamic line with a
+//! * the further-conjunct and single-clause tests pair each dynamic line with a
 //!   fixed amount over the same populations that stays represented — exact
 //!   count shape, no coverage gap, no gap-producing parse warning; the
 //!   further-conjunct control (`FIXED_COMPOUND`) also places its counters at
@@ -49,7 +49,7 @@
 //!   counter list beside a ", where X is …" definition, which keeps its exact
 //!   placements and is surfaced by the `DynamicQty` swallow detector;
 //! * the mixed-kind, other-kind-bonus, per-each counter-list and
-//!   unread-connective tests pair the dynamic line with a fixed amount over the
+//!   unread-connective tests pair each dynamic line with a fixed amount over the
 //!   same text whose dropped tail the `DynamicQty` swallow detector surfaces —
 //!   honest, but not represented;
 //! * the unreadable-operand test's fixed control is pinned in `swallow_check`
@@ -505,7 +505,9 @@ fn dynamic_amount_with_an_unread_per_each_connective_is_declined() {
 /// amount override — a ", where X is …" definition or an "equal to …" count —
 /// is unsupported: the override binds only the single-counter count, so the
 /// list would publish the element's bare `CostXPaid` and drop the override's
-/// quantity. A fixed counter list is the represented control.
+/// quantity. A fixed counter list is the represented control, and a fixed
+/// counter list beside a where-X definition pins that only a dynamic element
+/// declines.
 #[test]
 fn dynamic_counter_list_with_an_amount_override_is_unsupported() {
     let control = face(
@@ -533,7 +535,10 @@ fn dynamic_counter_list_with_an_amount_override_is_unsupported() {
         "This creature enters with a +1/+1 counter and two charge counters on it, where X is \
          the number of creatures you control.",
     );
-    assert!(!fixed_with_override.replacements.is_empty());
+    assert!(
+        !fixed_with_override.replacements.is_empty(),
+        "{fixed_with_override:#?}"
+    );
     assert_eq!(
         enters_with_placements(&fixed_with_override),
         vec![
