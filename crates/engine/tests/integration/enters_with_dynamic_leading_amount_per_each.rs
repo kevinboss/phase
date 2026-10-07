@@ -2,20 +2,30 @@
 //! its leading amount is dynamic ("X", "twice X", "that many") and is placed
 //! once FOR EACH object of a "for each" count — alone or conjoined with a
 //! further "and … for each" placement — the total is a product of two
-//! game-state values, and `QuantityExpr` scales only by an integer constant
-//! (CR 107.1: `Multiply { factor: i32 }`). The whole replacement is declined,
-//! so the card is reported UNSUPPORTED through the public coverage authority
-//! (`card_face_gaps`); it never becomes a supported count that drops the
-//! leading amount (X=3 over two other red and one other green creature must be
+//! game-state values, and `QuantityExpr` has no product of two dynamic
+//! quantities (`Multiply` scales by a constant factor). The whole replacement
+//! is declined; it never becomes a supported count that drops the leading
+//! amount (X=3 over two other red and one other green creature must be
 //! 3×2+1=7, never 2+1). Each case is paired with a fixed leading amount over
 //! the same populations, which stays represented with no gap and places its
 //! counters at runtime.
 //!
-//! The same holds when the per-each tail is present but unreadable (an operand
-//! with no quantity reading, a conjunct or bonus placing a different counter
-//! kind): a dynamic amount is itself a quantity reference, so the `DynamicQty`
-//! swallow detector that surfaces the unread tail behind a FIXED amount cannot
-//! see it, and the replacement must decline instead.
+//! The same holds when the clause's sentence carries a per-each connective
+//! ("for each" / "plus") that no tail parser reads — an operand with no
+//! quantity reading, a conjunct or bonus placing a different counter kind, a
+//! recipient outside the pronoun set ("on that creature"), a comma before
+//! "plus", or a conjoined counter list — and any amount is dynamic: a dynamic
+//! amount is itself a quantity reference, so the `DynamicQty` swallow detector
+//! that surfaces the unread tail behind a FIXED amount cannot see it, and the
+//! replacement must decline instead.
+//!
+//! Unsupported is shown through the public coverage authority
+//! (`card_face_gaps`, via `assert_unsupported`) — except where the declined
+//! line falls through to the effect parser's verb-less for-each put-counter
+//! arm (issue #9659: an X base plus an additional counter of another kind, an
+//! X counter list, a comma before "plus"). There no enters-with replacement is
+//! published and the line is surfaced by the `Replacement` swallow detector,
+//! which whole-card coverage reads (`assert_declined_to_replacement_swallow`).
 //!
 //! Under "plus an additional … for each" the leading amount is an addend, not
 //! a factor, so a dynamic base composes faithfully as a sum and stays
@@ -115,20 +125,44 @@ fn assert_unsupported(text: &str) {
             && face.static_abilities.is_empty(),
         "{text:?}: {face:#?}"
     );
-    let unimplemented: Vec<&str> = face
-        .abilities
-        .iter()
-        .filter_map(|def| def.effect.unimplemented_description())
-        .collect();
+    // The unimplemented node is the face's ONLY ability: a supported
+    // placement beside it (an effect-parser fall-through) would be published.
     assert!(
-        matches!(unimplemented.as_slice(), [line] if line.ends_with(body)),
-        "{text:?}: the whole line must be the unimplemented node, got {:?}",
+        matches!(
+            face.abilities.as_slice(),
+            [only] if only
+                .effect
+                .unimplemented_description()
+                .is_some_and(|line| line.ends_with(body))
+        ),
+        "{text:?}: the whole line must be the only, unimplemented ability, got {:?}",
         face.abilities
     );
     assert_eq!(
         card_face_gaps(&face),
         vec!["Effect:replacement_structure".to_string()],
         "{text:?}"
+    );
+}
+
+/// Assert the enters-with replacement is declined and the line surfaced, for a
+/// line that falls through to the effect parser's verb-less for-each
+/// put-counter arm (issue #9659): no replacement, trigger, or static is
+/// published and the `Replacement` swallow detector reports the line, so
+/// whole-card coverage is red. The fall-through ability itself is #9659's
+/// defect and is deliberately not pinned here.
+fn assert_declined_to_replacement_swallow(text: &str) {
+    let face = face("Dynamic Hellion", text);
+    assert!(
+        face.replacements.is_empty()
+            && face.triggers.is_empty()
+            && face.static_abilities.is_empty(),
+        "{text:?}: {face:#?}"
+    );
+    assert!(
+        has_swallow(&face, "Replacement"),
+        "{text:?}: {:?}",
+        face.parse_warnings
     );
 }
 
@@ -287,13 +321,89 @@ fn dynamic_base_plus_additional_of_another_kind_publishes_no_count() {
         control.parse_warnings
     );
 
-    let dynamic = face("Dynamic Hellion", DYNAMIC_PLUS_ADDITIONAL_OTHER_KIND);
-    assert!(dynamic.replacements.is_empty(), "{dynamic:#?}");
-    assert!(
-        has_swallow(&dynamic, "Replacement"),
-        "{:?}",
-        dynamic.parse_warnings
+    assert_declined_to_replacement_swallow(DYNAMIC_PLUS_ADDITIONAL_OTHER_KIND);
+}
+
+/// CR 614.1c: X counters and a charge counter on it for each other creature is
+/// declined — the conjoined list must not publish its counts with the per-each
+/// tail dropped — and so is a dynamic later list element; two counters and a
+/// charge counter over the same tail is the control, whose dropped tail the
+/// `DynamicQty` swallow detector surfaces.
+#[test]
+fn dynamic_counter_list_with_a_per_each_tail_is_declined() {
+    let control = face(
+        "Fixed Hellion",
+        "This creature enters with two +1/+1 counters and a charge counter on it for each \
+         other creature you control.",
     );
+    assert_eq!(
+        enters_with_counts(&control),
+        vec![QuantityExpr::Fixed { value: 2 }],
+        "reach guard"
+    );
+    assert!(
+        has_swallow(&control, "DynamicQty"),
+        "{:?}",
+        control.parse_warnings
+    );
+
+    assert_declined_to_replacement_swallow(
+        "This creature enters with X +1/+1 counters and a charge counter on it for each other \
+         creature you control.",
+    );
+    assert_unsupported(
+        "This creature enters with a +1/+1 counter and X charge counters on it for each other \
+         creature you control.",
+    );
+}
+
+/// CR 614.1c: a dynamic amount whose per-each connective follows a recipient
+/// outside the pronoun set ("on that creature", "on each of them") or a comma
+/// ("on it, plus …") is declined, never the bare amount; two counters over the
+/// same text is the control, whose dropped tail the `DynamicQty` swallow
+/// detector surfaces.
+#[test]
+fn dynamic_amount_with_an_unread_per_each_connective_is_declined() {
+    // (fixed control, dynamic line, how the dynamic line is shown declined)
+    type Case = (&'static str, &'static str, fn(&str));
+    let cases: [Case; 3] = [
+        (
+            "This creature enters with two +1/+1 counters on that creature for each other \
+             creature you control.",
+            "This creature enters with X +1/+1 counters on that creature for each other \
+             creature you control.",
+            assert_unsupported,
+        ),
+        (
+            "This creature enters with two +1/+1 counters on each of them for each other \
+             creature you control.",
+            "This creature enters with X +1/+1 counters on each of them for each other \
+             creature you control.",
+            assert_unsupported,
+        ),
+        (
+            "This creature enters with two +1/+1 counters on it, plus an additional +1/+1 \
+             counter on it for each other creature you control.",
+            "This creature enters with X +1/+1 counters on it, plus an additional +1/+1 \
+             counter on it for each other creature you control.",
+            assert_declined_to_replacement_swallow,
+        ),
+    ];
+    for (fixed, dynamic, assert_declined) in cases {
+        let control = face("Fixed Hellion", fixed);
+        assert_eq!(
+            enters_with_counts(&control),
+            vec![QuantityExpr::Fixed { value: 2 }],
+            "reach guard: {fixed:?}"
+        );
+        assert!(
+            has_swallow(&control, "DynamicQty"),
+            "{fixed:?}: {:?}",
+            control.parse_warnings
+        );
+
+        assert_declined(dynamic);
+    }
 }
 
 /// CR 107.3 + CR 614.1c: an X defined by a trailing "where X is" clause is
