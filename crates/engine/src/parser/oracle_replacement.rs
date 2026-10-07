@@ -4279,40 +4279,58 @@ fn parse_enters_with_counters(
     // the per-each tail, so the tail is read from the text before it.
     let tail_text = nom_primitives::split_once_on(after_counter, ", where x is ")
         .map_or(after_counter, |(_, (before, _))| before);
-    if let Some(tail) = parse_enters_per_each_tail(tail_text, &counter_type) {
-        // CR 107.3 + CR 614.1c: the "equal to" / "where X is" amount overrides
-        // below replace the count wholesale, so composed with a per-each tail
-        // they would drop it. Decline the whole replacement instead.
-        if nom_primitives::split_once_on(work_text, "equal to ").is_ok()
-            || nom_primitives::split_once_on(work_text, ", where x is ").is_ok()
+    match parse_enters_per_each_tail(tail_text, &counter_type) {
+        Some(tail) => {
+            // CR 107.3 + CR 614.1c: the "equal to" / "where X is" amount
+            // overrides below replace the count wholesale, so composed with a
+            // per-each tail they would drop it. Decline the whole replacement
+            // instead.
+            if nom_primitives::split_once_on(work_text, "equal to ").is_ok()
+                || nom_primitives::split_once_on(work_text, ", where x is ").is_ok()
+            {
+                return None;
+            }
+            count_expr = match (tail, count_expr) {
+                (EntersPerEachTail::ForEach(terms), QuantityExpr::Fixed { value: leading }) => {
+                    terms.total(u32::try_from(leading).ok()?)
+                }
+                // CR 614.1c: "<amount> counters on it for each <filter>" places
+                // the leading amount once per object, so the total is the
+                // product of the amount and a game-state count. CR 107.1:
+                // `QuantityExpr` scales only by an integer constant
+                // (`Multiply { factor: i32 }`), so a dynamic amount ("X",
+                // "twice X", "that many") has no faithful encoding. Decline the
+                // WHOLE replacement here, before any count is published: the
+                // line surfaces as an unsupported gap, never as a supported
+                // count that drops the amount (X=3 over two other red and one
+                // other green creature is 3×2+1=7, never 2+1).
+                (EntersPerEachTail::ForEach(_), _) => return None,
+                // CR 614.1c: under "plus an additional … for each" the leading
+                // amount is an addend placed once, so a dynamic base still
+                // composes faithfully as a sum.
+                (
+                    EntersPerEachTail::BasePlusAdditional {
+                        multiplier,
+                        per_each,
+                    },
+                    base,
+                ) => base_plus_additional_total(base, multiplier, per_each),
+            };
+        }
+        // CR 614.1c: the replacement places exactly the counters it names. The
+        // clause opens a per-each tail ("… on it for each" / "… on it plus")
+        // that this grammar cannot read, so publishing a dynamic leading amount
+        // alone would silently drop the per-each factor or bonus — and, the
+        // amount being a quantity reference itself, the `DynamicQty` swallow
+        // detector cannot see that drop. Decline the whole replacement. A fixed
+        // leading amount keeps its count, and the `DynamicQty` swallow detector
+        // surfaces the unread tail.
+        None if !matches!(count_expr, QuantityExpr::Fixed { .. })
+            && parse_enters_per_each_head(tail_text).is_ok() =>
         {
             return None;
         }
-        count_expr = match (tail, count_expr) {
-            (EntersPerEachTail::ForEach(terms), QuantityExpr::Fixed { value: leading }) => {
-                terms.total(leading)
-            }
-            // CR 107.1 + CR 614.1c: "<amount> counters on it for each <filter>"
-            // places the leading amount once per object, so the total is the
-            // product of the amount and a game-state count. `QuantityExpr` scales
-            // only by a constant (`Multiply { factor: i32 }`), so a dynamic
-            // amount ("X", "twice X", "that many") has no faithful encoding.
-            // Decline the WHOLE replacement here, before any count is
-            // published: the line surfaces as an unsupported gap, never as a
-            // supported count that drops the amount (X=3 over two other red and
-            // one other green creature is 3×2+1=7, never 2+1).
-            (EntersPerEachTail::ForEach(_), _) => return None,
-            // CR 107.1 + CR 122.1: under "plus an additional … for each" the
-            // leading amount is an addend placed once, so a dynamic base still
-            // composes faithfully as a sum.
-            (
-                EntersPerEachTail::BasePlusAdditional {
-                    multiplier,
-                    per_each,
-                },
-                base,
-            ) => base_plus_additional_total(base, multiplier, per_each),
-        };
+        None => {}
     }
     // CR 122.6: For "a number of counters equal to [quantity]" and the
     // sibling shorthand "counters on it equal to [quantity]", parse the
@@ -4785,21 +4803,6 @@ fn parse_enters_with_where_x_suffix(text: &str) -> Option<QuantityExpr> {
     crate::parser::oracle_quantity::parse_event_context_quantity(trimmed)
 }
 
-/// Scale a per-each count by a constant number of counters per object. The
-/// factor is an integer by construction: `parse_enters_with_counters` declines a
-/// dynamic per-object amount before anything is scaled, so no amount is ever
-/// dropped here.
-fn scale_for_each_count(factor: i32, for_each_count: QuantityExpr) -> QuantityExpr {
-    if factor == 1 {
-        for_each_count
-    } else {
-        QuantityExpr::Multiply {
-            factor,
-            inner: Box::new(for_each_count),
-        }
-    }
-}
-
 fn extract_enters_with_only_if_suffix(text: &str) -> Option<ReplacementCondition> {
     let (_, (_, condition_text)) = nom_primitives::split_once_on(text, " if ").ok()?;
     let condition_text = condition_text.trim().trim_end_matches('.');
@@ -5002,31 +5005,55 @@ struct EntersForEachTerms {
     extra: Vec<QuantityExpr>,
 }
 
+/// The connective that opens an enters-with per-each tail after its recipient.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntersPerEachConnective {
+    /// "… on <pronoun> for each <filter>": the leading amount is placed once per
+    /// object.
+    ForEach,
+    /// "… on <pronoun> plus <an|M> additional …": the leading amount is a base,
+    /// followed by a per-object bonus.
+    Plus,
+}
+
+/// CR 614.1c + CR 614.12: The structural head of an enters-with per-each tail,
+/// read from the slice after the FIRST "<type> counter" token — the optional
+/// plural "s", " on <pronoun>", then " for each " or " plus " — independently
+/// of whether the rest of the tail parses. The single authority for the head:
+/// the tail parsers consume it, and `parse_enters_with_counters` declines a
+/// dynamic leading amount when the head is present but the tail is unreadable.
+fn parse_enters_per_each_head(after_counter: &str) -> OracleResult<'_, EntersPerEachConnective> {
+    let (rest, _) = opt(tag("s")).parse(after_counter)?;
+    // CR 614.1c + CR 614.12: "[this permanent] enters with … counter on <pronoun>"
+    // is a replacement effect placing counters on the entering permanent(s). The
+    // self-referential recipient (it/them/him/her — Batroc the Leaper uses "him")
+    // precedes the per-each clause identically for every pronoun in the set.
+    // Routed through `nom_primitives::parse_object_recipient_pronoun` (the single
+    // authority for the recipient-pronoun set) so it cannot drift.
+    let (rest, _) = (tag(" on "), nom_primitives::parse_object_recipient_pronoun).parse(rest)?;
+    alt((
+        value(EntersPerEachConnective::ForEach, tag(" for each ")),
+        value(EntersPerEachConnective::Plus, tag(" plus ")),
+    ))
+    .parse(rest)
+}
+
 /// CR 614.1c + CR 614.12: Parse the " counter[s] on <pronoun> for each
 /// <filter>[ and <N> <kind> counter[s] on <pronoun> for each <filter>]…" tail
 /// of an enters-with clause. Every conjunct must name `base_type` — a conjunct
 /// placing a different kind of counter is a separate placement this count
-/// cannot express, so the whole tail declines (fail closed).
+/// cannot express, so this parser returns `None`. `parse_enters_with_counters`
+/// then declines the whole replacement when the leading amount is dynamic;
+/// a fixed leading amount keeps its count, and the `DynamicQty` swallow
+/// detector surfaces the unread tail.
 fn parse_enters_counter_for_each_suffix(
     after_counter: &str,
     base_type: &CounterType,
 ) -> Option<EntersForEachTerms> {
-    let (rest, _) = opt(tag::<_, _, OracleError<'_>>("s"))
-        .parse(after_counter)
-        .ok()?;
-    // CR 614.1c + CR 614.12: "[this permanent] enters with … counter on <pronoun>"
-    // is a replacement effect placing counters on the entering permanent(s). The
-    // self-referential recipient (it/them/him/her — Batroc the Leaper uses "him")
-    // precedes the per-each scaling clause identically for every pronoun in the
-    // set. Routed through `nom_primitives::parse_object_recipient_pronoun` (the
-    // single authority for the recipient-pronoun set) so it cannot drift.
-    let (rest, _) = (
-        tag::<_, _, OracleError<'_>>(" on "),
-        nom_primitives::parse_object_recipient_pronoun,
-        tag(" for each "),
-    )
-        .parse(rest)
-        .ok()?;
+    let Ok((rest, EntersPerEachConnective::ForEach)) = parse_enters_per_each_head(after_counter)
+    else {
+        return None;
+    };
     if let Ok((rest, qty)) = parse_for_each_convoked_creature_clause(rest) {
         if rest.trim().is_empty() {
             return Some(EntersForEachTerms {
@@ -5057,19 +5084,17 @@ fn parse_enters_for_each_conjuncts(
     }
     let first = parse_enters_for_each_clause(before)?;
     let (next, mut extra) = parse_enters_for_each_conjuncts(after, base_type)?;
-    extra.insert(0, scale_for_each_count(count, next));
+    extra.insert(0, next.scaled_by(count));
     Some((first, extra))
 }
 
 /// "and <N> <kind> counter[s] on <pronoun> for each " — the head of a further
 /// per-each conjunct. Yields the conjunct's count and counter kind.
-fn parse_enters_counter_conjunct(input: &str) -> OracleResult<'_, (i32, CounterType)> {
+fn parse_enters_counter_conjunct(input: &str) -> OracleResult<'_, (u32, CounterType)> {
     let (rest, _) = tag("and ").parse(input)?;
     let (rest, count) = alt((
         value(1, alt((tag("a "), tag("an ")))),
-        map_opt(terminated(nom_primitives::parse_number, tag(" ")), |n| {
-            i32::try_from(n).ok()
-        }),
+        terminated(nom_primitives::parse_number, tag(" ")),
     ))
     .parse(rest)?;
     let (rest, kind) = nom_primitives::parse_counter_type_typed(rest)?;
@@ -5107,18 +5132,18 @@ enum EntersPerEachTail {
     /// <pronoun> for each <filter>": the leading amount is a base placed once,
     /// plus `multiplier` counters per object.
     BasePlusAdditional {
-        multiplier: i32,
+        multiplier: u32,
         per_each: QuantityExpr,
     },
 }
 
 impl EntersForEachTerms {
-    /// CR 107.1 + CR 122.1: the total counters placed for a fixed number of
-    /// counters per object of the first clause — `leading × first + Σ
-    /// conjuncts`. Each 'for each' conjunct places its own counters, so an
+    /// CR 614.1c: the total counters placed for a fixed number of counters per
+    /// object of the first clause — `leading × first + Σ conjuncts`. The
+    /// replacement places the counters each 'for each' conjunct names, so an
     /// object matching both is counted by both (Ulasht ruling).
-    fn total(self, leading: i32) -> QuantityExpr {
-        let first = scale_for_each_count(leading, self.first);
+    fn total(self, leading: u32) -> QuantityExpr {
+        let first = self.first.scaled_by(leading);
         if self.extra.is_empty() {
             first
         } else {
@@ -5129,15 +5154,15 @@ impl EntersForEachTerms {
     }
 }
 
-/// CR 107.1 + CR 122.1: `base + multiplier × per_each` for the "plus an
-/// additional … for each" tail. A fixed base folds into an `Offset`; a dynamic
-/// base (an addend, never a factor) is summed.
+/// CR 614.1c: `base + multiplier × per_each` for the "plus an additional … for
+/// each" tail. A fixed base folds into an `Offset`; a dynamic base (an addend,
+/// never a factor) is summed.
 fn base_plus_additional_total(
     base: QuantityExpr,
-    multiplier: i32,
+    multiplier: u32,
     per_each: QuantityExpr,
 ) -> QuantityExpr {
-    let inner = scale_for_each_count(multiplier, per_each);
+    let inner = per_each.scaled_by(multiplier);
     match base {
         QuantityExpr::Fixed { value: 0 } => inner,
         QuantityExpr::Fixed { value: offset } => QuantityExpr::Offset {
@@ -5190,28 +5215,18 @@ fn parse_enters_per_each_tail(
 fn parse_enters_base_plus_additional_for_each(
     after_counter: &str,
     base_counter_type: &CounterType,
-) -> Option<(i32, QuantityExpr)> {
+) -> Option<(u32, QuantityExpr)> {
     // Consume the optional plural "s" of the base counter word, then the base
-    // recipient (any pronoun in `nom_primitives::parse_object_recipient_pronoun`)
-    // and the " plus " bridge to the additional clause.
-    let (rest, _) = opt(tag::<_, _, OracleError<'_>>("s"))
-        .parse(after_counter)
-        .ok()?;
-    let (rest, _) = (
-        tag::<_, _, OracleError<'_>>(" on "),
-        nom_primitives::parse_object_recipient_pronoun,
-        tag(" plus "),
-    )
-        .parse(rest)
-        .ok()?;
+    // recipient and the " plus " bridge to the additional clause.
+    let Ok((rest, EntersPerEachConnective::Plus)) = parse_enters_per_each_head(after_counter)
+    else {
+        return None;
+    };
 
     // Per-each multiplier M: "an additional" (M = 1) or "<N> additional" (M > 1).
     let (rest, multiplier) = alt((
         value(1, tag::<_, _, OracleError<'_>>("an additional ")),
-        map_opt(
-            terminated(nom_primitives::parse_number, tag(" additional ")),
-            |n| i32::try_from(n).ok(),
-        ),
+        terminated(nom_primitives::parse_number, tag(" additional ")),
     ))
     .parse(rest)
     .ok()?;
@@ -14963,7 +14978,7 @@ mod tests {
         );
     }
 
-    /// CR 614.1c + CR 122.1: Ulasht, the Hate Seed — two conjoined "for each"
+    /// CR 614.1c: Ulasht, the Hate Seed — two conjoined "for each"
     /// placements of the same counter kind sum; a creature that is both red and
     /// green is counted by both conjuncts (Ulasht ruling).
     #[test]
