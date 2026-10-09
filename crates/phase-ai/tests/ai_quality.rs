@@ -3383,8 +3383,8 @@ fn flicker_never_targets_token_while_nontoken_alternative_exists() {
 }
 
 // R1.9 (shippability): a flicker whose legal targets offer no value is not
-// cast — while its cast candidate is present (it got past the pre-filter) and
-// carries `AntiSelfHarmPolicy`'s no-value veto.
+// cast — the engine issues the cast and the tactical pre-filter removes it
+// with the no-value check's reason (its decision-trace event).
 //
 // The fixture is Cloudshift ({W}; no Flashback, CR 702.34a, and no Rebound,
 // CR 702.88a): a resolved Cloudshift goes to the graveyard (CR 608.2n) and
@@ -3416,12 +3416,9 @@ fn no_value_board(spell: FlickerSpell, threat: Option<FlickerThreat>) -> Flicker
     )
 }
 
-/// The decision-trace `Reject` entry of R1.9's veto: `AntiSelfHarmPolicy`
-/// rejects an own flicker whose legal targets offer no value, with the
-/// no-value check's `NoValue(CreatureOnlyOrSource)` fact.
 /// The tactical pre-filter's decision-trace event for R1.9's veto
 /// (orchestrator decision amending plan r9): the no-value check's
-/// `NoValue(ExcludedAtBase)` outcome, code 2.
+/// `NoValue(RemovedFromSearch)` outcome, code 2.
 fn is_r1_9_gate_reject(line: &str, action: &GameAction) -> bool {
     line.contains("message=tactical gate reject")
         && line.contains(r#"gate_reject="flicker_no_value""#)

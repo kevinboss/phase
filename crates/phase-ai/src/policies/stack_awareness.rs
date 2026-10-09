@@ -1048,7 +1048,6 @@ mod flicker_rows {
     /// One U-S1 reading: a two-player (or 2HG) board where the AI controls
     /// the object `setup` returns, and one entry on the stack.
     fn reading(
-        label: &str,
         two_headed: bool,
         setup: impl FnOnce(&mut GameScenario) -> (ObjectId, ObjectId),
         controller: PlayerId,
@@ -1074,7 +1073,6 @@ mod flicker_rows {
             targets,
         );
         let removes = pending_removal_will_remove(runner.state(), P0, object);
-        eprintln!("[flicker U-S1] {label}: {removes}");
         removes
     }
 
@@ -1096,7 +1094,6 @@ mod flicker_rows {
             (
                 "opponent Murder -> V",
                 reading(
-                    "opponent Murder -> V",
                     false,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1109,7 +1106,6 @@ mod flicker_rows {
             (
                 "AI's own Murder -> V",
                 reading(
-                    "AI's own Murder -> V",
                     false,
                     |s| v_and_source(s, P0),
                     P0,
@@ -1122,7 +1118,6 @@ mod flicker_rows {
             (
                 "2HG teammate Murder -> V",
                 reading(
-                    "2HG teammate Murder -> V",
                     true,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1135,7 +1130,6 @@ mod flicker_rows {
             (
                 "opponent Flickerwisp trigger -> V",
                 reading(
-                    "opponent Flickerwisp trigger -> V",
                     false,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1148,7 +1142,6 @@ mod flicker_rows {
             (
                 "opponent Eldrazi Displacer -> AI-owned V",
                 reading(
-                    "opponent Eldrazi Displacer -> AI-owned V",
                     false,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1166,7 +1159,6 @@ mod flicker_rows {
             (
                 "AI's own Guardian trigger -> V",
                 reading(
-                    "AI's own Guardian trigger -> V",
                     false,
                     |s| v_and_source(s, P0),
                     P0,
@@ -1184,7 +1176,6 @@ mod flicker_rows {
             (
                 "2HG teammate Flickerwisp trigger -> AI's V",
                 reading(
-                    "2HG teammate Flickerwisp trigger -> AI's V",
                     true,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1197,7 +1188,6 @@ mod flicker_rows {
             (
                 "2HG teammate Flickerwisp trigger -> stolen creature",
                 reading(
-                    "2HG teammate Flickerwisp trigger -> stolen creature",
                     true,
                     |s| {
                         let stolen = s
@@ -1217,7 +1207,6 @@ mod flicker_rows {
             (
                 "opponent Murder -> indestructible V",
                 reading(
-                    "opponent Murder -> indestructible V",
                     false,
                     |s| {
                         let v = s.add_creature(P0, "Hill Giant", 3, 3).indestructible().id();
@@ -1234,7 +1223,6 @@ mod flicker_rows {
             (
                 "opponent Shock -> 3/3",
                 reading(
-                    "opponent Shock -> 3/3",
                     false,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1247,7 +1235,6 @@ mod flicker_rows {
             (
                 "opponent Day of Judgment",
                 reading(
-                    "opponent Day of Judgment",
                     false,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1260,7 +1247,6 @@ mod flicker_rows {
             (
                 "opponent Diabolic Edict -> AI",
                 reading(
-                    "opponent Diabolic Edict -> AI",
                     false,
                     |s| v_and_source(s, P1),
                     P1,
@@ -1292,7 +1278,6 @@ mod flicker_rows {
             vec![TargetRef::Object(v)],
         );
         let dies = will_target_die_from_stack(runner.state(), v);
-        eprintln!("[flicker U-S2] own Murder -> V: {dies}");
         assert!(dies);
     }
 }

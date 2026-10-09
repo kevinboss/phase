@@ -367,11 +367,9 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    // R1.9: an own flicker whose legal targets offer no value is not taken.
-    // Where base's redundancy path or own-board activation veto excluded the
-    // candidate from search, this removes it here too, so search never
-    // simulates it. The rejection is reported on the decision-trace target
-    // with the no-value check's typed outcome.
+    // An own flicker whose legal targets offer no value is not taken: the
+    // no-value check removes it here, so search never simulates it. The
+    // rejection is reported on the decision-trace target with its typed outcome.
     if let Some(outcome) = flicker_no_value_gate_reject(ctx) {
         tracing::debug!(
             target: "phase_ai::decision_trace",
@@ -8470,9 +8468,6 @@ mod flicker_rows {
                 let redundant = is_redundant_creature_only_removal(&ctx, &ctx.effect_nodes());
                 let no_value = flicker_no_value_gate_reject(&ctx);
                 let reading = assess_candidate(&ctx);
-                eprintln!(
-                    "[flicker U-G1] {name}, own E = {with_etb}: gate={reading:?} redundant={redundant} no_value={no_value:?}"
-                );
                 assert!(!redundant, "{name}");
                 if with_etb {
                     assert_ne!(reading, GateDecision::Reject, "{name}");
@@ -8481,7 +8476,7 @@ mod flicker_rows {
                     assert_eq!(reading, GateDecision::Reject, "{name}");
                     assert_eq!(
                         no_value,
-                        Some(FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase)),
+                        Some(FlickerCheckOutcome::NoValue(OwnLegShape::RemovedFromSearch)),
                         "{name}"
                     );
                 }
@@ -8531,7 +8526,6 @@ mod flicker_rows {
             }
             let state = runner.state();
             let reading = gate(state, &fx::activate_action(state, maze));
-            eprintln!("[flicker U-G2] Mystifying Maze, attacker dying = {dying}: {reading:?}");
             if dying {
                 assert_eq!(reading, GateDecision::Reject);
             } else {
@@ -8577,7 +8571,6 @@ mod flicker_rows {
         let flicker = penalty(runner.state(), &fx::choose(v), v);
         fx::begin_cast(&mut murder_runner, own_murder);
         let duplicate = penalty(murder_runner.state(), &fx::choose(v), v);
-        eprintln!("[flicker U-G3] Blink -> V: {flicker}; Murder -> V: {duplicate}");
         assert_eq!(flicker, 0.0);
         assert_eq!(duplicate, -10.0);
     }
@@ -8641,7 +8634,6 @@ mod flicker_rows {
                     fx::cast_action(state, source)
                 };
                 let reading = gate(state, &action);
-                eprintln!("[flicker U-G4] {card}, own E = {with_etb}: {reading:?}");
                 if with_etb {
                     assert_ne!(reading, GateDecision::Reject, "{card}");
                 } else {

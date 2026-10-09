@@ -370,7 +370,6 @@ fn live_matcher_reads_scheduled_returns_through_the_flicker_authority() {
     let mut failures = Vec::new();
     for (name, oid, expected) in readings {
         let kind = blink_kind_for(&state, oid);
-        eprintln!("[flicker U-P1] {name}: {kind}");
         if kind != expected {
             failures.push(format!("{name}: {kind}, expected {expected}"));
         }

@@ -17,7 +17,7 @@ use engine::types::replacements::ReplacementEvent;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
-use crate::ability_chain::ChainNode;
+use crate::ability_chain::{is_own_flicker_leg, ChainNode};
 
 /// Effect-level classification flags shared across spells and activated abilities.
 /// Built from any ability's effect chain — no card-level assumptions.
@@ -59,10 +59,7 @@ impl EffectProfile {
         }
         let effects: Vec<&Effect> = nodes.iter().map(|node| &*node.effect).collect();
         let has_direct_removal_text = nodes.iter().any(|node| {
-            is_direct_removal(&node.effect)
-                && !ChainNode::Definition(node)
-                    .flicker_pair()
-                    .is_some_and(|pair| pair.subject.is_own())
+            is_direct_removal(&node.effect) && !is_own_flicker_leg(ChainNode::Definition(node))
         });
         Self::from_effects_with_removal_reading(&effects, has_direct_removal_text)
     }
@@ -1263,15 +1260,10 @@ mod flicker_rows {
         let state = runner.state();
         for id in cards {
             let reading = object_reading(state, id);
-            eprintln!("[flicker U-F1] {}: {reading}", state.objects[&id].name);
             assert!(!reading, "{}", state.objects[&id].name);
         }
         for source in [smuggler, spirit] {
             let reading = activation_reading(state, source);
-            eprintln!(
-                "[flicker U-F1] {} activation: {reading}",
-                state.objects[&source].name
-            );
             assert!(!reading, "{}", state.objects[&source].name);
         }
     }
@@ -1304,11 +1296,9 @@ mod flicker_rows {
         let runner = scenario.build();
         let state = runner.state();
         let maze_reading = activation_reading(state, maze);
-        eprintln!("[flicker U-F2] Mystifying Maze activation: {maze_reading}");
         assert!(maze_reading);
         for id in cards {
             let reading = object_reading(state, id);
-            eprintln!("[flicker U-F2] {}: {reading}", state.objects[&id].name);
             assert!(reading, "{}", state.objects[&id].name);
         }
     }
@@ -1320,7 +1310,6 @@ mod flicker_rows {
         let ring = fx::roots("Oblivion Ring", &["Enchantment"], &[], fx::OBLIVION_RING);
         assert_eq!(ring.len(), 2, "ETB exile and LTB return");
         let reading = EffectProfile::from_abilities(&ring).has_direct_removal_text;
-        eprintln!("[flicker U-F3] Oblivion Ring: {reading}");
         assert!(reading);
     }
 }

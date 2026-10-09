@@ -414,15 +414,19 @@ fn return_alteration(
 /// no-value check (a chain made only of such nodes does nothing but flicker
 /// its controller's own permanents).
 pub(crate) fn is_own_flicker_node(node: ChainNode<'_>) -> bool {
+    is_own_flicker_leg(node) || flicker_return(node.effect()).is_some()
+}
+
+/// An exile leg paired with a return of the source or of a permanent its
+/// controller controls (CR 400.7: it re-enters rather than being removed).
+pub(crate) fn is_own_flicker_leg(node: ChainNode<'_>) -> bool {
     node.flicker_pair()
         .is_some_and(|pair| pair.subject.is_own())
-        || flicker_return(node.effect()).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use engine::game::scenario::{P0, P1};
-    use engine::parser::oracle::parse_oracle_text;
     use engine::types::ability::{AbilityKind, TypedFilter};
     use engine::types::identifiers::TrackedSetId;
     use engine::types::zones::EtbTapState;
@@ -430,29 +434,6 @@ mod tests {
     use super::*;
     use crate::policies::context::flicker_fixtures as fx;
     use crate::policies::effect_classify::{flicker_target_outcome, FlickerTargetOutcome};
-
-    /// Every ability and trigger execute a card parses to, from its verbatim
-    /// Oracle text.
-    fn roots(
-        name: &str,
-        types: &[&str],
-        keywords: &[&str],
-        oracle: &str,
-    ) -> Vec<AbilityDefinition> {
-        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
-        let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
-        let parsed = parse_oracle_text(oracle, name, &keywords, &types, &[]);
-        parsed
-            .abilities
-            .into_iter()
-            .chain(
-                parsed
-                    .triggers
-                    .into_iter()
-                    .filter_map(|t| t.execute.map(|e| *e)),
-            )
-            .collect()
-    }
 
     /// The flicker pair of every node of every root, at `Potential` scope.
     fn pairs(roots: &[AbilityDefinition]) -> Vec<FlickerPair> {
@@ -463,16 +444,6 @@ mod tests {
             });
         }
         pairs
-    }
-
-    fn only_pair(name: &str, types: &[&str], keywords: &[&str], oracle: &str) -> FlickerPair {
-        let pairs = pairs(&roots(name, types, keywords, oracle));
-        assert_eq!(
-            pairs.len(),
-            1,
-            "{name}: exactly one flicker pair, got {pairs:?}"
-        );
-        pairs[0].clone()
     }
 
     fn change_zone(origin: Option<Zone>, destination: Zone, target: TargetFilter) -> Effect {
@@ -541,14 +512,14 @@ mod tests {
         use ReturnTiming::{Immediate, Scheduled};
         let you = Some(ControllerRef::You);
 
-        let blink = only_pair(
+        let blink = fx::only_pair(
             "Momentary Blink",
             &["Instant"],
             fx::MOMENTARY_BLINK_KEYWORDS,
             fx::MOMENTARY_BLINK,
         );
         expect(&blink, Immediate, Filtered(you.clone()), None, Unaltered);
-        let cloudshift = only_pair("Cloudshift", &["Instant"], &[], fx::CLOUDSHIFT);
+        let cloudshift = fx::only_pair("Cloudshift", &["Instant"], &[], fx::CLOUDSHIFT);
         expect(
             &cloudshift,
             Immediate,
@@ -556,28 +527,28 @@ mod tests {
             you.clone(),
             Unaltered,
         );
-        let ghostly = only_pair("Ghostly Flicker", &["Instant"], &[], fx::GHOSTLY_FLICKER);
+        let ghostly = fx::only_pair("Ghostly Flicker", &["Instant"], &[], fx::GHOSTLY_FLICKER);
         assert_eq!(ghostly.subject, Filtered(you.clone()));
-        let guardian = only_pair(
+        let guardian = fx::only_pair(
             "Guardian of Ghirapur",
             &["Creature"],
             &["Flying"],
             fx::GUARDIAN_OF_GHIRAPUR,
         );
         expect(&guardian, Scheduled, Filtered(you.clone()), None, Unaltered);
-        let flickerwisp = only_pair("Flickerwisp", &["Creature"], &["Flying"], fx::FLICKERWISP);
+        let flickerwisp = fx::only_pair("Flickerwisp", &["Creature"], &["Flying"], fx::FLICKERWISP);
         expect(&flickerwisp, Scheduled, Filtered(None), None, Unaltered);
-        let mist = only_pair("Turn to Mist", &["Instant"], &[], fx::TURN_TO_MIST);
+        let mist = fx::only_pair("Turn to Mist", &["Instant"], &[], fx::TURN_TO_MIST);
         expect(&mist, Scheduled, Filtered(None), None, Unaltered);
         // The tapped return is not an alteration (it is not a gain).
-        let displacer = only_pair(
+        let displacer = fx::only_pair(
             "Eldrazi Displacer",
             &["Creature"],
             fx::ELDRAZI_DISPLACER_KEYWORDS,
             fx::ELDRAZI_DISPLACER,
         );
         expect(&displacer, Immediate, Filtered(None), None, Unaltered);
-        let maze = only_pair("Mystifying Maze", &["Land"], &[], fx::MYSTIFYING_MAZE);
+        let maze = fx::only_pair("Mystifying Maze", &["Land"], &[], fx::MYSTIFYING_MAZE);
         expect(
             &maze,
             Scheduled,
@@ -585,13 +556,13 @@ mod tests {
             None,
             Unaltered,
         );
-        let fleeting = only_pair("Fleeting Spirit", &["Creature"], &[], fx::FLEETING_SPIRIT);
+        let fleeting = fx::only_pair("Fleeting Spirit", &["Creature"], &[], fx::FLEETING_SPIRIT);
         expect(&fleeting, Scheduled, Source, None, Unaltered);
-        let aetherling = only_pair("Aetherling", &["Creature"], &[], fx::AETHERLING);
+        let aetherling = fx::only_pair("Aetherling", &["Creature"], &[], fx::AETHERLING);
         expect(&aetherling, Scheduled, Source, None, Unaltered);
-        let huatli = only_pair("Huatli, Poet of Unity", &["Creature"], &[], fx::HUATLI);
+        let huatli = fx::only_pair("Huatli, Poet of Unity", &["Creature"], &[], fx::HUATLI);
         expect(&huatli, Immediate, Source, None, Transformed);
-        let daydream = only_pair(
+        let daydream = fx::only_pair(
             "Daydream",
             &["Sorcery"],
             fx::DAYDREAM_KEYWORDS,
@@ -601,7 +572,7 @@ mod tests {
 
         // Flickering Spirit's return names the source (`SelfRef`), not the
         // exiled card: outside the anaphor set.
-        assert!(pairs(&roots(
+        assert!(pairs(&fx::roots(
             "Flickering Spirit",
             &["Creature"],
             &["Flying"],
@@ -634,7 +605,7 @@ mod tests {
             ("Tawnos's Coffin", "Artifact", &[][..], fx::TAWNOS_COFFIN),
         ] {
             assert!(
-                pairs(&roots(name, &[types], keywords, oracle)).is_empty(),
+                pairs(&fx::roots(name, &[types], keywords, oracle)).is_empty(),
                 "{name} must not pair"
             );
         }
@@ -689,7 +660,7 @@ mod tests {
     // U-A4: Oblivion Ring's ETB exile and LTB return are two abilities.
     #[test]
     fn pairing_never_crosses_abilities() {
-        let ring = roots("Oblivion Ring", &["Enchantment"], &[], fx::OBLIVION_RING);
+        let ring = fx::roots("Oblivion Ring", &["Enchantment"], &[], fx::OBLIVION_RING);
         assert_eq!(ring.len(), 2, "ETB exile and LTB return");
         assert!(pairs(&ring).is_empty());
     }
@@ -697,7 +668,7 @@ mod tests {
     // U-A5: Ghostly Flicker's one return pairs with both exiled targets.
     #[test]
     fn ghostly_flicker_pairs_both_targets() {
-        let pair = only_pair("Ghostly Flicker", &["Instant"], &[], fx::GHOSTLY_FLICKER);
+        let pair = fx::only_pair("Ghostly Flicker", &["Instant"], &[], fx::GHOSTLY_FLICKER);
         let mut scenario = fx::scenario();
         let giant = fx::giant(&mut scenario, P0);
         let bears = fx::bears(&mut scenario, P0);
@@ -746,7 +717,7 @@ mod tests {
             ("Ghostly Flicker", &[][..], fx::GHOSTLY_FLICKER),
         ] {
             assert!(
-                all_own_flicker_nodes(&roots(name, &["Instant"], keywords, oracle)),
+                all_own_flicker_nodes(&fx::roots(name, &["Instant"], keywords, oracle)),
                 "{name}"
             );
         }
@@ -757,7 +728,7 @@ mod tests {
             ("Huatli, Poet of Unity", fx::HUATLI),
             ("Fleeting Spirit", fx::FLEETING_SPIRIT),
         ] {
-            let blink: Vec<AbilityDefinition> = roots(name, &["Creature"], &[], oracle)
+            let blink: Vec<AbilityDefinition> = fx::roots(name, &["Creature"], &[], oracle)
                 .into_iter()
                 .filter(|root| exile_leg_target(&root.effect).is_some())
                 .collect();
@@ -765,7 +736,7 @@ mod tests {
             assert!(all_own_flicker_nodes(&blink), "{name}");
         }
 
-        let stratagem = roots(
+        let stratagem = fx::roots(
             "Illusionist's Stratagem",
             &["Instant"],
             &[],
@@ -778,7 +749,7 @@ mod tests {
             .expect("Stratagem draws");
         assert!(!is_own_flicker_node(ChainNode::Definition(draw)));
 
-        let settle = roots(
+        let settle = fx::roots(
             "Settle Beyond Reality",
             &["Sorcery"],
             &[],
@@ -794,10 +765,10 @@ mod tests {
             .expect("Settle's removal mode");
         assert!(!is_own_flicker_node(ChainNode::Definition(opponent_exile)));
 
-        let mist = roots("Turn to Mist", &["Instant"], &[], fx::TURN_TO_MIST);
+        let mist = fx::roots("Turn to Mist", &["Instant"], &[], fx::TURN_TO_MIST);
         assert!(!is_own_flicker_node(ChainNode::Definition(&mist[0])));
 
-        let kaya = roots(
+        let kaya = fx::roots(
             "Kaya, Ghost Assassin",
             &["Planeswalker"],
             &[],

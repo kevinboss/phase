@@ -33,7 +33,9 @@ use engine::types::replacements::ReplacementEvent;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
-use crate::ability_chain::{self, is_own_flicker_node, ChainNode, ExileSubject, FlickerPair};
+use crate::ability_chain::{
+    self, is_own_flicker_leg, is_own_flicker_node, ChainNode, ExileSubject, FlickerPair,
+};
 use crate::card_value::intrinsic_value;
 use crate::cast_facts::{collect_definition_effects, visit_definition_nodes, ModeWalk};
 use crate::config::PolicyPenalties;
@@ -100,7 +102,7 @@ impl AntiSelfHarmPolicy {
                 .map(|target| score_target_ref(ctx, target))
                 .fold(AntiSelfHarmScore::plain(0.0), AntiSelfHarmScore::combine),
             GameAction::SelectModes { .. } => AntiSelfHarmScore::plain(score_selected_modes(ctx)),
-            // Penalise accepting an optional effect whose life cost would kill or nearly kill us.
+            // CR 603.5: accepting an optional effect is worth the flicker value of the targets it holds (the lethal-life-cost veto is in verdict).
             GameAction::DecideOptionalEffect { accept: true } => {
                 AntiSelfHarmScore::plain(score_optional_effect_accept(ctx))
             }
@@ -157,31 +159,27 @@ pub(crate) enum FlickerCheckOutcome {
     NoValue(OwnLegShape),
 }
 
-/// How base treated a no-value own flicker candidate, which decides whether
-/// the no-value check vetoes it or charges it (base parity; orchestrator
-/// decision amending plan r9 S10.3). At `PHASE_BASE_SHA` an own flicker
-/// reached search only when both of base's exclusions let it through:
-/// - the pre-filter's redundancy path (`tactical_gate`
-///   `is_redundant_creature_only_removal`) rejects a cast or activation with a
-///   creature-only harmful leg and no live opponent target, so any own
-///   creature-only exile leg was excluded;
-/// - the own-board activation veto (`harmful_activation_reaches_only_own_board`)
-///   rejects an activation whose harmful legs reach only the AI's board unless
-///   `is_deliberate_self_target_rider` matches an immediate return, so an
-///   activation with a scheduled return (Abuelo, Aetherling) was excluded.
+/// How the no-value check treats a no-value own flicker, by the shape of its
+/// own exile legs:
+/// - a creature-only own leg is outside the pre-filter's removal class
+///   (`tactical_gate` `is_redundant_creature_only_removal`), and an activation
+///   whose return is not immediate (`is_deliberate_self_target_rider`) is
+///   outside the own-board activation veto's stand-down; with no gain, both
+///   are removed by the tactical pre-filter;
+/// - an own leg that admits noncreatures, or an activation with an immediate
+///   return, is left to search and charged the wasted-cast penalty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnLegShape {
-    /// Base excluded the candidate from search (a creature-only own leg, or an
-    /// activation without an immediate return): the tactical pre-filter
-    /// removes it (`flicker_no_value_gate_reject`), keeping that outcome.
-    ExcludedAtBase,
+    /// Removed from search (a creature-only own leg, or an activation without
+    /// an immediate return): the tactical pre-filter removes it
+    /// (`flicker_no_value_gate_reject`).
+    RemovedFromSearch,
     /// A spell none of whose own exile legs is creature-only (Ghostly Flicker,
-    /// Gone Fishing): base let search decide, so it is charged the
-    /// wasted-cast penalty.
+    /// Gone Fishing): left to search and charged the wasted-cast penalty.
     NoncreatureSpellLeg,
     /// An activation none of whose own exile legs is creature-only and whose
-    /// return is immediate (Ruin Ghost): base let search decide, so it is
-    /// charged the wasted-cast penalty.
+    /// return is immediate (Ruin Ghost): left to search and charged the
+    /// wasted-cast penalty.
     ImmediateReturnActivation,
 }
 
@@ -190,7 +188,7 @@ impl FlickerCheckOutcome {
     pub(crate) fn trace_code(self) -> i64 {
         match self {
             FlickerCheckOutcome::Gain => 1,
-            FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase) => 2,
+            FlickerCheckOutcome::NoValue(OwnLegShape::RemovedFromSearch) => 2,
             FlickerCheckOutcome::NoValue(
                 OwnLegShape::NoncreatureSpellLeg | OwnLegShape::ImmediateReturnActivation,
             ) => 3,
@@ -586,17 +584,16 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> AntiSelfHarmScore {
         None => (0.0, 0.0),
     };
 
-    // R1.9: an own flicker whose legal targets offer no value wastes the card
-    // or the activation. A candidate base excluded from search is removed by
-    // the tactical pre-filter (no term here); one base admitted is charged
-    // (`OwnLegShape`).
+    // An own flicker whose legal targets offer no value wastes the card or the
+    // activation: removed by the tactical pre-filter or charged here (`OwnLegShape`).
     let no_value_check = flicker_no_value_check(ctx);
     let no_value_penalty = match no_value_check {
         Some(FlickerCheckOutcome::NoValue(
             OwnLegShape::NoncreatureSpellLeg | OwnLegShape::ImmediateReturnActivation,
         )) => ctx.penalties().wasted_cast_penalty,
         Some(
-            FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase) | FlickerCheckOutcome::Gain,
+            FlickerCheckOutcome::NoValue(OwnLegShape::RemovedFromSearch)
+            | FlickerCheckOutcome::Gain,
         )
         | None => 0.0,
     };
@@ -716,13 +713,6 @@ fn is_harmful_creature_only_removal_leg(node: ChainNode<'_>) -> bool {
         && matches!(effect_polarity(effect), EffectPolarity::Harmful)
         && targets_creatures_only(effect)
         && !is_own_flicker_leg(node)
-}
-
-/// An exile leg paired with a return of the source or of a permanent its
-/// controller controls.
-fn is_own_flicker_leg(node: ChainNode<'_>) -> bool {
-    node.flicker_pair()
-        .is_some_and(|pair| pair.subject.is_own())
 }
 
 /// CR 603.5: a "may" trigger's choice is made as it resolves. Accepting an
@@ -853,7 +843,7 @@ fn linked_exile_release_penalty(
     }
 }
 
-/// CR 610.3a: only an "until this leaves the battlefield" link returns the
+/// CR 610.3: only an "until this leaves the battlefield" link returns the
 /// exiled card when its source leaves.
 fn exile_link_returns_when_source_leaves(kind: &ExileLinkKind) -> bool {
     match kind {
@@ -912,11 +902,11 @@ pub(crate) fn legal_targets_offer_flicker_gain(
     })
 }
 
-/// R1.9 — does an own flicker cast or activation have any legal target worth
+/// Does an own flicker cast or activation have any legal target worth
 /// flickering? A flicker whose every legal target gains nothing wastes the
 /// card or the activation. At the decision root the tactical pre-filter removes
-/// it when base excluded such a candidate from search, and `score_pre_cast`
-/// charges it when base admitted it (see [`OwnLegShape`]).
+/// it for an `OwnLegShape::RemovedFromSearch` shape, and `score_pre_cast`
+/// charges the other shapes (see [`OwnLegShape`]).
 ///
 /// `None` when a gate stopped the check before its board-wide step; the gates
 /// run cheapest first:
@@ -924,7 +914,8 @@ pub(crate) fn legal_targets_offer_flicker_gain(
 ///    and at least one is an own exile leg (a modal spell with a non-flicker
 ///    mode, a chain with any other node, or an unscoped or opponent-scoped leg
 ///    is not a pure own flicker);
-/// 2. card-local: an activation's cost is mana and/or tap only;
+/// 2. card-local: an activation's cost is not itself the play (a loyalty
+///    cost);
 /// 3. root only;
 /// 4. board-wide: the legal targets of each own exile leg.
 fn flicker_no_value_check(ctx: &PolicyContext<'_>) -> Option<FlickerCheckOutcome> {
@@ -933,7 +924,7 @@ fn flicker_no_value_check(ctx: &PolicyContext<'_>) -> Option<FlickerCheckOutcome
 }
 
 /// The card-local and root-only steps of the no-value check (gates 1–3): an
-/// own-flicker-only candidate's own exile legs and their base-parity
+/// own-flicker-only candidate's own exile legs and their
 /// [`OwnLegShape`]. `None` when a gate stops the check.
 struct OwnFlickerLegs<'a> {
     shape: OwnLegShape,
@@ -967,18 +958,18 @@ fn own_flicker_legs<'a>(ctx: &'a PolicyContext<'_>) -> Option<OwnFlickerLegs<'a>
         return None;
     }
     if matches!(ctx.candidate.action, GameAction::ActivateAbility { .. })
-        && !abilities
+        && abilities
             .iter()
-            .all(|ability| cost_is_mana_or_tap_only(ability))
+            .any(|ability| cost_is_its_own_play(ability))
     {
         return None;
     }
     if !ctx.at_root() {
         return None;
     }
-    // Base parity (see `OwnLegShape`): the pre-filter excluded any
-    // creature-only own leg; the activation veto excluded an activation
-    // without an immediate return.
+    // See `OwnLegShape`: a creature-only own leg is outside the pre-filter's
+    // removal class, and an activation without an immediate return is outside
+    // the own-board activation veto's stand-down.
     let gate_admitted = own_legs
         .iter()
         .all(|(effect, _)| !targets_creatures_only(effect));
@@ -989,7 +980,7 @@ fn own_flicker_legs<'a>(ctx: &'a PolicyContext<'_>) -> Option<OwnFlickerLegs<'a>
         {
             OwnLegShape::ImmediateReturnActivation
         }
-        _ => OwnLegShape::ExcludedAtBase,
+        _ => OwnLegShape::RemovedFromSearch,
     };
     Some(OwnFlickerLegs {
         shape,
@@ -1024,16 +1015,15 @@ fn flicker_legs_outcome(
     })
 }
 
-/// R1.9 at the tactical pre-filter (orchestrator decision amending plan r9):
-/// `Some(outcome)` when an own flicker that base's pre-filter or activation
-/// veto excluded from search (`OwnLegShape::ExcludedAtBase`) still has no
-/// legal target worth flickering, so the gate removes it exactly where base
-/// removed it. The board-wide step runs only for that card-local shape;
-/// shapes base admitted are charged by `score_pre_cast` instead.
+/// The tactical pre-filter's no-value check:
+/// `Some(outcome)` when an own flicker of shape
+/// `OwnLegShape::RemovedFromSearch` still has no legal target worth
+/// flickering, so the gate removes it. The board-wide step runs only for that
+/// card-local shape; the other shapes are charged by `score_pre_cast` instead.
 pub(crate) fn flicker_no_value_gate_reject(ctx: &PolicyContext<'_>) -> Option<FlickerCheckOutcome> {
     let own = own_flicker_legs(ctx)?;
     match own.shape {
-        OwnLegShape::ExcludedAtBase => match flicker_legs_outcome(ctx, &own)? {
+        OwnLegShape::RemovedFromSearch => match flicker_legs_outcome(ctx, &own)? {
             outcome @ FlickerCheckOutcome::NoValue(_) => Some(outcome),
             FlickerCheckOutcome::Gain => None,
         },
@@ -1041,26 +1031,30 @@ pub(crate) fn flicker_no_value_gate_reject(ctx: &PolicyContext<'_>) -> Option<Fl
     }
 }
 
-/// CR 601.2h + CR 602.2b: the cost is paid as part of activating; a cost whose
-/// own consequence can be the play (a loyalty gain, a discard or sacrifice) is
-/// priced by the cost policies, not by the flicker's target value. Read through
-/// the single cost authority (`AbilityDefinition::cost_categories`). A cost
-/// with no category (an effect cost without counters, an unimplemented cost)
-/// is not mana/tap only.
-fn cost_is_mana_or_tap_only(ability: &AbilityDefinition) -> bool {
+/// CR 601.2h + CR 602.2b + CR 606.4: the cost is paid as part of activating.
+/// A loyalty ability's cost changes its permanent's loyalty, and that change
+/// can be the play whatever the flicker gains, so the no-value check stands
+/// down for it. Any other cost (mana, tap, a discard, a sacrifice, life) buys
+/// only the flicker, so a flicker with no gain wastes it. Read through the
+/// single cost authority (`AbilityDefinition::cost_categories`); a cost with
+/// no category (an effect cost without counters, an unimplemented cost) cannot
+/// be read, so the check stands down for it too.
+fn cost_is_its_own_play(ability: &AbilityDefinition) -> bool {
     if ability.cost.is_none() {
-        return true;
+        return false;
     }
     let categories = ability.cost_categories();
-    !categories.is_empty() && categories.iter().all(|c| category_is_mana_or_tap(*c))
+    categories.is_empty() || categories.iter().any(|c| category_is_its_own_play(*c))
 }
 
-fn category_is_mana_or_tap(category: CostCategory) -> bool {
+fn category_is_its_own_play(category: CostCategory) -> bool {
     match category {
-        CostCategory::ManaOnly | CostCategory::TapsSelf | CostCategory::UntapsSelf => true,
-        CostCategory::SacrificesPermanent
+        CostCategory::PaysLoyalty => true,
+        CostCategory::ManaOnly
+        | CostCategory::TapsSelf
+        | CostCategory::UntapsSelf
+        | CostCategory::SacrificesPermanent
         | CostCategory::PaysLife
-        | CostCategory::PaysLoyalty
         | CostCategory::Discards
         | CostCategory::ExilesCards
         | CostCategory::TapsOtherCreatures
@@ -9510,24 +9504,28 @@ mod flicker_rows {
             .map(|(_, value)| *value)
     }
 
-    /// R1.9's veto (orchestrator decision amending plan r9): the tactical
+    /// R1.9's veto: the tactical
     /// pre-filter removes the candidate with the no-value check's
-    /// `NoValue(ExcludedAtBase)` outcome, and the policy itself scores it with
+    /// `NoValue(RemovedFromSearch)` outcome, and the policy itself scores it with
     /// that fact (code 2) and no term.
-    fn gate_vetoes_no_value(state: &GameState, action: &GameAction) -> bool {
+    fn assert_gate_vetoes_no_value(state: &GameState, action: &GameAction, label: &str) {
         let probe = fx::Probe::new(state, action);
         let ctx = probe.ctx(state, ROOT);
         let outcome = flicker_no_value_gate_reject(&ctx);
         let verdict = AntiSelfHarmPolicy.verdict(&ctx);
-        let gate = fx::gate_passes(state, action);
-        eprintln!(
-            "[flicker gate] {action:?}: gate outcome={outcome:?} gate passes={gate} policy fact={:?}",
-            fact(&verdict, "flicker_no_value_check")
+        assert_eq!(
+            outcome,
+            Some(FlickerCheckOutcome::NoValue(OwnLegShape::RemovedFromSearch)),
+            "{label}: the no-value check's gate outcome"
         );
-        outcome == Some(FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase))
-            && !gate
-            && reject_kind(&verdict).is_none()
-            && fact(&verdict, "flicker_no_value_check") == Some(2)
+        assert!(
+            !fx::gate_passes(state, action),
+            "{label}: the pre-filter must remove the candidate"
+        );
+        assert!(
+            reject_kind(&verdict).is_none() && fact(&verdict, "flicker_no_value_check") == Some(2),
+            "{label}: the policy scores it with the shape-2 fact, got {verdict:?}"
+        );
     }
 
     /// A no-value-check penalty reading: a score (not a veto) whose reason is
@@ -9536,18 +9534,6 @@ mod flicker_rows {
         reject_kind(verdict).is_none()
             && reason_of(verdict).kind == "anti_self_harm_score"
             && fact(verdict, "flicker_no_value_check") == Some(3)
-    }
-
-    fn print(row: &str, label: &str, verdict: &PolicyVerdict, score: Option<f64>) {
-        eprintln!(
-            "[flicker {row}] {label}: verdict={} facts={:?} score={score:?}",
-            match verdict {
-                PolicyVerdict::Reject { reason } => format!("Reject({})", reason.kind),
-                PolicyVerdict::Score { delta, reason } =>
-                    format!("Score({delta}, {})", reason.kind),
-            },
-            reason_of(verdict).facts
-        );
     }
 
     fn blink(scenario: &mut GameScenario) -> ObjectId {
@@ -9677,7 +9663,6 @@ mod flicker_rows {
                 .expect("an AI-controlled object is valued")
         };
         let (rescue, etb, no_gain) = (value(v), value(e), value(w));
-        eprintln!("[flicker U-H1] V={rescue:?} E={etb:?} W={no_gain:?}");
         assert_eq!(rescue.kind, FlickerValueKind::Rescue);
         assert_eq!(etb.kind, FlickerValueKind::EtbReuse);
         assert_eq!(no_gain.kind, FlickerValueKind::NoGain);
@@ -9723,7 +9708,6 @@ mod flicker_rows {
         let state = target_runner.state();
         let banisher_score = score_at(state, &fx::choose(banisher), ROOT);
         let w_score = score_at(state, &fx::choose(w), ROOT);
-        eprintln!("[flicker U-H2] Blink slot: Banisher={banisher_score} W={w_score}");
         assert!(banisher_score < w_score);
 
         let penalties = PolicyPenalties::default();
@@ -9735,7 +9719,6 @@ mod flicker_rows {
             &penalties,
         )
         .expect("valued");
-        eprintln!("[flicker U-H2] Banisher holding the AI's own card: {lent_value:?}");
         assert_eq!(lent_value.kind, FlickerValueKind::NoGain);
         assert_eq!(lent_value.score, penalties.flicker_no_value_penalty);
 
@@ -9749,7 +9732,6 @@ mod flicker_rows {
             &penalties,
         )
         .expect("valued");
-        eprintln!("[flicker U-H2] threatened Banisher: {threatened:?}");
         assert_eq!(threatened.kind, FlickerValueKind::Rescue);
         assert_eq!(
             threatened.score,
@@ -9783,7 +9765,6 @@ mod flicker_rows {
         let state = runner.state();
         let ring_score = score_at(state, &fx::choose(ring), ROOT);
         let totem_score = score_at(state, &fx::choose(totem), ROOT);
-        eprintln!("[flicker U-H2] Felidar slot: Oblivion Ring={ring_score} totem={totem_score}");
         assert!(ring_score < totem_score);
     }
 
@@ -9809,11 +9790,13 @@ mod flicker_rows {
             let state = runner.state();
             let stolen_score = score_at(state, &fx::choose(stolen), ROOT);
             let own_score = score_at(state, &fx::choose(w), ROOT);
-            eprintln!("[flicker U-H3] {name}: stolen={stolen_score} own W={own_score}");
             if blink_spell {
-                assert!(stolen_score < own_score);
+                assert!(
+                    stolen_score < own_score,
+                    "{name}: stolen {stolen_score} vs own {own_score}"
+                );
             } else {
-                assert_eq!(stolen_score, own_score);
+                assert_eq!(stolen_score, own_score, "{name}");
             }
         }
     }
@@ -9833,7 +9816,6 @@ mod flicker_rows {
         let with_etb = score_at(runner.state(), &cast, ROOT);
         fx::opponent_casts(&mut runner, murder, Some(TargetRef::Object(v)));
         let with_murder = score_at(runner.state(), &cast, ROOT);
-        eprintln!("[flicker U-H4] E on board={with_etb} Murder on V={with_murder}");
         assert_eq!(with_etb, 0.0);
         assert_eq!(with_murder, 0.0);
     }
@@ -9909,21 +9891,12 @@ mod flicker_rows {
         ] {
             let (runner, action) = no_value_arm(&arm, false);
             let state = runner.state();
-            let verdict = verdict_at(state, &action, ROOT);
-            let registry = registry_score_at(state, &action, ROOT);
-            print("U-H5", &format!("{label} root"), &verdict, Some(registry));
-            assert!(gate_vetoes_no_value(state, &action), "{label}: {verdict:?}");
+            assert_gate_vetoes_no_value(state, &action, label);
 
             let (runner, action) = no_value_arm(&arm, true);
             let state = runner.state();
             let guard = verdict_at(state, &action, ROOT);
             let guard_score = score_at(state, &action, ROOT);
-            print(
-                "U-H5",
-                &format!("{label} + E root"),
-                &guard,
-                Some(guard_score),
-            );
             assert!(reject_kind(&guard).is_none(), "{label} + E: {guard:?}");
             assert_eq!(guard_score, 0.0, "{label} + E");
             assert_eq!(
@@ -9940,43 +9913,23 @@ mod flicker_rows {
             let state = runner.state();
             let verdict = verdict_at(state, &action, ROOT);
             let score = score_at(state, &action, ROOT);
-            print("U-H5", &format!("{label} root"), &verdict, Some(score));
             assert!(is_no_value_penalty_reason(&verdict), "{label}: {verdict:?}");
             assert_eq!(score, wasted(), "{label}");
         }
-        // The activation split (base parity): Abuelo's scheduled return was
-        // excluded from search at base (own-board activation veto), so it is
-        // vetoed; Ruin Ghost's immediate return was admitted (the rider), so
-        // it is charged.
+        // The activation split: Abuelo's scheduled return is outside the
+        // own-board activation veto's stand-down, so the pre-filter removes
+        // it; Ruin Ghost's immediate return is inside it (the rider), so it is
+        // left to search and charged.
         let (abuelo_runner, abuelo_action) = no_value_arm(&NoValueArm::Abuelo, false);
         let (ghost_runner, ghost_action) = no_value_arm(&NoValueArm::RuinGhost, false);
-        let abuelo_verdict = verdict_at(abuelo_runner.state(), &abuelo_action, ROOT);
         let ghost_verdict = verdict_at(ghost_runner.state(), &ghost_action, ROOT);
-        print(
-            "U-H5",
-            "activation split: Abuelo (scheduled)",
-            &abuelo_verdict,
-            None,
-        );
-        print(
-            "U-H5",
-            "activation split: Ruin Ghost (immediate)",
-            &ghost_verdict,
-            None,
-        );
-        assert!(gate_vetoes_no_value(abuelo_runner.state(), &abuelo_action));
+        assert_gate_vetoes_no_value(abuelo_runner.state(), &abuelo_action, "Abuelo");
         assert!(is_no_value_penalty_reason(&ghost_verdict));
         assert!(fx::gate_passes(ghost_runner.state(), &ghost_action));
 
         let (runner, action) = no_value_arm(&NoValueArm::GhostlyFlicker, true);
         let guard = verdict_at(runner.state(), &action, ROOT);
         let guard_score = score_at(runner.state(), &action, ROOT);
-        print(
-            "U-H5",
-            "Ghostly Flicker + E root",
-            &guard,
-            Some(guard_score),
-        );
         assert!(reject_kind(&guard).is_none());
         assert_eq!(guard_score, 0.0);
         assert_eq!(fact(&guard, "flicker_no_value_check"), Some(1));
@@ -9988,7 +9941,6 @@ mod flicker_rows {
             let (runner, action) = no_value_arm(&arm, false);
             let verdict = verdict_at(runner.state(), &action, LOOKAHEAD);
             let score = score_at(runner.state(), &action, LOOKAHEAD);
-            print("U-H5", &format!("{label} lookahead"), &verdict, Some(score));
             assert!(reject_kind(&verdict).is_none(), "{label}: {verdict:?}");
             assert_eq!(score, 0.0, "{label}");
         }
@@ -10014,10 +9966,8 @@ mod flicker_rows {
         fx::resolve_to_prompt(&mut runner, wisp);
         let state = runner.state();
         let at_e = verdict_at(state, &fx::choose(e), ROOT);
-        print("U-H6", "Flickerwisp -> E", &at_e, None);
         assert!(reject_kind(&at_e).is_none());
         let at_t = verdict_at(state, &fx::choose(t), ROOT);
-        print("U-H6", "Flickerwisp -> own T (hostile)", &at_t, None);
         assert!(reject_kind(&at_t).is_some());
 
         // Abuelo with own V and E only.
@@ -10030,7 +9980,6 @@ mod flicker_rows {
         let runner = scenario.build();
         let action = fx::activate_action(runner.state(), source);
         let verdict = verdict_at(runner.state(), &action, ROOT);
-        print("U-H6", "Abuelo with V and E", &verdict, None);
         assert!(reject_kind(&verdict).is_none());
 
         // Venser's +1 with own V and lands only.
@@ -10041,7 +9990,6 @@ mod flicker_rows {
         let runner = scenario.build();
         let action = fx::activate_action(runner.state(), source);
         let verdict = verdict_at(runner.state(), &action, ROOT);
-        print("U-H6", "Venser +1 with V and lands", &verdict, None);
         assert!(reject_kind(&verdict).is_none());
     }
 
@@ -10079,7 +10027,6 @@ mod flicker_rows {
                 _ => {}
             }
         }
-        eprintln!("[flicker U-H7] decline={declines:?} V={v_scores:?}");
         assert!(!declines.is_empty() && !v_scores.is_empty());
         let best_decline = declines.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         assert!(v_scores.iter().all(|score| *score < best_decline));
@@ -10139,7 +10086,6 @@ mod flicker_rows {
         for (label, expect_positive) in [("E", true), ("V", false), ("T", false)] {
             let (runner, _) = restoration_angel_frame(label);
             let accept = score_at(runner.state(), &ACCEPT, ROOT);
-            eprintln!("[flicker U-H8] Restoration Angel -> {label}: accept={accept}");
             if expect_positive {
                 assert!(accept > 0.0);
             } else {
@@ -10164,7 +10110,6 @@ mod flicker_rows {
         let _ = runner.cast(mer_man).commit();
         drive_to_optional_choice(&mut runner);
         let draw_accept = score_at(runner.state(), &ACCEPT, ROOT);
-        eprintln!("[flicker U-H8] Mer Man draw frame: accept={draw_accept}");
         assert_eq!(draw_accept, 0.0);
 
         // Reach guard: a frame whose ability the opponent controls scores 0.0
@@ -10195,7 +10140,6 @@ mod flicker_rows {
             }
         }
         let opponent_accept = score_at(runner.state(), &ACCEPT, ROOT);
-        eprintln!("[flicker U-H8] P1's Restoration Angel frame: accept={opponent_accept}");
         assert_eq!(opponent_accept, 0.0);
     }
 
@@ -10249,13 +10193,11 @@ mod flicker_rows {
         for card in ["Turn to Mist", "Otherworldly Journey", "Eldrazi Displacer"] {
             let (runner, action) = unscoped_flicker(card, true);
             let score = score_at(runner.state(), &action, ROOT);
-            eprintln!("[flicker U-H9] {card} with E: score={score}");
             assert_eq!(score, 0.0, "{card}");
         }
         for card in ["Turn to Mist", "Eldrazi Displacer"] {
             let (runner, action) = unscoped_flicker(card, false);
             let score = score_at(runner.state(), &action, ROOT);
-            eprintln!("[flicker U-H9] {card} with only V: score={score}");
             assert_eq!(score, wasted(), "{card}");
         }
     }
@@ -10293,12 +10235,14 @@ mod flicker_rows {
         let verdict = verdict_at(state, &action, ROOT);
         let score = score_at(state, &action, ROOT);
         let gate = fx::gate_passes(state, &action);
-        print("U-H10", "Illusionist's Stratagem", &verdict, Some(score));
-        eprintln!("[flicker U-H10] Illusionist's Stratagem gate passes = {gate}");
         assert_eq!(fact(&verdict, "flicker_no_value_check"), None);
         assert_eq!(score, 0.0);
         assert!(gate);
-        assert!(gate_vetoes_no_value(state, &fx::cast_action(state, reach)));
+        assert_gate_vetoes_no_value(
+            state,
+            &fx::cast_action(state, reach),
+            "Momentary Blink (reach)",
+        );
 
         for opposing in [true, false] {
             let mut scenario = base_board(opposing);
@@ -10318,15 +10262,13 @@ mod flicker_rows {
             let action = fx::cast_action(state, settle);
             let verdict = verdict_at(state, &action, ROOT);
             let score = score_at(state, &action, ROOT);
-            print(
-                "U-H10",
-                &format!("Settle Beyond Reality, opposing creature = {opposing}"),
-                &verdict,
-                Some(score),
-            );
             assert_eq!(fact(&verdict, "flicker_no_value_check"), None);
             assert_eq!(score, if opposing { 0.0 } else { wasted() });
-            assert!(gate_vetoes_no_value(state, &fx::cast_action(state, reach)));
+            assert_gate_vetoes_no_value(
+                state,
+                &fx::cast_action(state, reach),
+                "Momentary Blink (reach)",
+            );
         }
     }
 
@@ -10345,14 +10287,10 @@ mod flicker_rows {
         let action = fx::activate_action(state, venser);
         let verdict = verdict_at(state, &action, ROOT);
         let score = score_at(state, &action, ROOT);
-        print("U-H11", "Venser +1", &verdict, Some(score));
         assert!(reject_kind(&verdict).is_none());
         assert_eq!(score, 0.0);
         assert!(fx::gate_passes(state, &action));
-        assert!(gate_vetoes_no_value(
-            state,
-            &fx::activate_action(state, abuelo)
-        ));
+        assert_gate_vetoes_no_value(state, &fx::activate_action(state, abuelo), "Abuelo (reach)");
     }
 
     // U-H12 (R1.9, activation): a no-value own flicker activation is removed
@@ -10362,14 +10300,9 @@ mod flicker_rows {
     fn no_value_own_flicker_activation_is_not_taken() {
         let (runner, action) = no_value_arm(&NoValueArm::Smuggler, false);
         let state = runner.state();
-        let gate = fx::gate_passes(state, &action);
-        let verdict = verdict_at(state, &action, ROOT);
-        print("U-H12", "Nephalia Smuggler", &verdict, None);
-        eprintln!("[flicker U-H12] Nephalia Smuggler gate passes = {gate}");
-        // Removed by the pre-filter's no-value veto, not by base's
-        // redundancy path (the own leg is not redundant removal).
-        assert!(!gate);
-        assert!(gate_vetoes_no_value(state, &action));
+        // Removed by the pre-filter's no-value check (U-G1 shows the
+        // redundancy path does not read the own leg as removal).
+        assert_gate_vetoes_no_value(state, &action, "Nephalia Smuggler");
     }
 
     // U-H13 (B3): a token (CR 111.8) ranks below every flicker target that
@@ -10421,9 +10354,6 @@ mod flicker_rows {
             score(stolen),
             score(stolen_banisher),
         );
-        eprintln!(
-            "[flicker U-H13] T={t_score} Banisher={banisher} stolen={stolen_score} stolen Banisher={stolen_banisher_score}"
-        );
         assert!(banisher > t_score);
         assert!(stolen_score > t_score);
         assert!(stolen_banisher_score > t_score);
@@ -10454,7 +10384,6 @@ mod flicker_rows {
         };
         let (runner, action) = smuggler_board(None);
         let verdict = verdict_at(runner.state(), &action, ROOT);
-        print("U-H14", "Nephalia Smuggler, only own T", &verdict, None);
         assert_eq!(
             reject_kind(&verdict),
             Some("anti_self_harm_harmful_activation_own_board_only")
@@ -10463,14 +10392,12 @@ mod flicker_rows {
         // re-enters); the no-value check then vetoes the vanilla re-entry.
         let (runner, action) = smuggler_board(Some("V"));
         let verdict = verdict_at(runner.state(), &action, ROOT);
-        print("U-H14", "Nephalia Smuggler, own T and V", &verdict, None);
         assert_ne!(
             reject_kind(&verdict),
             Some("anti_self_harm_harmful_activation_own_board_only")
         );
         let (runner, action) = smuggler_board(Some("E"));
         let verdict = verdict_at(runner.state(), &action, ROOT);
-        print("U-H14", "Nephalia Smuggler, own T and E", &verdict, None);
         assert!(reject_kind(&verdict).is_none());
 
         // Eldrazi Displacer with only own T and a stolen creature.
@@ -10484,12 +10411,6 @@ mod flicker_rows {
         mark_token(&mut runner, t);
         let action = fx::activate_action(runner.state(), source);
         let verdict = verdict_at(runner.state(), &action, ROOT);
-        print(
-            "U-H14",
-            "Eldrazi Displacer, own T and stolen",
-            &verdict,
-            None,
-        );
         assert_eq!(
             reject_kind(&verdict),
             Some("anti_self_harm_harmful_activation_own_board_only")
@@ -10506,7 +10427,6 @@ mod flicker_rows {
         let index = fx::exile_ability_index(runner.state(), source);
         fx::begin_activation(&mut runner, source, index);
         let verdict = verdict_at(runner.state(), &fx::choose(t), ROOT);
-        print("U-H14", "Eldrazi Displacer -> own T", &verdict, None);
         assert!(reject_kind(&verdict).is_some());
     }
 
@@ -10568,14 +10488,7 @@ mod flicker_rows {
         let root = verdict_at(runner.state(), &action, ROOT);
         let lookahead = verdict_at(runner.state(), &action, LOOKAHEAD);
         let lookahead_score = score_at(runner.state(), &action, LOOKAHEAD);
-        print("U-H15", "(a) Aetherling root", &root, None);
-        print(
-            "U-H15",
-            "(a) Aetherling lookahead",
-            &lookahead,
-            Some(lookahead_score),
-        );
-        assert!(gate_vetoes_no_value(runner.state(), &action));
+        assert_gate_vetoes_no_value(runner.state(), &action, "(a) Aetherling root");
         assert!(reject_kind(&root).is_none());
         assert!(reject_kind(&lookahead).is_none());
         assert_eq!(lookahead_score, 0.0);
@@ -10583,12 +10496,6 @@ mod flicker_rows {
         let (runner, action) = aetherling_board(true);
         let rescue = verdict_at(runner.state(), &action, ROOT);
         let rescue_score = score_at(runner.state(), &action, ROOT);
-        print(
-            "U-H15",
-            "(b) Aetherling under Murder",
-            &rescue,
-            Some(rescue_score),
-        );
         assert!(reject_kind(&rescue).is_none());
         assert_eq!(rescue_score, 0.0);
 
@@ -10599,16 +10506,21 @@ mod flicker_rows {
             let (runner, action) = nicol_bolas_board(shroud);
             let verdict = verdict_at(runner.state(), &action, ROOT);
             let score = score_at(runner.state(), &action, ROOT);
-            print("U-H15", label, &verdict, Some(score));
             assert!(reject_kind(&verdict).is_none(), "{label}");
             assert_eq!(score, 0.0, "{label}");
             assert_eq!(fact(&verdict, "flicker_no_value_check"), Some(1), "{label}");
         }
     }
 
-    fn fleeting_spirit_board(threat: bool) -> (GameRunner, GameAction) {
+    /// Fleeting Spirit on the AI's battlefield, a spare card in the AI's hand
+    /// and, with `spare_land`, a Plains too (the cheap discard a real hand
+    /// holds); with `threat`, the opponent's Murder targets it.
+    fn fleeting_spirit_board(threat: bool, spare_land: bool) -> (GameRunner, GameAction) {
         let mut scenario = fx::scenario();
         scenario.add_card_to_hand(P0, "Spare Card");
+        if spare_land {
+            scenario.add_land_to_hand(P0, "Plains");
+        }
         let spirit = fx::creature(
             &mut scenario,
             P0,
@@ -10627,41 +10539,39 @@ mod flicker_rows {
         (runner, action)
     }
 
-    // U-H16 (F1): a self-blink whose cost is its own consequence (a discard)
-    // is priced by the cost policy, not vetoed by this one.
+    // U-H16 (F1): a self-blink whose cost is a discard buys only the flicker,
+    // so with no gain the pre-filter removes it whatever the hand holds (a
+    // spare land makes the discard cheap, so the cost policy alone would not
+    // reject it); with a pending removal on it, the rescue is a gain and the
+    // cost policy prices the discard.
     #[test]
-    fn cost_priced_self_blink_verdict_follows_the_cost_policy() {
-        for (label, threat) in [("(a) no threat", false), ("(b) Murder on it", true)] {
-            let (runner, action) = fleeting_spirit_board(threat);
-            let state = runner.state();
-            let anti = verdict_at(state, &action, ROOT);
-            let anti_score = score_at(state, &action, ROOT);
-            let cost = registry_verdict_of(state, &action, PolicyId::SelfCostValue)
-                .expect("SelfCostValuePolicy scores the activation");
-            let registry = registry_score_at(state, &action, ROOT);
-            print(
-                "U-H16",
-                &format!("{label} AntiSelfHarm"),
-                &anti,
-                Some(anti_score),
+    fn discard_cost_self_blink_needs_a_gain() {
+        for spare_land in [false, true] {
+            let (runner, action) = fleeting_spirit_board(false, spare_land);
+            assert_gate_vetoes_no_value(
+                runner.state(),
+                &action,
+                &format!("no threat, spare land in hand = {spare_land}"),
             );
-            print(
-                "U-H16",
-                &format!("{label} SelfCostValue"),
-                &cost,
-                Some(registry),
-            );
-            assert!(reject_kind(&anti).is_none(), "{label}");
-            assert_eq!(anti_score, 0.0, "{label}");
-            if threat {
-                assert!(reject_kind(&cost).is_none());
-                assert_eq!(reason_of(&cost).kind, "self_cost_benefit_present");
-                assert!(registry.is_finite());
-            } else {
-                assert_eq!(reject_kind(&cost), Some("self_cost_trivial_benefit"));
-                assert_eq!(registry, f64::NEG_INFINITY);
-            }
         }
+
+        let (runner, action) = fleeting_spirit_board(true, false);
+        let state = runner.state();
+        let anti = verdict_at(state, &action, ROOT);
+        let anti_score = score_at(state, &action, ROOT);
+        let cost = registry_verdict_of(state, &action, PolicyId::SelfCostValue)
+            .expect("SelfCostValuePolicy scores the activation");
+        let registry = registry_score_at(state, &action, ROOT);
+        assert!(fx::gate_passes(state, &action), "a rescue passes the gate");
+        assert!(reject_kind(&anti).is_none(), "{anti:?}");
+        assert_eq!(anti_score, 0.0, "{anti:?}");
+        assert_eq!(fact(&anti, "flicker_no_value_check"), Some(1), "{anti:?}");
+        assert_eq!(
+            reason_of(&cost).kind,
+            "self_cost_benefit_present",
+            "{cost:?}"
+        );
+        assert!(registry.is_finite(), "registry score {registry}");
     }
 
     // U-H17 (F1): a return that alters the permanent (CR 122.6: with a
@@ -10701,12 +10611,14 @@ mod flicker_rows {
             let gate = fx::gate_passes(state, &action);
             let verdict = verdict_at(state, &action, ROOT);
             let score = score_at(state, &action, ROOT);
-            print("U-H17", label, &verdict, Some(score));
-            eprintln!("[flicker U-H17] {label} gate passes = {gate}");
             assert!(gate, "{label}");
             assert!(reject_kind(&verdict).is_none(), "{label}");
             assert_eq!(score, 0.0, "{label}");
         }
-        assert!(gate_vetoes_no_value(state, &fx::cast_action(state, reach)));
+        assert_gate_vetoes_no_value(
+            state,
+            &fx::cast_action(state, reach),
+            "Momentary Blink (reach)",
+        );
     }
 }

@@ -1889,11 +1889,6 @@ mod flicker_rows {
             .iter()
             .map(|effect| *effect as *const Effect)
             .collect();
-        eprintln!(
-            "[flicker U-C2] {label}: {} nodes, {} effects",
-            nodes.len(),
-            effects.len()
-        );
         assert_eq!(nodes, effects, "{label}");
         nodes.len()
     }

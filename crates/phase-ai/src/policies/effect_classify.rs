@@ -4418,7 +4418,6 @@ mod flicker_rows {
             ),
         ];
         for (label, outcome, expected) in rows {
-            eprintln!("[flicker U-C1] {label}: {outcome:?}");
             assert_eq!(outcome, Some(expected), "{label}");
         }
 
@@ -4427,7 +4426,6 @@ mod flicker_rows {
         let teammate = scenario.add_creature(P1, "Teammate Bear", 2, 2).id();
         let runner = scenario.build();
         let outcome = flicker_target_outcome(runner.state(), &flickerwisp_pair(), teammate, P0);
-        eprintln!("[flicker U-C1] teammate's object, Flickerwisp (2HG): {outcome:?}");
         assert_eq!(outcome, Some(Reenters));
 
         assert_eq!(Reenters.polarity(), EffectPolarity::Beneficial);
@@ -4477,7 +4475,6 @@ mod flicker_rows {
             flicker_reading_for_target(&ctx, v),
             flicker_reading_for_target(&ctx, t),
         );
-        eprintln!("[flicker U-C3] Blink: V={at_v:?} T={at_t:?}");
         assert_eq!(at_v, Some(FlickerTargetOutcome::Reenters));
         assert_eq!(at_t, Some(FlickerTargetOutcome::Ceases));
 
@@ -4486,7 +4483,6 @@ mod flicker_rows {
         let probe = fx::Probe::new(state, &fx::choose(v));
         let ctx = probe.ctx(state, SearchDepth::Root);
         let at_v = flicker_reading_for_target(&ctx, v);
-        eprintln!("[flicker U-C3] Murder: V={at_v:?}");
         assert_eq!(at_v, None);
     }
 }

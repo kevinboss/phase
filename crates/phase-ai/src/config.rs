@@ -1414,7 +1414,7 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "flicker_rescue_target_bonus",
-        "CR 608.2b + CR 400.7 rescue term for a flicker target that a pending removal would remove, whoever controls it (charter r9); ordering invariant: rescue outranks ETB re-use (> flicker_etb_retrigger_bonus) and suppresses the linked-exile-release term; awaiting a paired-seed ai-gate calibration.",
+        "CR 608.2b + CR 400.7 rescue term for a flicker target that a pending removal would remove, whoever controls it; ordering invariant: rescue outranks ETB re-use (> flicker_etb_retrigger_bonus) and suppresses the linked-exile-release term; awaiting a paired-seed ai-gate calibration.",
     ),
     (
         "flicker_etb_retrigger_bonus",
