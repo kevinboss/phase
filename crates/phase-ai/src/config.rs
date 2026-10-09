@@ -664,6 +664,47 @@ pub struct PolicyPenalties {
     /// the bound has to be stated in the resource the player actually spends.
     #[serde(default = "default_self_cost_material_life")]
     pub self_cost_material_life: i32,
+    /// Strong band. Rescue term for a flicker target a pending removal on the
+    /// stack would remove, whoever controls it (CR 608.2b + CR 400.7: the
+    /// flicker leaves that removal's target illegal), added to the threatened
+    /// permanent's value.
+    /// Ordering invariant: above `flicker_etb_retrigger_bonus`. Consumed by
+    /// `AntiSelfHarmPolicy`'s flicker target valuation.
+    #[serde(default = "default_flicker_rescue_target_bonus")]
+    pub flicker_rescue_target_bonus: f64,
+    /// Strong band. ETB re-use term for a flicker target with a value ETB
+    /// (CR 603.6a). Ordering invariant: below `flicker_rescue_target_bonus` and
+    /// above zero. Consumed by `AntiSelfHarmPolicy`'s flicker target valuation.
+    #[serde(default = "default_flicker_etb_retrigger_bonus")]
+    pub flicker_etb_retrigger_bonus: f64,
+    /// Preference band. Score of a flicker target with no rescue and no ETB
+    /// value. Ordering invariant: strictly below `AntiSelfHarmPolicy`'s declined
+    /// target score (-0.25), so an optional flicker slot whose only targets
+    /// gain nothing is declined. Consumed by `AntiSelfHarmPolicy`'s flicker
+    /// target valuation.
+    #[serde(default = "default_flicker_no_value_penalty")]
+    pub flicker_no_value_penalty: f64,
+    /// Strong band. Cost of flickering a permanent whose leaving returns an
+    /// opponent's card it holds in a linked exile (CR 610.3; CR 607.2a +
+    /// CR 603.6c). Ordering invariant: negative, and not applied to a rescued
+    /// target. Consumed by `AntiSelfHarmPolicy`'s flicker target valuation.
+    #[serde(default = "default_flicker_releases_exile_penalty")]
+    pub flicker_releases_exile_penalty: f64,
+    /// Strong band. Score of a flicker target that returns under another
+    /// player's control (CR 110.2a). Ordering invariant: strictly below
+    /// `flicker_no_value_penalty`, and never a rescue. Consumed by
+    /// `AntiSelfHarmPolicy`'s flicker target valuation.
+    #[serde(default = "default_flicker_control_loss_penalty")]
+    pub flicker_control_loss_penalty: f64,
+    /// Critical band. Score of a flicker target that cannot return — a token
+    /// (CR 111.8), or a card that isn't double-faced under a transformed return
+    /// (CR 712.14a). Ordering invariant: strictly below
+    /// `min(flicker_no_value_penalty, flicker_control_loss_penalty) +
+    /// flicker_releases_exile_penalty`, so it ranks below every flicker target
+    /// that returns. Consumed by `AntiSelfHarmPolicy`'s flicker target
+    /// valuation.
+    #[serde(default = "default_flicker_token_target_score")]
+    pub flicker_token_target_score: f64,
 }
 
 impl Default for PolicyPenalties {
@@ -761,6 +802,12 @@ impl Default for PolicyPenalties {
             land_color_demand_unit: default_land_color_demand_unit(),
             land_tempo_rider_penalty: default_land_tempo_rider_penalty(),
             self_cost_material_life: default_self_cost_material_life(),
+            flicker_rescue_target_bonus: default_flicker_rescue_target_bonus(),
+            flicker_etb_retrigger_bonus: default_flicker_etb_retrigger_bonus(),
+            flicker_no_value_penalty: default_flicker_no_value_penalty(),
+            flicker_releases_exile_penalty: default_flicker_releases_exile_penalty(),
+            flicker_control_loss_penalty: default_flicker_control_loss_penalty(),
+            flicker_token_target_score: default_flicker_token_target_score(),
         }
     }
 }
@@ -853,6 +900,34 @@ fn default_self_cost_material_life() -> i32 {
 }
 
 fn default_wasted_cast_penalty() -> f64 {
+    -8.0
+}
+
+// The six flicker target-valuation scalars below are shared by `Default` and
+// `#[serde(default)]`, so a tuning artifact written before they existed still
+// deserializes (`ai_tune` reads `policy_penalties` directly into this struct).
+
+fn default_flicker_rescue_target_bonus() -> f64 {
+    4.0
+}
+
+fn default_flicker_etb_retrigger_bonus() -> f64 {
+    2.0
+}
+
+fn default_flicker_no_value_penalty() -> f64 {
+    -1.0
+}
+
+fn default_flicker_releases_exile_penalty() -> f64 {
+    -3.0
+}
+
+fn default_flicker_control_loss_penalty() -> f64 {
+    -3.0
+}
+
+fn default_flicker_token_target_score() -> f64 {
     -8.0
 }
 /// The worst gift in the family — a whole untapping, draw and attack step for
@@ -1336,6 +1411,30 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
     (
         "self_cost_material_life",
         "veto threshold, not a rate — SelfCostValuePolicy's trivial-payoff materiality bound is a life COUNT in i32, so the continuous [-15.0, 15.0] penalties vector CMA-ES optimizes cannot carry it at all; promotion would need a discrete search, not a paired-seed rerun",
+    ),
+    (
+        "flicker_rescue_target_bonus",
+        "CR 608.2b + CR 400.7 rescue term for a flicker target that a pending removal would remove, whoever controls it (charter r9); ordering invariant: rescue outranks ETB re-use (> flicker_etb_retrigger_bonus) and suppresses the linked-exile-release term; awaiting a paired-seed ai-gate calibration.",
+    ),
+    (
+        "flicker_etb_retrigger_bonus",
+        "CR 603.6a ETB re-use term for a flicker target; ordering invariant: below flicker_rescue_target_bonus and above zero, so a valuable ETB beats a target with no gain; awaiting a paired-seed ai-gate calibration.",
+    ),
+    (
+        "flicker_no_value_penalty",
+        "Flicker target with no rescue and no ETB value; ordering invariant: strictly below AntiSelfHarmPolicy's declined-target score (-0.25) so an optional flicker slot whose only targets gain nothing is declined (CR 601.2c / CR 603.5); awaiting a paired-seed ai-gate calibration.",
+    ),
+    (
+        "flicker_releases_exile_penalty",
+        "CR 610.3 linked-exile release cost for flickering a permanent that holds an opponent's card; ordering invariant: negative, and not applied when the target is rescued (rescue outranks it); awaiting a paired-seed ai-gate calibration.",
+    ),
+    (
+        "flicker_control_loss_penalty",
+        "CR 110.2a control-losing return (the flicker returns the permanent under another player's control); ordering invariant: strictly below flicker_no_value_penalty so a control-losing target ranks below an otherwise equal target, and never a rescue; awaiting a paired-seed ai-gate calibration.",
+    ),
+    (
+        "flicker_token_target_score",
+        "CR 111.8 / CR 712.14a a flicker target that cannot return (a token, or a non-double-faced card under a transformed return); ordering invariant: strictly below min(flicker_no_value_penalty, flicker_control_loss_penalty) + flicker_releases_exile_penalty, so it scores below every flicker target that returns; correctness-bearing floor, not a tuning preference.",
     ),
 ];
 
@@ -2218,6 +2317,95 @@ mod tests {
             PolicyPenalties::default().self_cost_material_life,
             default_self_cost_material_life(),
             "Default and serde must share one source of truth"
+        );
+    }
+
+    #[test]
+    fn policy_penalties_load_pre_flicker_fields_artifact() {
+        const FLICKER_FIELDS: [&str; 6] = [
+            "flicker_rescue_target_bonus",
+            "flicker_etb_retrigger_bonus",
+            "flicker_no_value_penalty",
+            "flicker_releases_exile_penalty",
+            "flicker_control_loss_penalty",
+            "flicker_token_target_score",
+        ];
+        let mut artifact = serde_json::to_value(PolicyPenalties::default()).unwrap();
+        let object = artifact.as_object_mut().expect("serializes as object");
+        for field in FLICKER_FIELDS {
+            object
+                .remove(field)
+                .expect("field must be present before removal");
+        }
+        // A value CMA-ES could plausibly have tuned, to prove the round-trip
+        // reads the artifact rather than silently falling back to Default.
+        object.insert("wasted_cast_penalty".into(), serde_json::json!(-3.5));
+
+        let loaded: PolicyPenalties = serde_json::from_value(artifact)
+            .expect("a pre-flicker-fields artifact must still deserialize");
+        assert_eq!(loaded.wasted_cast_penalty, -3.5, "tuned value preserved");
+        let defaults = PolicyPenalties::default();
+        for (loaded_value, shared_default, default_value) in [
+            (
+                loaded.flicker_rescue_target_bonus,
+                default_flicker_rescue_target_bonus(),
+                defaults.flicker_rescue_target_bonus,
+            ),
+            (
+                loaded.flicker_etb_retrigger_bonus,
+                default_flicker_etb_retrigger_bonus(),
+                defaults.flicker_etb_retrigger_bonus,
+            ),
+            (
+                loaded.flicker_no_value_penalty,
+                default_flicker_no_value_penalty(),
+                defaults.flicker_no_value_penalty,
+            ),
+            (
+                loaded.flicker_releases_exile_penalty,
+                default_flicker_releases_exile_penalty(),
+                defaults.flicker_releases_exile_penalty,
+            ),
+            (
+                loaded.flicker_control_loss_penalty,
+                default_flicker_control_loss_penalty(),
+                defaults.flicker_control_loss_penalty,
+            ),
+            (
+                loaded.flicker_token_target_score,
+                default_flicker_token_target_score(),
+                defaults.flicker_token_target_score,
+            ),
+        ] {
+            assert_eq!(
+                loaded_value, shared_default,
+                "absent field falls back to the shared default"
+            );
+            assert_eq!(
+                default_value, shared_default,
+                "Default and serde share one source of truth"
+            );
+        }
+    }
+
+    // U-K2: the flicker valuation's ordering invariants hold at the defaults.
+    #[test]
+    fn flicker_penalty_ordering_invariants() {
+        use crate::policies::anti_self_harm::DECLINED_TARGET_SCORE;
+        let p = PolicyPenalties::default();
+        assert!(p.flicker_rescue_target_bonus > p.flicker_etb_retrigger_bonus);
+        assert!(p.flicker_etb_retrigger_bonus > 0.0);
+        const { assert!(0.0 > DECLINED_TARGET_SCORE) };
+        assert!(DECLINED_TARGET_SCORE > p.flicker_no_value_penalty);
+        assert!(p.flicker_no_value_penalty > p.flicker_control_loss_penalty);
+        assert!(p.flicker_releases_exile_penalty < 0.0);
+        // A token (CR 111.8) ranks below every flicker target that returns,
+        // whatever its release term.
+        assert!(
+            p.flicker_token_target_score
+                < p.flicker_no_value_penalty
+                    .min(p.flicker_control_loss_penalty)
+                    + p.flicker_releases_exile_penalty
         );
     }
 

@@ -10,9 +10,10 @@ use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::player::PlayerId;
 
+use crate::ability_chain::ChainNode;
 use crate::cast_facts::{
-    cast_facts_for_action, collect_definition_effects, collect_definition_effects_with,
-    effect_profile_for_action, effective_activated_ability, CastFacts, EffectProfile, ModeWalk,
+    cast_facts_for_action, effect_profile_for_action, effective_activated_ability,
+    visit_definition_nodes, CastFacts, EffectProfile, ModeWalk,
 };
 use crate::config::{AiConfig, PolicyPenalties};
 use crate::eval::{strategic_intent, StrategicIntent};
@@ -163,15 +164,39 @@ impl<'a> PolicyContext<'a> {
         }
     }
 
+    /// Every effect this candidate can produce, in walk order. The effect view
+    /// of [`Self::effect_nodes`]: both come from one dispatch
+    /// ([`Self::visit_effect_nodes`]), so they cannot disagree.
     pub fn effects(&self) -> Vec<&'a Effect> {
+        let mut effects = Vec::new();
+        self.visit_effect_nodes(&mut |node| effects.push(node.effect()));
+        effects
+    }
+
+    /// The flicker-pair view of [`Self::effects`]: the same nodes in the same
+    /// order, each carrying its chain so a consumer can ask
+    /// [`ChainNode::flicker_pair`]. CR 400.7 re-entry is a property of the
+    /// chain (an exile leg and its return), not of one effect.
+    pub(crate) fn effect_nodes(&self) -> Vec<ChainNode<'a>> {
+        let mut nodes = Vec::new();
+        self.visit_effect_nodes(&mut |node| nodes.push(node));
+        nodes
+    }
+
+    /// The single dispatch over the candidate's ability tree(s) that both
+    /// [`Self::effects`] and [`Self::effect_nodes`] are built from.
+    fn visit_effect_nodes(&self, visit: &mut impl FnMut(ChainNode<'a>)) {
         // If we're casting/activating, get effects from the source object
         match &self.candidate.action {
             GameAction::CastSpell { .. } => {
-                return self
-                    .source_object()
-                    .into_iter()
-                    .flat_map(|object| object.abilities.iter().flat_map(collect_definition_effects))
-                    .collect();
+                if let Some(object) = self.source_object() {
+                    for ability in object.abilities.iter() {
+                        visit_definition_nodes(ability, ModeWalk::All, &mut |node| {
+                            visit(ChainNode::Definition(node))
+                        });
+                    }
+                }
+                return;
             }
             // CR 700.2a: an activation announces the ability; if it is modal the
             // mode is chosen at the separate `AbilityModeChoice` prompt, which
@@ -186,13 +211,17 @@ impl<'a> PolicyContext<'a> {
                 ability_index,
                 source_id,
             } => {
-                return self
+                if let Some(ability) = self
                     .state
                     .objects
                     .get(source_id)
                     .and_then(|object| object.abilities.get(*ability_index))
-                    .map(|ability| collect_definition_effects_with(ability, ModeWalk::RootOnly))
-                    .unwrap_or_default();
+                {
+                    visit_definition_nodes(ability, ModeWalk::RootOnly, &mut |node| {
+                        visit(ChainNode::Definition(node))
+                    });
+                }
+                return;
             }
             // CR 601.2b + CR 700.2a: the mode IS chosen here, so report exactly
             // the branches this candidate commits to. Reporting every printed
@@ -207,29 +236,33 @@ impl<'a> PolicyContext<'a> {
             // one consumer written against it so far; the rest of the policy
             // set simply stops being blind here.
             GameAction::SelectModes { indices } => {
-                return selected_mode_abilities(self.state, &self.decision.waiting_for, indices)
-                    .into_iter()
-                    .flat_map(collect_definition_effects)
-                    .collect();
+                for ability in
+                    selected_mode_abilities(self.state, &self.decision.waiting_for, indices)
+                {
+                    visit_definition_nodes(ability, ModeWalk::All, &mut |node| {
+                        visit(ChainNode::Definition(node))
+                    });
+                }
+                return;
             }
             _ => {}
         }
 
         // During target selection, extract effects from the pending cast/ability/trigger
-        match &self.decision.waiting_for {
-            WaitingFor::TargetSelection { pending_cast, .. } => {
-                collect_ability_effects(&pending_cast.ability)
-            }
+        let pending: Option<&'a ResolvedAbility> = match &self.decision.waiting_for {
+            WaitingFor::TargetSelection { pending_cast, .. } => Some(&pending_cast.ability),
             WaitingFor::MultiTargetSelection {
                 pending_ability, ..
-            } => collect_ability_effects(pending_ability),
+            } => Some(pending_ability),
             WaitingFor::TriggerTargetSelection { .. } => self
                 .state
                 .pending_trigger
                 .as_ref()
-                .map(|t| collect_ability_effects(&t.ability))
-                .unwrap_or_default(),
-            _ => Vec::new(),
+                .map(|trigger| &*trigger.ability),
+            _ => None,
+        };
+        if let Some(ability) = pending {
+            visit_resolved_abilities(ability, &mut |node| visit(ChainNode::Resolved(node)));
         }
     }
 
@@ -266,18 +299,39 @@ impl<'a> PolicyContext<'a> {
         &self,
         filter: &TargetFilter,
         source_id: ObjectId,
+        is_relevant: impl FnMut(ObjectId) -> bool,
+    ) -> bool {
+        self.any_legal_opponent_creature(&self.legal_targets(filter, source_id), is_relevant)
+    }
+
+    /// The engine's legal targets for `filter` from `source_id`, chosen by the
+    /// AI (CR 115.2: target legality is the engine's). Board-wide: callers
+    /// that need both the opposing-creature reading and another reading of the
+    /// same pool compute it once and pass it to
+    /// [`Self::any_legal_opponent_creature`].
+    pub(crate) fn legal_targets(
+        &self,
+        filter: &TargetFilter,
+        source_id: ObjectId,
+    ) -> Vec<TargetRef> {
+        find_legal_targets(self.state, filter, self.ai_player, source_id)
+    }
+
+    /// CR 102.3: True when `targets` holds a relevant creature an opponent of
+    /// the AI controls (team-aware).
+    pub(crate) fn any_legal_opponent_creature(
+        &self,
+        targets: &[TargetRef],
         mut is_relevant: impl FnMut(ObjectId) -> bool,
     ) -> bool {
-        find_legal_targets(self.state, filter, self.ai_player, source_id)
-            .into_iter()
-            .any(|target| match target {
-                TargetRef::Object(id) => self.state.objects.get(&id).is_some_and(|object| {
-                    is_opponent(self.state, self.ai_player, object.controller)
-                        && object.card_types.core_types.contains(&CoreType::Creature)
-                        && is_relevant(id)
-                }),
-                TargetRef::Player(_) => false,
-            })
+        targets.iter().any(|target| match target {
+            TargetRef::Object(id) => self.state.objects.get(id).is_some_and(|object| {
+                is_opponent(self.state, self.ai_player, object.controller)
+                    && object.card_types.core_types.contains(&CoreType::Creature)
+                    && is_relevant(*id)
+            }),
+            TargetRef::Player(_) => false,
+        })
     }
 
     /// Does the pending spell carry an inherently-mass effect (`DestroyAll`,
@@ -303,28 +357,31 @@ impl<'a> PolicyContext<'a> {
 /// `cast_facts::collect_definition_effects`, which does the same walk one level
 /// up on `AbilityDefinition`.
 pub(crate) fn collect_ability_effects(ability: &ResolvedAbility) -> Vec<&Effect> {
-    collect_resolved_abilities(ability)
-        .into_iter()
-        .map(|node| &node.effect)
-        .collect()
+    let mut effects = Vec::new();
+    visit_resolved_abilities(ability, &mut |node| effects.push(&node.effect));
+    effects
 }
 
 pub(crate) fn collect_resolved_abilities(ability: &ResolvedAbility) -> Vec<&ResolvedAbility> {
     let mut abilities = Vec::new();
-    push_resolved_abilities(&mut abilities, ability);
+    visit_resolved_abilities(ability, &mut |node| abilities.push(node));
     abilities
 }
 
-fn push_resolved_abilities<'a>(
-    abilities: &mut Vec<&'a ResolvedAbility>,
+/// Visit every node of a `ResolvedAbility` tree in walk order: the node, its
+/// `sub_ability` chain, then its `else_ability` branch. The single resolved
+/// walker [`collect_ability_effects`] and [`collect_resolved_abilities`] are
+/// built from.
+pub(crate) fn visit_resolved_abilities<'a>(
     ability: &'a ResolvedAbility,
+    visit: &mut impl FnMut(&'a ResolvedAbility),
 ) {
-    abilities.push(ability);
+    visit(ability);
     if let Some(sub_ability) = &ability.sub_ability {
-        push_resolved_abilities(abilities, sub_ability);
+        visit_resolved_abilities(sub_ability, visit);
     }
     if let Some(else_ability) = &ability.else_ability {
-        push_resolved_abilities(abilities, else_ability);
+        visit_resolved_abilities(else_ability, visit);
     }
 }
 
@@ -1369,5 +1426,611 @@ mod tests {
         // already-expired one blocks (covered by
         // `deadline_expired_gates_projection`).
         assert!(ctx.can_afford_projection());
+    }
+}
+
+/// Shared fixtures for the flicker authority's tests. Every card is the
+/// verbatim Oracle text, parsed through the scenario Oracle builders or
+/// `parse_oracle_text` — the production parse path.
+#[cfg(test)]
+pub(crate) mod flicker_fixtures {
+    use engine::ai_support::{AiDecisionContext, CandidateAction};
+    use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use engine::types::ability::{Effect, TargetRef};
+    use engine::types::actions::GameAction;
+    use engine::types::game_state::{CastPaymentMode, GameState, WaitingFor};
+    use engine::types::identifiers::ObjectId;
+    use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
+    use engine::types::phase::Phase;
+    use engine::types::player::PlayerId;
+    use engine::types::zones::Zone;
+
+    use engine::types::ability::AbilityDefinition;
+
+    use super::{PolicyContext, SearchDepth};
+    use crate::ability_chain::{ChainNode, FlickerPair};
+    use crate::cast_facts::cast_facts_for_action;
+    use crate::config::AiConfig;
+
+    pub(crate) const MOMENTARY_BLINK: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.\nFlashback {3}{U} (You may cast this card from your graveyard for its flashback cost. Then exile it.)";
+    pub(crate) const CLOUDSHIFT: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
+    pub(crate) const GHOSTLY_FLICKER: &str = "Exile two target artifacts, creatures, and/or lands you control, then return those cards to the battlefield under your control.";
+    pub(crate) const SETTLE_BEYOND_REALITY: &str = "Choose one or both —\n• Exile target creature you don't control.\n• Exile target creature you control, then return it to the battlefield under its owner's control.";
+    pub(crate) const ILLUSIONISTS_STRATAGEM: &str = "Exile up to two target creatures you control, then return those cards to the battlefield under their owner's control.\nDraw a card.";
+    pub(crate) const TURN_TO_MIST: &str = "Exile target creature. Return that card to the battlefield under its owner's control at the beginning of the next end step.";
+    pub(crate) const ELDRAZI_DISPLACER: &str = "Devoid (This card has no color.)\n{2}{C}: Exile another target creature, then return it to the battlefield tapped under its owner's control. ({C} represents colorless mana.)";
+    pub(crate) const GUARDIAN_OF_GHIRAPUR: &str = "Flying\nWhen this creature enters, exile up to one other target creature or artifact you control. Return it to the battlefield under its owner's control at the beginning of the next end step.";
+    pub(crate) const FLICKERWISP: &str = "Flying\nWhen this creature enters, exile another target permanent. Return that card to the battlefield under its owner's control at the beginning of the next end step.";
+    pub(crate) const MYSTIFYING_MAZE: &str = "{T}: Add {C}.\n{4}, {T}: Exile target attacking creature an opponent controls. At the beginning of the next end step, return it to the battlefield tapped under its owner's control.";
+    pub(crate) const BANISHER_PRIEST: &str = "When this creature enters, exile target creature an opponent controls until this creature leaves the battlefield.";
+    pub(crate) const OBLIVION_RING: &str = "When this enchantment enters, exile another target nonland permanent.\nWhen this enchantment leaves the battlefield, return the exiled card to the battlefield under its owner's control.";
+    pub(crate) const FLEETING_SPIRIT: &str = "{W}, Exile three cards from your graveyard: This creature gains first strike until end of turn.\nDiscard a card: Exile this creature. Return it to the battlefield under its owner's control at the beginning of the next end step.";
+    pub(crate) const AETHERLING: &str = "{U}: Exile this creature. Return it to the battlefield under its owner's control at the beginning of the next end step.\n{U}: This creature can't be blocked this turn.\n{1}: This creature gets +1/-1 until end of turn.\n{1}: This creature gets -1/+1 until end of turn.";
+    pub(crate) const HUATLI: &str = "When Huatli enters, search your library for a basic land card, reveal it, put it into your hand, then shuffle.\n{3}{R/W}{R/W}: Exile Huatli, then return her to the battlefield transformed under her owner's control. Activate only as a sorcery.";
+    pub(crate) const DAYDREAM: &str = "Exile target creature you control, then return that card to the battlefield under its owner's control with a +1/+1 counter on it.\nFlashback {2}{W} (You may cast this card from your graveyard for its flashback cost. Then exile it.)";
+    pub(crate) const KAYA_GHOST_ASSASSIN: &str = "[0]: Exile Kaya or up to one target creature. Return that card to the battlefield under its owner's control at the beginning of your next upkeep. You lose 2 life.\n[−1]: Each opponent loses 2 life and you gain 2 life.\n[−2]: Each opponent discards a card and you draw a card.";
+    pub(crate) const TAWNOS_COFFIN: &str = "You may choose not to untap this artifact during your untap step.\n{3}, {T}: Exile target creature and all Auras attached to it. Note the number and kind of counters that were on that creature. When this artifact leaves the battlefield or becomes untapped, return that exiled card to the battlefield under its owner's control tapped with the noted number and kind of counters on it. If you do, return the other exiled cards to the battlefield under their owner's control attached to that permanent.";
+    pub(crate) const RONA: &str = "Trample\nWhenever a source deals damage to Rona, that source's controller exiles a card from their hand at random. If it's a land card, you may put it onto the battlefield under your control. Otherwise, you may cast it without paying its mana cost.";
+    pub(crate) const FLICKERING_SPIRIT: &str = "Flying\n{3}{W}: Exile this creature, then return it to the battlefield under its owner's control.";
+    pub(crate) const SWORDS_TO_PLOWSHARES: &str =
+        "Exile target creature. Its controller gains life equal to its power.";
+    pub(crate) const ZOMBIFY: &str =
+        "Return target creature card from your graveyard to the battlefield.";
+
+    /// A two-player scenario at the AI's (P0's) precombat main with stocked
+    /// libraries.
+    pub(crate) fn scenario() -> GameScenario {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for _ in 0..10 {
+            scenario.add_card_to_library_top(P0, "Library Filler");
+            scenario.add_card_to_library_top(P1, "Library Filler");
+        }
+        scenario
+    }
+
+    /// V — a vanilla 3/3.
+    pub(crate) fn giant(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
+        scenario.add_creature(player, "Hill Giant", 3, 3).id()
+    }
+
+    /// W — a vanilla 2/2.
+    pub(crate) fn bears(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
+        scenario.add_creature(player, "Grizzly Bears", 2, 2).id()
+    }
+
+    /// T — a 1/1 creature, marked a token by [`make_token`] after `build`.
+    pub(crate) fn token_body(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
+        scenario.add_creature(player, "Spirit Token", 1, 1).id()
+    }
+
+    pub(crate) fn make_token(state: &mut GameState, id: ObjectId) {
+        state.objects.get_mut(&id).unwrap().is_token = true;
+    }
+
+    // ── More cards (verbatim Oracle, `data/card-data.json`) ──────────────────
+
+    pub(crate) const EPHEMERATE: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.\nRebound (If you cast this spell from your hand, exile it as it resolves. At the beginning of your next upkeep, you may cast this card from exile without paying its mana cost.)";
+    pub(crate) const OTHERWORLDLY_JOURNEY: &str = "Exile target creature. At the beginning of the next end step, return that card to the battlefield under its owner's control with a +1/+1 counter on it.";
+    pub(crate) const RESTORATION_ANGEL: &str = "Flash\nFlying\nWhen this creature enters, you may exile target non-Angel creature you control, then return that card to the battlefield under your control.";
+    pub(crate) const FELIDAR_GUARDIAN: &str = "When this creature enters, you may exile another target permanent you control, then return that card to the battlefield under its owner's control.";
+    pub(crate) const NEPHALIA_SMUGGLER: &str = "{3}{U}, {T}: Exile another target creature you control, then return that card to the battlefield under your control.";
+    pub(crate) const ABUELO: &str = "Flying, ward {2}\n{1}{W}{U}: Exile another target creature or artifact you control. Return it to the battlefield under its owner's control at the beginning of the next end step.";
+    pub(crate) const VENSER: &str = "Each nontoken creature you control that wasn't cast from your hand enters with two additional +1/+1 counters on it.\n[+1]: Exile up to one other target permanent you control. At the beginning of the next end step, return that card to the battlefield under its owner's control.\n[\u{2212}2]: For each opponent, return up to one target nonland permanent that player controls to its owner's hand.\nVenser, Visionary Traveler can be your commander.";
+    pub(crate) const NICOL_BOLAS: &str = "Flying\nWhen Nicol Bolas enters, each opponent discards a card.\n{4}{U}{B}{R}: Exile Nicol Bolas, then return him to the battlefield transformed under his owner's control. Activate only as a sorcery.";
+    pub(crate) const LILYSPLASH_MENTOR: &str = "Reach\n{1}{G}{U}: Exile another target creature you control, then return it to the battlefield under its owner's control with a +1/+1 counter on it. Activate only as a sorcery.";
+    pub(crate) const RUIN_GHOST: &str =
+        "{W}, {T}: Exile target land you control, then return it to the battlefield under your control.";
+    pub(crate) const ELVISH_VISIONARY: &str = "When this creature enters, draw a card.";
+    pub(crate) const MURDER: &str = "Destroy target creature.";
+    pub(crate) const SHOCK: &str = "Shock deals 2 damage to any target.";
+    pub(crate) const DAY_OF_JUDGMENT: &str = "Destroy all creatures.";
+    pub(crate) const DIABOLIC_EDICT: &str = "Target player sacrifices a creature of their choice.";
+    pub(crate) const WASTES: &str = "{T}: Add {C}.";
+
+    // Keyword hints: the `data/card-data.json` `keywords` list of every
+    // fixture card whose list is non-empty (Step 0 keyword table).
+    pub(crate) const MOMENTARY_BLINK_KEYWORDS: &[&str] = &["Flashback"];
+    pub(crate) const EPHEMERATE_KEYWORDS: &[&str] = &["Rebound"];
+    pub(crate) const DAYDREAM_KEYWORDS: &[&str] = &["Flashback"];
+    pub(crate) const FLYING: &[&str] = &["Flying"];
+    pub(crate) const RESTORATION_ANGEL_KEYWORDS: &[&str] = &["Flash", "Flying"];
+    pub(crate) const ABUELO_KEYWORDS: &[&str] = &["Flying", "Ward"];
+    pub(crate) const ELDRAZI_DISPLACER_KEYWORDS: &[&str] = &["Devoid"];
+    pub(crate) const LILYSPLASH_MENTOR_KEYWORDS: &[&str] = &["Reach"];
+
+    pub(crate) fn cost(shards: &[ManaCostShard], generic: u32) -> ManaCost {
+        ManaCost::Cost {
+            shards: shards.to_vec(),
+            generic,
+        }
+    }
+
+    /// An instant (`is_instant`) or sorcery in `player`'s hand, built from its
+    /// verbatim Oracle text with its keyword hints.
+    pub(crate) fn spell_in_hand(
+        scenario: &mut GameScenario,
+        player: PlayerId,
+        name: &str,
+        is_instant: bool,
+        keywords: &[&str],
+        oracle: &str,
+        mana: ManaCost,
+    ) -> ObjectId {
+        scenario
+            .add_spell_to_hand(player, name, is_instant)
+            .from_oracle_text_with_keywords(keywords, oracle)
+            .with_mana_cost(mana)
+            .id()
+    }
+
+    /// A creature on `player`'s battlefield, built from its verbatim Oracle
+    /// text with its keyword hints.
+    pub(crate) fn creature(
+        scenario: &mut GameScenario,
+        player: PlayerId,
+        name: &str,
+        power: i32,
+        toughness: i32,
+        keywords: &[&str],
+        oracle: &str,
+    ) -> ObjectId {
+        scenario
+            .add_creature(player, name, power, toughness)
+            .from_oracle_text_with_keywords(keywords, oracle)
+            .id()
+    }
+
+    /// E — Elvish Visionary, a value-ETB creature.
+    pub(crate) fn visionary(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
+        creature(
+            scenario,
+            player,
+            "Elvish Visionary",
+            1,
+            1,
+            &[],
+            ELVISH_VISIONARY,
+        )
+    }
+
+    pub(crate) fn lands(
+        scenario: &mut GameScenario,
+        player: PlayerId,
+        color: ManaColor,
+        count: usize,
+    ) {
+        for _ in 0..count {
+            scenario.add_basic_land(player, color);
+        }
+    }
+
+    /// Make `player` the active player holding priority in its precombat main.
+    pub(crate) fn give_turn(state: &mut GameState, player: PlayerId) {
+        state.phase = Phase::PreCombatMain;
+        state.active_player = player;
+        state.priority_player = player;
+        state.waiting_for = WaitingFor::Priority { player };
+    }
+
+    /// Pass priority until `player` holds it, without letting the stack
+    /// resolve.
+    pub(crate) fn pass_until_priority(runner: &mut GameRunner, player: PlayerId) {
+        for _ in 0..8 {
+            if matches!(runner.state().waiting_for, WaitingFor::Priority { player: p } if p == player)
+            {
+                return;
+            }
+            runner
+                .act(GameAction::PassPriority)
+                .expect("passing priority must be accepted");
+        }
+        panic!(
+            "priority never reached {player:?}; waiting_for = {:?}",
+            runner.state().waiting_for
+        );
+    }
+
+    /// P1 casts `card` (targeting `target`, if any) on its own turn and priority
+    /// comes back to the AI (P0) with it on the stack.
+    pub(crate) fn opponent_casts(
+        runner: &mut GameRunner,
+        card: ObjectId,
+        target: Option<TargetRef>,
+    ) {
+        give_turn(runner.state_mut(), P1);
+        let cast = runner.cast(card);
+        let cast = match target {
+            Some(TargetRef::Object(id)) => cast.target_object(id),
+            Some(TargetRef::Player(player)) => cast.target_player(player),
+            None => cast,
+        };
+        let _ = cast.commit();
+        pass_until_priority(runner, P0);
+    }
+
+    pub(crate) fn cast_action(state: &GameState, id: ObjectId) -> GameAction {
+        GameAction::CastSpell {
+            object_id: id,
+            card_id: state.objects[&id].card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        }
+    }
+
+    /// Cast `spell` and stop at its target prompt.
+    pub(crate) fn begin_cast(runner: &mut GameRunner, spell: ObjectId) {
+        let action = cast_action(runner.state(), spell);
+        runner.act(action).expect("the cast must be accepted");
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ),
+            "the cast must stop at its target prompt; got {:?}",
+            runner.state().waiting_for
+        );
+    }
+
+    /// Activate `source`'s ability `ability_index` and stop at its target
+    /// prompt.
+    pub(crate) fn begin_activation(
+        runner: &mut GameRunner,
+        source: ObjectId,
+        ability_index: usize,
+    ) {
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index,
+            })
+            .expect("the activation must be accepted");
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+                    | WaitingFor::TriggerTargetSelection { .. }
+                    | WaitingFor::MultiTargetSelection { .. }
+            ),
+            "the activation must stop at its target prompt; got {:?}",
+            runner.state().waiting_for
+        );
+    }
+
+    /// The index of `source`'s first ability whose root exiles (a flicker
+    /// activation's exile leg).
+    pub(crate) fn exile_ability_index(state: &GameState, source: ObjectId) -> usize {
+        state.objects[&source]
+            .abilities
+            .iter()
+            .position(|ability| {
+                matches!(
+                    &*ability.effect,
+                    Effect::ChangeZone {
+                        destination: Zone::Exile,
+                        ..
+                    }
+                )
+            })
+            .expect("the source has an exile activation")
+    }
+
+    pub(crate) fn activate_action(state: &GameState, source: ObjectId) -> GameAction {
+        GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: exile_ability_index(state, source),
+        }
+    }
+
+    pub(crate) fn choose(id: ObjectId) -> GameAction {
+        GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(id)),
+        }
+    }
+
+    /// A policy context for `action` at the state's current decision, built as
+    /// production builds it: the engine-issued decision and candidate, and the
+    /// action's cast facts.
+    pub(crate) struct Probe {
+        pub(crate) config: AiConfig,
+        pub(crate) context: crate::context::AiContext,
+        pub(crate) decision: AiDecisionContext,
+        pub(crate) candidate: CandidateAction,
+    }
+
+    impl Probe {
+        pub(crate) fn new(state: &GameState, action: &GameAction) -> Self {
+            let decision = engine::ai_support::build_decision_context(state);
+            let candidate = decision
+                .candidates
+                .iter()
+                .find(|candidate| candidate.action == *action)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{action:?} must be an engine-issued candidate of {:?}; offered {:?}",
+                        state.waiting_for,
+                        decision
+                            .candidates
+                            .iter()
+                            .map(|c| &c.action)
+                            .collect::<Vec<_>>()
+                    )
+                })
+                .clone();
+            let config = AiConfig::default();
+            let context = crate::context::AiContext::empty(&config.weights);
+            Probe {
+                config,
+                context,
+                decision,
+                candidate,
+            }
+        }
+
+        pub(crate) fn ctx<'a>(
+            &'a self,
+            state: &'a GameState,
+            depth: SearchDepth,
+        ) -> PolicyContext<'a> {
+            PolicyContext {
+                state,
+                decision: &self.decision,
+                candidate: &self.candidate,
+                ai_player: P0,
+                config: &self.config,
+                context: &self.context,
+                cast_facts: cast_facts_for_action(state, &self.candidate.action, P0),
+                search_depth: depth,
+            }
+        }
+    }
+
+    /// Cast `creature` from hand and pass priority until the AI's first
+    /// decision after it resolves (its ETB trigger's target prompt).
+    pub(crate) fn resolve_to_prompt(runner: &mut GameRunner, creature: ObjectId) {
+        let _ = runner.cast(creature).commit();
+        for _ in 0..8 {
+            if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+                return;
+            }
+            runner
+                .act(GameAction::PassPriority)
+                .expect("passing priority must be accepted");
+        }
+        panic!(
+            "the creature never reached its trigger prompt; waiting_for = {:?}",
+            runner.state().waiting_for
+        );
+    }
+
+    /// Whether the tactical pre-filter keeps `action` (a gate `Reject` drops
+    /// the candidate).
+    pub(crate) fn gate_passes(state: &GameState, action: &GameAction) -> bool {
+        let probe = Probe::new(state, action);
+        !crate::tactical_gate::gate_candidates(
+            state,
+            &probe.decision,
+            vec![probe.candidate.clone()],
+            P0,
+            &probe.config,
+            &probe.context,
+        )
+        .is_empty()
+    }
+
+    /// Every ability and trigger `execute` a card parses to, from its verbatim
+    /// Oracle text with its keyword hints.
+    pub(crate) fn roots(
+        name: &str,
+        types: &[&str],
+        keywords: &[&str],
+        oracle: &str,
+    ) -> Vec<AbilityDefinition> {
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+        let parsed =
+            engine::parser::oracle::parse_oracle_text(oracle, name, &keywords, &types, &[]);
+        parsed
+            .abilities
+            .into_iter()
+            .chain(
+                parsed
+                    .triggers
+                    .into_iter()
+                    .filter_map(|trigger| trigger.execute.map(|execute| *execute)),
+            )
+            .collect()
+    }
+
+    /// The card's one flicker pair (every node of every root, all modes).
+    pub(crate) fn only_pair(
+        name: &str,
+        types: &[&str],
+        keywords: &[&str],
+        oracle: &str,
+    ) -> FlickerPair {
+        let mut pairs = Vec::new();
+        for root in roots(name, types, keywords, oracle) {
+            crate::ability_chain::visit_scoped_nodes(
+                &root,
+                crate::ability_chain::AbilityScope::Potential,
+                &mut |node| pairs.extend(ChainNode::Definition(node).flicker_pair()),
+            );
+        }
+        assert_eq!(
+            pairs.len(),
+            1,
+            "{name}: exactly one flicker pair, got {pairs:?}"
+        );
+        pairs.remove(0)
+    }
+}
+
+/// Phase-1 flicker row U-C2: the node view and the effect view of a
+/// candidate come from one dispatch.
+#[cfg(test)]
+mod flicker_rows {
+    use engine::ai_support::{ActionMetadata, TacticalClass};
+    use engine::game::ability_utils::build_resolved_from_def;
+    use engine::game::scenario::{GameRunner, P0, P1};
+    use engine::types::mana::{ManaColor, ManaCostShard};
+
+    use super::flicker_fixtures as fx;
+    use super::*;
+
+    fn assert_one_dispatch(label: &str, ctx: &PolicyContext<'_>) -> usize {
+        let nodes: Vec<*const Effect> = ctx
+            .effect_nodes()
+            .iter()
+            .map(|node| node.effect() as *const Effect)
+            .collect();
+        let effects: Vec<*const Effect> = ctx
+            .effects()
+            .iter()
+            .map(|effect| *effect as *const Effect)
+            .collect();
+        eprintln!(
+            "[flicker U-C2] {label}: {} nodes, {} effects",
+            nodes.len(),
+            effects.len()
+        );
+        assert_eq!(nodes, effects, "{label}");
+        nodes.len()
+    }
+
+    fn check_issued(label: &str, state: &GameState, action: &GameAction) -> usize {
+        let probe = fx::Probe::new(state, action);
+        assert_one_dispatch(label, &probe.ctx(state, SearchDepth::Root))
+    }
+
+    // U-C2.
+    #[test]
+    fn effect_nodes_and_effects_share_one_dispatch() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 8);
+        fx::lands(&mut scenario, P0, ManaColor::Blue, 4);
+        let v = fx::giant(&mut scenario, P0);
+        scenario.add_creature(P1, "Opposing Bear", 2, 2);
+        let blink = fx::spell_in_hand(
+            &mut scenario,
+            P0,
+            "Momentary Blink",
+            true,
+            fx::MOMENTARY_BLINK_KEYWORDS,
+            fx::MOMENTARY_BLINK,
+            fx::cost(&[ManaCostShard::White], 1),
+        );
+        let settle = fx::spell_in_hand(
+            &mut scenario,
+            P0,
+            "Settle Beyond Reality",
+            false,
+            &[],
+            fx::SETTLE_BEYOND_REALITY,
+            fx::cost(&[ManaCostShard::White], 4),
+        );
+        let smuggler = fx::creature(
+            &mut scenario,
+            P0,
+            "Nephalia Smuggler",
+            1,
+            1,
+            &[],
+            fx::NEPHALIA_SMUGGLER,
+        );
+        let wisp = scenario
+            .add_creature_to_hand(P0, "Flickerwisp", 3, 1)
+            .from_oracle_text_with_keywords(fx::FLYING, fx::FLICKERWISP)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White, ManaCostShard::White], 1))
+            .id();
+        let runner = scenario.build();
+        let state = runner.state();
+
+        assert!(check_issued("CastSpell", state, &fx::cast_action(state, blink)) > 0);
+        assert!(
+            check_issued(
+                "ActivateAbility",
+                state,
+                &fx::activate_action(state, smuggler)
+            ) > 0
+        );
+        assert_eq!(
+            check_issued("PassPriority", state, &GameAction::PassPriority),
+            0
+        );
+
+        let mut modes = GameRunner::from_state(state.clone());
+        modes
+            .act(fx::cast_action(state, settle))
+            .expect("the modal cast must be accepted");
+        let decision = engine::ai_support::build_decision_context(modes.state());
+        let select = decision
+            .candidates
+            .iter()
+            .find(|candidate| matches!(candidate.action, GameAction::SelectModes { .. }))
+            .unwrap_or_else(|| panic!("a SelectModes candidate at {:?}", modes.state().waiting_for))
+            .action
+            .clone();
+        assert!(check_issued("SelectModes", modes.state(), &select) > 0);
+
+        let mut targets = GameRunner::from_state(state.clone());
+        fx::begin_cast(&mut targets, blink);
+        let probe = fx::Probe::new(targets.state(), &fx::choose(v));
+        let ctx = probe.ctx(targets.state(), SearchDepth::Root);
+        assert!(assert_one_dispatch("TargetSelection", &ctx) > 0);
+        assert!(
+            ctx.effect_nodes()[0].flicker_pair().is_some(),
+            "the Blink exile node pairs with its return"
+        );
+
+        let mut trigger = GameRunner::from_state(state.clone());
+        fx::resolve_to_prompt(&mut trigger, wisp);
+        assert!(
+            matches!(
+                trigger.state().waiting_for,
+                WaitingFor::TriggerTargetSelection { .. }
+            ),
+            "Flickerwisp's ETB stops at a trigger target prompt; got {:?}",
+            trigger.state().waiting_for
+        );
+        assert!(check_issued("TriggerTargetSelection", trigger.state(), &fx::choose(v)) > 0);
+
+        // MultiTargetSelection: no fixture card reaches it through a cast, so
+        // its `pending_ability` is built from Momentary Blink's parsed
+        // definition (the existing `effects()` tests' hand-built shape).
+        let root = fx::roots(
+            "Momentary Blink",
+            &["Instant"],
+            fx::MOMENTARY_BLINK_KEYWORDS,
+            fx::MOMENTARY_BLINK,
+        )
+        .remove(0);
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::MultiTargetSelection {
+                player: P0,
+                legal_targets: vec![v],
+                min_targets: 1,
+                max_targets: 1,
+                pending_ability: Box::new(build_resolved_from_def(&root, blink, P0)),
+            },
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::SelectCards { cards: vec![v] },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Target),
+        };
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: SearchDepth::Root,
+        };
+        assert!(assert_one_dispatch("MultiTargetSelection", &ctx) > 0);
     }
 }

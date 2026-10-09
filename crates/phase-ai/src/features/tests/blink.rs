@@ -139,8 +139,9 @@ fn flicker_in_trigger_chain_is_enabler() {
 
 #[test]
 fn exile_without_return_is_not_flicker() {
-    // Pure exile removal (or a delayed-return flickerer like Flickerwisp): the
-    // exile step is present but there is no immediate battlefield return.
+    // Pure exile removal: the exile step is present but nothing returns the
+    // card. (A delayed-return flickerer such as Flickerwisp IS an enabler —
+    // `unscoped_delayed_return_is_flicker_enabler`.)
     let mut c = face("Swords to Plowshares", vec![CoreType::Instant]);
     c.abilities
         .push(spell(change_zone(None, Zone::Exile, friendly_creature())));
@@ -406,4 +407,111 @@ fn anti_calibration_one_incidental_flicker_inert() {
         "one incidental flicker must stay inert, got {}",
         f.commitment
     );
+}
+
+// ─── flicker-enabler detection from verbatim Oracle text ────────────────────────
+//
+// These faces are parsed from each card's verbatim Oracle text through the
+// production parser, so the detector is exercised on the shapes real cards
+// produce (scheduled delayed returns, self-blinks, modal triggers).
+
+fn oracle_face(name: &str, core: Vec<CoreType>, keywords: &[&str], oracle: &str) -> CardFace {
+    let types: Vec<String> = core.iter().map(|core| format!("{core:?}")).collect();
+    let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+    let parsed = engine::parser::oracle::parse_oracle_text(oracle, name, &keywords, &types, &[]);
+    let mut card = face(name, core);
+    card.abilities = parsed.abilities;
+    card.triggers = parsed.triggers;
+    card
+}
+
+#[test]
+fn delayed_return_trigger_is_flicker_enabler() {
+    // CR 603.7: Guardian of Ghirapur's return is a delayed trigger at the next
+    // end step — a scheduled return of the exiled card.
+    let card = oracle_face(
+        "Guardian of Ghirapur",
+        vec![CoreType::Creature],
+        &["Flying"],
+        "Flying\nWhen this creature enters, exile up to one other target creature or artifact you control. Return it to the battlefield under its owner's control at the beginning of the next end step.",
+    );
+    assert!(is_flicker_enabler(&card));
+}
+
+#[test]
+fn unscoped_delayed_return_is_flicker_enabler() {
+    // Flickerwisp: "another target permanent" names no controller, so a blink
+    // deck aims it at its own permanents.
+    let card = oracle_face(
+        "Flickerwisp",
+        vec![CoreType::Creature],
+        &["Flying"],
+        "Flying\nWhen this creature enters, exile another target permanent. Return that card to the battlefield under its owner's control at the beginning of the next end step.",
+    );
+    assert!(is_flicker_enabler(&card));
+}
+
+#[test]
+fn self_blink_activation_is_flicker_enabler() {
+    // Fleeting Spirit: the activation exiles the source and schedules its
+    // return.
+    let card = oracle_face(
+        "Fleeting Spirit",
+        vec![CoreType::Creature],
+        &[],
+        "{W}, Exile three cards from your graveyard: This creature gains first strike until end of turn.\nDiscard a card: Exile this creature. Return it to the battlefield under its owner's control at the beginning of the next end step.",
+    );
+    assert!(is_flicker_enabler(&card));
+}
+
+#[test]
+fn opponent_scoped_delayed_return_is_not_flicker() {
+    // Mystifying Maze exiles an opponent's attacker: tempo, not a value
+    // flicker.
+    let card = oracle_face(
+        "Mystifying Maze",
+        vec![CoreType::Land],
+        &[],
+        "{T}: Add {C}.\n{4}, {T}: Exile target attacking creature an opponent controls. At the beginning of the next end step, return it to the battlefield tapped under its owner's control.",
+    );
+    assert!(!is_flicker_enabler(&card));
+}
+
+#[test]
+fn linked_exile_pair_across_abilities_is_not_flicker() {
+    // CR 607.2a: Oblivion Ring's exile and return are two linked abilities, not
+    // one exile-and-return chain.
+    let card = oracle_face(
+        "Oblivion Ring",
+        vec![CoreType::Enchantment],
+        &[],
+        "When this enchantment enters, exile another target nonland permanent.\nWhen this enchantment leaves the battlefield, return the exiled card to the battlefield under its owner's control.",
+    );
+    assert!(!is_flicker_enabler(&card));
+}
+
+#[test]
+fn modal_blink_mode_counts_at_potential_scope() {
+    // CR 700.2: Kykar's blink is one of its trigger's modes; deck-time
+    // detection asks whether the card can ever flicker.
+    let card = oracle_face(
+        "Kykar, Zephyr Awakener",
+        vec![CoreType::Creature],
+        &["Flying"],
+        "Flying\nWhenever you cast a noncreature spell, choose one —\n• Exile another target creature you control. Return that card to the battlefield under its owner's control at the beginning of the next end step.\n• Create a 1/1 white Spirit creature token with flying.",
+    );
+    assert!(is_flicker_enabler(&card));
+}
+
+#[test]
+fn non_battlefield_exile_then_put_is_not_flicker() {
+    // Rona exiles a card from a hand, then may put it onto the battlefield:
+    // nothing left the battlefield, so nothing is flickered.
+    let card = oracle_face(
+        "Rona, Tolarian Obliterator",
+        vec![CoreType::Creature],
+        &["Trample"],
+        "Trample\nWhenever a source deals damage to Rona, that source's controller exiles a card from their hand at random. If it's a land card, you may put it onto the battlefield under your control. Otherwise, you may cast it without paying its mana cost.",
+    );
+    assert!(!is_flicker_enabler(&card));
 }

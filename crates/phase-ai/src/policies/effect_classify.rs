@@ -16,6 +16,8 @@ use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use super::context::PolicyContext;
+use crate::ability_chain::{FlickerPair, ReturnAlteration};
+use engine::game::players;
 
 /// Player-impact magnitude above which target selection has a directional
 /// preference rather than falling back to the spell's broader polarity.
@@ -1732,6 +1734,129 @@ fn filter_excludes_parent_target(filter: &TargetFilter) -> bool {
         TargetFilter::And { filters } => filters.iter().any(filter_excludes_parent_target),
         _ => false,
     }
+}
+
+// ── Flicker per-target outcome ──────────────────────────────────────────────
+
+/// What an exile-and-return chain does to one exiled object, read per target
+/// (the flicker authority in `ability_chain` pairs the chain; this reads it
+/// against a concrete object and controller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlickerTargetOutcome {
+    /// CR 400.7 + CR 110.2a: it returns as a new object under its current
+    /// controller.
+    Reenters,
+    /// CR 110.2a: it returns under another player's control.
+    ReturnsToAnotherPlayer,
+    /// It never comes back: a token (CR 111.8), or a card that isn't
+    /// double-faced under a transformed return (CR 712.14a).
+    Ceases,
+    /// CR 102.3: an opponent's object — the exile is tempo or removal against
+    /// that player.
+    OpposingObject,
+    /// The return names a player the AI cannot resolve before resolution.
+    Unresolved,
+}
+
+impl FlickerTargetOutcome {
+    /// The outcome's polarity for the object's controller.
+    pub(crate) fn polarity(self) -> EffectPolarity {
+        match self {
+            FlickerTargetOutcome::Reenters => EffectPolarity::Beneficial,
+            FlickerTargetOutcome::ReturnsToAnotherPlayer
+            | FlickerTargetOutcome::Ceases
+            | FlickerTargetOutcome::OpposingObject => EffectPolarity::Harmful,
+            FlickerTargetOutcome::Unresolved => EffectPolarity::Contextual,
+        }
+    }
+}
+
+/// The player `object` returns under when `pair`'s return resolves for an
+/// ability `ability_controller` controls, or `None` when that player is only
+/// known at resolution.
+pub(crate) fn returning_player(
+    pair: &FlickerPair,
+    object: &GameObject,
+    ability_controller: PlayerId,
+) -> Option<PlayerId> {
+    match &pair.returns.enters_under {
+        // CR 110.2a: the effect states "under its owner's control"; the engine
+        // encodes that as `enters_under: None` and resolves it to the owner
+        // (`ChangeZone.enters_under`).
+        None => Some(object.owner),
+        // CR 110.2a: "under your control" — the ability's controller.
+        Some(ControllerRef::You) => Some(ability_controller),
+        // The engine resolves only `You` at runtime (`ChangeZone.enters_under`).
+        Some(
+            ControllerRef::Opponent
+            | ControllerRef::ScopedPlayer
+            | ControllerRef::TargetPlayer
+            | ControllerRef::TargetOpponent
+            | ControllerRef::ParentTargetController
+            | ControllerRef::EventTargetController
+            | ControllerRef::ParentTargetOwner
+            | ControllerRef::DefendingPlayer
+            | ControllerRef::ChosenPlayer { .. }
+            | ControllerRef::SourceChosenPlayer
+            | ControllerRef::TriggeringPlayer
+            | ControllerRef::EnchantedPlayer
+            | ControllerRef::ActivePlayer
+            | ControllerRef::SpecificPlayer { .. },
+        ) => None,
+    }
+}
+
+/// What `pair` does to `object_id` when an ability `ability_controller`
+/// controls exiles it. `None` when the object does not exist.
+pub(crate) fn flicker_target_outcome(
+    state: &GameState,
+    pair: &FlickerPair,
+    object_id: ObjectId,
+    ability_controller: PlayerId,
+) -> Option<FlickerTargetOutcome> {
+    let object = state.objects.get(&object_id)?;
+    // CR 102.3: exiling an opponent's object is tempo or removal against that
+    // player, whatever the return does.
+    if players::is_opponent(state, ability_controller, object.controller) {
+        return Some(FlickerTargetOutcome::OpposingObject);
+    }
+    // CR 111.8: a token that left the battlefield can't come back.
+    if object.is_token {
+        return Some(FlickerTargetOutcome::Ceases);
+    }
+    // CR 712.14a: a card that isn't double-faced, instructed to enter
+    // transformed, stays in exile.
+    if pair.returns.alteration == ReturnAlteration::Transformed && object.back_face.is_none() {
+        return Some(FlickerTargetOutcome::Ceases);
+    }
+    let Some(returning) = returning_player(pair, object, ability_controller) else {
+        return Some(FlickerTargetOutcome::Unresolved);
+    };
+    if returning != object.controller {
+        // CR 110.2a: control changes on re-entry.
+        return Some(FlickerTargetOutcome::ReturnsToAnotherPlayer);
+    }
+    // CR 400.7: it returns as a new object; CR 110.2a: it enters under the
+    // returning player, who is its current controller.
+    Some(FlickerTargetOutcome::Reenters)
+}
+
+/// The flicker reading of `object_id` as a target of this candidate: the
+/// outcome of the first exile leg of [`PolicyContext::effect_nodes`] that
+/// pairs with a return and whose filter matches the object. `None` when no
+/// flicker exile leg reaches it.
+///
+/// The AI chooses targets only for its own spells and abilities, so
+/// `ctx.ai_player` is the ability controller at every target decision.
+pub(crate) fn flicker_reading_for_target(
+    ctx: &PolicyContext<'_>,
+    object_id: ObjectId,
+) -> Option<FlickerTargetOutcome> {
+    ctx.effect_nodes().into_iter().find_map(|node| {
+        let pair = node.flicker_pair()?;
+        effect_targets_object(ctx, node.effect(), object_id)
+            .then(|| flicker_target_outcome(ctx.state, &pair, object_id, ctx.ai_player))?
+    })
 }
 
 #[cfg(test)]
@@ -4155,5 +4280,213 @@ mod filter_domain_tests {
         );
         assert!(!filter_admits_creature(&filter));
         assert!(!filter_is_creature_only(&filter));
+    }
+}
+
+/// Phase-1 flicker rows U-C1 and U-C3: the per-target outcome of the flicker
+/// authority, read against owner, controller, teammate, token and back face.
+#[cfg(test)]
+mod flicker_rows {
+    use engine::game::game_object::BackFaceData;
+    use engine::game::scenario::{GameScenario, P0, P1};
+    use engine::types::card::LayoutKind;
+    use engine::types::card_type::{CardType, CoreType, Supertype};
+    use engine::types::format::FormatConfig;
+    use engine::types::mana::{ManaColor, ManaCostShard};
+
+    use super::*;
+    use crate::policies::context::flicker_fixtures as fx;
+    use crate::policies::context::SearchDepth;
+
+    fn blink_pair() -> FlickerPair {
+        fx::only_pair(
+            "Momentary Blink",
+            &["Instant"],
+            fx::MOMENTARY_BLINK_KEYWORDS,
+            fx::MOMENTARY_BLINK,
+        )
+    }
+
+    fn cloudshift_pair() -> FlickerPair {
+        fx::only_pair("Cloudshift", &["Instant"], &[], fx::CLOUDSHIFT)
+    }
+
+    fn flickerwisp_pair() -> FlickerPair {
+        fx::only_pair("Flickerwisp", &["Creature"], fx::FLYING, fx::FLICKERWISP)
+    }
+
+    fn bolas_pair() -> FlickerPair {
+        fx::only_pair(
+            "Nicol Bolas, the Ravager",
+            &["Creature"],
+            fx::FLYING,
+            fx::NICOL_BOLAS,
+        )
+    }
+
+    fn arisen() -> BackFaceData {
+        BackFaceData {
+            name: "Nicol Bolas, the Arisen".to_string(),
+            loyalty: Some(7),
+            card_types: CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Planeswalker],
+                subtypes: vec!["Bolas".to_string()],
+            },
+            layout_kind: Some(LayoutKind::Transform),
+            ..BackFaceData::default()
+        }
+    }
+
+    // U-C1: owner vs controller (CR 110.2a), opponent vs teammate (CR 102.3),
+    // token (CR 111.8), unresolved return player, transformed return of a
+    // card with and without a back face (CR 712.14a).
+    #[test]
+    fn outcome_covers_owner_controller_teammate_token() {
+        use FlickerTargetOutcome::*;
+        let mut scenario = fx::scenario();
+        let own = fx::giant(&mut scenario, P0);
+        let token = fx::token_body(&mut scenario, P0);
+        let stolen = scenario
+            .add_creature(P1, "Stolen Bear", 2, 2)
+            .controlled_by(P0)
+            .id();
+        let opposing = fx::bears(&mut scenario, P1);
+        let shell = scenario.add_creature(P0, "Single-Faced Shell", 4, 4).id();
+        let bolas = fx::creature(
+            &mut scenario,
+            P0,
+            "Nicol Bolas, the Ravager",
+            4,
+            4,
+            fx::FLYING,
+            fx::NICOL_BOLAS,
+        );
+        let mut runner = scenario.build();
+        fx::make_token(runner.state_mut(), token);
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&bolas)
+            .unwrap()
+            .back_face = Some(arisen());
+        let state = runner.state();
+
+        let mut unresolved = cloudshift_pair();
+        unresolved.returns.enters_under = Some(ControllerRef::TargetPlayer);
+
+        let rows = [
+            (
+                "own nontoken, Blink",
+                flicker_target_outcome(state, &blink_pair(), own, P0),
+                Reenters,
+            ),
+            (
+                "own token, Blink",
+                flicker_target_outcome(state, &blink_pair(), token, P0),
+                Ceases,
+            ),
+            (
+                "stolen, Blink (owner's control)",
+                flicker_target_outcome(state, &blink_pair(), stolen, P0),
+                ReturnsToAnotherPlayer,
+            ),
+            (
+                "stolen, Cloudshift (your control)",
+                flicker_target_outcome(state, &cloudshift_pair(), stolen, P0),
+                Reenters,
+            ),
+            (
+                "opponent's object, Flickerwisp",
+                flicker_target_outcome(state, &flickerwisp_pair(), opposing, P0),
+                OpposingObject,
+            ),
+            (
+                "enters_under TargetPlayer",
+                flicker_target_outcome(state, &unresolved, own, P0),
+                Unresolved,
+            ),
+            (
+                "single-faced shell under Bolas's pair",
+                flicker_target_outcome(state, &bolas_pair(), shell, P0),
+                Ceases,
+            ),
+            (
+                "Nicol Bolas with his back face",
+                flicker_target_outcome(state, &bolas_pair(), bolas, P0),
+                Reenters,
+            ),
+        ];
+        for (label, outcome, expected) in rows {
+            eprintln!("[flicker U-C1] {label}: {outcome:?}");
+            assert_eq!(outcome, Some(expected), "{label}");
+        }
+
+        // Teammate's object in Two-Headed Giant (CR 810.1: P0 and P1 are a team).
+        let mut scenario = GameScenario::new_with_format(FormatConfig::two_headed_giant(), 4, 42);
+        let teammate = scenario.add_creature(P1, "Teammate Bear", 2, 2).id();
+        let runner = scenario.build();
+        let outcome = flicker_target_outcome(runner.state(), &flickerwisp_pair(), teammate, P0);
+        eprintln!("[flicker U-C1] teammate's object, Flickerwisp (2HG): {outcome:?}");
+        assert_eq!(outcome, Some(Reenters));
+
+        assert_eq!(Reenters.polarity(), EffectPolarity::Beneficial);
+        assert_eq!(ReturnsToAnotherPlayer.polarity(), EffectPolarity::Harmful);
+        assert_eq!(Ceases.polarity(), EffectPolarity::Harmful);
+        assert_eq!(OpposingObject.polarity(), EffectPolarity::Harmful);
+        assert_eq!(Unresolved.polarity(), EffectPolarity::Contextual);
+    }
+
+    // U-C3: the target reading finds the flicker exile leg; a plain removal
+    // has none.
+    #[test]
+    fn flicker_reading_for_target_finds_the_exile_leg() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 2);
+        fx::lands(&mut scenario, P0, ManaColor::Black, 3);
+        let v = fx::giant(&mut scenario, P0);
+        let t = fx::token_body(&mut scenario, P0);
+        let blink = fx::spell_in_hand(
+            &mut scenario,
+            P0,
+            "Momentary Blink",
+            true,
+            fx::MOMENTARY_BLINK_KEYWORDS,
+            fx::MOMENTARY_BLINK,
+            fx::cost(&[ManaCostShard::White], 1),
+        );
+        let murder = fx::spell_in_hand(
+            &mut scenario,
+            P0,
+            "Murder",
+            true,
+            &[],
+            fx::MURDER,
+            fx::cost(&[ManaCostShard::Black, ManaCostShard::Black], 1),
+        );
+        let mut runner = scenario.build();
+        fx::make_token(runner.state_mut(), t);
+        let mut murder_runner =
+            engine::game::scenario::GameRunner::from_state(runner.state().clone());
+
+        fx::begin_cast(&mut runner, blink);
+        let state = runner.state();
+        let probe = fx::Probe::new(state, &fx::choose(v));
+        let ctx = probe.ctx(state, SearchDepth::Root);
+        let (at_v, at_t) = (
+            flicker_reading_for_target(&ctx, v),
+            flicker_reading_for_target(&ctx, t),
+        );
+        eprintln!("[flicker U-C3] Blink: V={at_v:?} T={at_t:?}");
+        assert_eq!(at_v, Some(FlickerTargetOutcome::Reenters));
+        assert_eq!(at_t, Some(FlickerTargetOutcome::Ceases));
+
+        fx::begin_cast(&mut murder_runner, murder);
+        let state = murder_runner.state();
+        let probe = fx::Probe::new(state, &fx::choose(v));
+        let ctx = probe.ctx(state, SearchDepth::Root);
+        let at_v = flicker_reading_for_target(&ctx, v);
+        eprintln!("[flicker U-C3] Murder: V={at_v:?}");
+        assert_eq!(at_v, None);
     }
 }

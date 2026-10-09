@@ -2677,3 +2677,1482 @@ fn mana_dork_outvalues_a_bigger_body_when_trading() {
         keep_dork_reverted - keep_body_reverted
     );
 }
+
+// ── Own-scoped flicker (phase-rs/phase#9673, phase 1) ────────────────────
+//
+// Every card below is built from its verbatim Oracle text through the
+// scenario's Oracle builders (the production parse path). Opposing stack
+// items are real casts by the opponent through the cast pipeline, after which
+// priority is passed back to the AI. Each row prints its per-difficulty
+// reading before asserting, so a base-SHA run records which difficulty is red.
+
+const MOMENTARY_BLINK: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.\nFlashback {3}{U} (You may cast this card from your graveyard for its flashback cost. Then exile it.)";
+const EPHEMERATE: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.\nRebound (If you cast this spell from your hand, exile it as it resolves. At the beginning of your next upkeep, you may cast this card from exile without paying its mana cost.)";
+const CLOUDSHIFT: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
+const ELVISH_VISIONARY: &str = "When this creature enters, draw a card.";
+const MURDER: &str = "Destroy target creature.";
+const SHOCK: &str = "Shock deals 2 damage to any target.";
+const DAY_OF_JUDGMENT: &str = "Destroy all creatures.";
+const DIABOLIC_EDICT: &str = "Target player sacrifices a creature of their choice.";
+const GUARDIAN_OF_GHIRAPUR: &str = "Flying\nWhen this creature enters, exile up to one other target creature or artifact you control. Return it to the battlefield under its owner's control at the beginning of the next end step.";
+const RESTORATION_ANGEL: &str = "Flash\nFlying\nWhen this creature enters, you may exile target non-Angel creature you control, then return that card to the battlefield under your control.";
+const OBLIVION_RING: &str = "When this enchantment enters, exile another target nonland permanent.\nWhen this enchantment leaves the battlefield, return the exiled card to the battlefield under its owner's control.";
+const BANISHER_PRIEST: &str = "When this creature enters, exile target creature an opponent controls until this creature leaves the battlefield.";
+
+/// Keyword hints for the fixture cards whose `data/card-data.json` `keywords`
+/// list is non-empty: the Oracle builder needs them to read a keyword line as
+/// a keyword rather than as an unparsed ability line.
+const GUARDIAN_OF_GHIRAPUR_KEYWORDS: &[&str] = &["Flying"];
+const RESTORATION_ANGEL_KEYWORDS: &[&str] = &["Flash", "Flying"];
+
+/// The named difficulties of every flicker e2e row: Easy (search off) and
+/// Medium (search on, the ai-gate difficulty).
+const FLICKER_DIFFICULTIES: [AiDifficulty; 2] = [AiDifficulty::Easy, AiDifficulty::Medium];
+
+/// The seed tag of the deterministic configuration every flicker e2e reading
+/// uses (the `tests/community_scenarios.rs` precedent).
+const FLICKER_MEASUREMENT_SEED: u64 = 42;
+
+/// The configuration production builds for this fixture's player count, in
+/// measurement mode: search runs without the wall-clock deadline, bounded by
+/// its node and depth limits alone, so every reading repeats run to run.
+fn flicker_config(
+    state: &engine::types::game_state::GameState,
+    difficulty: AiDifficulty,
+) -> phase_ai::config::AiConfig {
+    phase_ai::config::create_config_for_players(
+        difficulty,
+        Platform::Native,
+        state.players.len() as u8,
+    )
+    .into_measurement(FLICKER_MEASUREMENT_SEED)
+}
+
+/// `choose_action` for the AI (P0) under [`flicker_config`], seed 42.
+fn flicker_choose(
+    state: &engine::types::game_state::GameState,
+    difficulty: AiDifficulty,
+) -> GameAction {
+    let mut rng = SmallRng::seed_from_u64(42);
+    choose_action(state, P0, &flicker_config(state, difficulty), &mut rng)
+        .expect("AI should return an action")
+}
+
+fn flicker_mana(shards: &[engine::types::mana::ManaCostShard], generic: u32) -> ManaCost {
+    ManaCost::Cost {
+        shards: shards.to_vec(),
+        generic,
+    }
+}
+
+/// The three own-scoped flicker instants of R1.1.
+#[derive(Debug, Clone, Copy)]
+enum FlickerSpell {
+    MomentaryBlink,
+    Ephemerate,
+    Cloudshift,
+}
+
+impl FlickerSpell {
+    const ALL: [FlickerSpell; 3] = [
+        FlickerSpell::MomentaryBlink,
+        FlickerSpell::Ephemerate,
+        FlickerSpell::Cloudshift,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            FlickerSpell::MomentaryBlink => "Momentary Blink",
+            FlickerSpell::Ephemerate => "Ephemerate",
+            FlickerSpell::Cloudshift => "Cloudshift",
+        }
+    }
+
+    fn oracle(self) -> &'static str {
+        match self {
+            FlickerSpell::MomentaryBlink => MOMENTARY_BLINK,
+            FlickerSpell::Ephemerate => EPHEMERATE,
+            FlickerSpell::Cloudshift => CLOUDSHIFT,
+        }
+    }
+
+    fn cost(self) -> ManaCost {
+        use engine::types::mana::ManaCostShard::White;
+        match self {
+            FlickerSpell::MomentaryBlink => flicker_mana(&[White], 1),
+            FlickerSpell::Ephemerate | FlickerSpell::Cloudshift => flicker_mana(&[White], 0),
+        }
+    }
+
+    /// The keyword lines the plain Oracle builder would leave unparsed.
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            FlickerSpell::MomentaryBlink => &["Flashback"],
+            FlickerSpell::Ephemerate => &["Rebound"],
+            FlickerSpell::Cloudshift => &[],
+        }
+    }
+
+    fn add_to_hand(self, scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_spell_to_hand(P0, self.name(), true)
+            .from_oracle_text_with_keywords(self.keywords(), self.oracle())
+            .with_mana_cost(self.cost())
+            .id()
+    }
+}
+
+/// The AI's own creatures a flicker board can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnPiece {
+    /// V — Hill Giant, a vanilla 3/3.
+    VanillaGiant,
+    /// W — Grizzly Bears, a vanilla 2/2.
+    VanillaBears,
+    /// E — Elvish Visionary, a value-ETB creature.
+    ValueEtb,
+    /// T — a 1/1 creature token.
+    Token,
+}
+
+/// The opposing (or own) effect on the stack when the AI gets priority.
+#[derive(Debug, Clone, Copy)]
+enum FlickerThreat {
+    /// The opponent's Murder targeting V.
+    OpposingMurderOnV,
+    /// The opponent's Shock targeting V (non-lethal on a 3/3, CR 704.5g).
+    OpposingShockOnV,
+    /// The opponent's Day of Judgment (untargeted, CR 115.10a).
+    OpposingDayOfJudgment,
+    /// The opponent's Diabolic Edict targeting the AI player.
+    OpposingEdictOnAi,
+    /// The AI's own Murder targeting V.
+    OwnMurderOnV,
+}
+
+struct FlickerBoard {
+    runner: engine::game::scenario::GameRunner,
+    spell: ObjectId,
+    pieces: Vec<(OwnPiece, ObjectId)>,
+}
+
+impl FlickerBoard {
+    fn id(&self, piece: OwnPiece) -> ObjectId {
+        self.pieces
+            .iter()
+            .find(|(p, _)| *p == piece)
+            .map(|(_, id)| *id)
+            .unwrap_or_else(|| panic!("{piece:?} is not on this board"))
+    }
+}
+
+fn add_own_piece(scenario: &mut GameScenario, owner: PlayerId, piece: OwnPiece) -> ObjectId {
+    match piece {
+        OwnPiece::VanillaGiant => scenario.add_creature(owner, "Hill Giant", 3, 3).id(),
+        OwnPiece::VanillaBears => scenario.add_creature(owner, "Grizzly Bears", 2, 2).id(),
+        OwnPiece::ValueEtb => scenario
+            .add_creature_from_oracle(owner, "Elvish Visionary", 1, 1, ELVISH_VISIONARY)
+            .id(),
+        OwnPiece::Token => scenario.add_creature(owner, "Spirit Token", 1, 1).id(),
+    }
+}
+
+fn add_lands(
+    scenario: &mut GameScenario,
+    player: PlayerId,
+    color: engine::types::mana::ManaColor,
+    count: usize,
+) {
+    for _ in 0..count {
+        scenario.add_basic_land(player, color);
+    }
+}
+
+fn mark_tokens(runner: &mut engine::game::scenario::GameRunner, pieces: &[(OwnPiece, ObjectId)]) {
+    for (piece, id) in pieces {
+        if *piece == OwnPiece::Token {
+            runner.state_mut().objects.get_mut(id).unwrap().is_token = true;
+        }
+    }
+}
+
+/// Make `player` the active player holding priority in its precombat main.
+fn give_turn(runner: &mut engine::game::scenario::GameRunner, player: PlayerId) {
+    let state = runner.state_mut();
+    state.phase = Phase::PreCombatMain;
+    state.active_player = player;
+    state.priority_player = player;
+    state.waiting_for = WaitingFor::Priority { player };
+}
+
+/// Pass priority until `player` holds it, without letting the stack resolve
+/// (each pass hands priority to the next player; the AI's own pass never
+/// happens here).
+fn pass_until_priority(runner: &mut engine::game::scenario::GameRunner, player: PlayerId) {
+    for _ in 0..8 {
+        if matches!(runner.state().waiting_for, WaitingFor::Priority { player: p } if p == player) {
+            return;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("passing priority must be accepted");
+    }
+    panic!(
+        "priority never reached {player:?}; waiting_for = {:?}",
+        runner.state().waiting_for
+    );
+}
+
+fn cast_spell_action(state: &engine::types::game_state::GameState, id: ObjectId) -> GameAction {
+    GameAction::CastSpell {
+        object_id: id,
+        card_id: state.objects[&id].card_id,
+        targets: vec![],
+        payment_mode: CastPaymentMode::Auto,
+    }
+}
+
+fn choose_object(id: ObjectId) -> GameAction {
+    GameAction::ChooseTarget {
+        target: Some(TargetRef::Object(id)),
+    }
+}
+
+fn flicker_scores(
+    state: &engine::types::game_state::GameState,
+    difficulty: AiDifficulty,
+) -> Vec<(GameAction, f64)> {
+    score_candidates(state, P0, &flicker_config(state, difficulty))
+}
+
+fn score_of(scores: &[(GameAction, f64)], action: &GameAction) -> Option<f64> {
+    scores
+        .iter()
+        .find(|(candidate, _)| candidate == action)
+        .map(|(_, score)| *score)
+}
+
+/// Build a flicker board with two untapped Plains for the AI: see
+/// [`flicker_board_with_plains`].
+fn flicker_board(
+    spell: FlickerSpell,
+    pieces: &[OwnPiece],
+    threat: Option<FlickerThreat>,
+) -> FlickerBoard {
+    flicker_board_with_plains(spell, 2, pieces, threat)
+}
+
+/// Build a flicker board: the AI (P0) holds `spell` with `plains` untapped
+/// Plains and controls `pieces`; the opponent (P1) controls no creature. With
+/// a threat, the threat's caster casts it first and priority comes back to the
+/// AI with it on the stack.
+fn flicker_board_with_plains(
+    spell: FlickerSpell,
+    plains: usize,
+    pieces: &[OwnPiece],
+    threat: Option<FlickerThreat>,
+) -> FlickerBoard {
+    use engine::types::mana::ManaColor;
+    use engine::types::mana::ManaCostShard::{Black, Red, White};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    stock_libraries(&mut scenario);
+    let spell_id = spell.add_to_hand(&mut scenario);
+    add_lands(&mut scenario, P0, ManaColor::White, plains);
+    let placed: Vec<(OwnPiece, ObjectId)> = pieces
+        .iter()
+        .map(|piece| (*piece, add_own_piece(&mut scenario, P0, *piece)))
+        .collect();
+
+    let threat_card = threat.map(|threat| match threat {
+        FlickerThreat::OpposingMurderOnV => {
+            add_lands(&mut scenario, P1, ManaColor::Black, 3);
+            scenario
+                .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
+                .with_mana_cost(flicker_mana(&[Black, Black], 1))
+                .id()
+        }
+        FlickerThreat::OpposingShockOnV => {
+            add_lands(&mut scenario, P1, ManaColor::Red, 1);
+            scenario
+                .add_spell_to_hand_from_oracle(P1, "Shock", true, SHOCK)
+                .with_mana_cost(flicker_mana(&[Red], 0))
+                .id()
+        }
+        FlickerThreat::OpposingDayOfJudgment => {
+            add_lands(&mut scenario, P1, ManaColor::White, 4);
+            scenario
+                .add_spell_to_hand_from_oracle(P1, "Day of Judgment", false, DAY_OF_JUDGMENT)
+                .with_mana_cost(flicker_mana(&[White, White], 2))
+                .id()
+        }
+        FlickerThreat::OpposingEdictOnAi => {
+            add_lands(&mut scenario, P1, ManaColor::Black, 2);
+            scenario
+                .add_spell_to_hand_from_oracle(P1, "Diabolic Edict", true, DIABOLIC_EDICT)
+                .with_mana_cost(flicker_mana(&[Black], 1))
+                .id()
+        }
+        FlickerThreat::OwnMurderOnV => {
+            add_lands(&mut scenario, P0, ManaColor::Black, 3);
+            scenario
+                .add_spell_to_hand_from_oracle(P0, "Murder", true, MURDER)
+                .with_mana_cost(flicker_mana(&[Black, Black], 1))
+                .id()
+        }
+    });
+
+    let mut runner = scenario.build();
+    mark_tokens(&mut runner, &placed);
+    let board_v = placed
+        .iter()
+        .find(|(piece, _)| *piece == OwnPiece::VanillaGiant)
+        .map(|(_, id)| *id);
+
+    if let (Some(threat), Some(card)) = (threat, threat_card) {
+        let caster = match threat {
+            FlickerThreat::OwnMurderOnV => P0,
+            _ => P1,
+        };
+        give_turn(&mut runner, caster);
+        let v = || board_v.expect("this threat names V");
+        match threat {
+            FlickerThreat::OpposingMurderOnV
+            | FlickerThreat::OpposingShockOnV
+            | FlickerThreat::OwnMurderOnV => {
+                let _ = runner.cast(card).target_object(v()).commit();
+            }
+            FlickerThreat::OpposingDayOfJudgment => {
+                let _ = runner.cast(card).commit();
+            }
+            FlickerThreat::OpposingEdictOnAi => {
+                let _ = runner.cast(card).target_player(P0).commit();
+            }
+        }
+        pass_until_priority(&mut runner, P0);
+        assert_eq!(
+            runner.state().stack.len(),
+            1,
+            "{threat:?} must be on the stack when the AI gets priority"
+        );
+    }
+
+    FlickerBoard {
+        runner,
+        spell: spell_id,
+        pieces: placed,
+    }
+}
+
+/// Cast the board's flicker spell and stop at its target prompt.
+fn begin_flicker_cast(board: &mut FlickerBoard) {
+    let action = cast_spell_action(board.runner.state(), board.spell);
+    board
+        .runner
+        .act(action)
+        .expect("casting the flicker spell must be accepted");
+    assert!(
+        matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "the flicker cast must stop at its target prompt; got {:?}",
+        board.runner.state().waiting_for
+    );
+}
+
+fn report_rows(row: &str, failures: &[String]) {
+    assert!(
+        failures.is_empty(),
+        "{row}: {} failing reading(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// R1.1 (AC1): an own-scoped flicker cast survives the pre-filter, with an
+// opposing removal on the stack (rescue) and without one (value ETB).
+
+#[test]
+fn own_flicker_spell_survives_prefilter_with_opposing_removal_on_stack() {
+    let mut failures = Vec::new();
+    for spell in FlickerSpell::ALL {
+        let board = flicker_board(
+            spell,
+            &[OwnPiece::VanillaGiant, OwnPiece::ValueEtb],
+            Some(FlickerThreat::OpposingMurderOnV),
+        );
+        let cast = cast_spell_action(board.runner.state(), board.spell);
+        for difficulty in FLICKER_DIFFICULTIES {
+            let scores = flicker_scores(board.runner.state(), difficulty);
+            let score = score_of(&scores, &cast);
+            eprintln!("[flicker R1.1 rescue] {spell:?} {difficulty:?}: cast score = {score:?}");
+            if !score.is_some_and(f64::is_finite) {
+                failures.push(format!(
+                    "{spell:?} {difficulty:?}: cast candidate absent or non-finite ({score:?})"
+                ));
+            }
+        }
+    }
+    report_rows("R1.1 rescue", &failures);
+}
+
+#[test]
+fn own_flicker_spell_survives_prefilter_with_value_etb_target() {
+    let mut failures = Vec::new();
+    for spell in FlickerSpell::ALL {
+        let board = flicker_board(spell, &[OwnPiece::ValueEtb, OwnPiece::VanillaGiant], None);
+        let cast = cast_spell_action(board.runner.state(), board.spell);
+        for difficulty in FLICKER_DIFFICULTIES {
+            let scores = flicker_scores(board.runner.state(), difficulty);
+            let score = score_of(&scores, &cast);
+            eprintln!("[flicker R1.1 etb] {spell:?} {difficulty:?}: cast score = {score:?}");
+            if !score.is_some_and(f64::is_finite) {
+                failures.push(format!(
+                    "{spell:?} {difficulty:?}: cast candidate absent or non-finite ({score:?})"
+                ));
+            }
+        }
+    }
+    report_rows("R1.1 etb", &failures);
+}
+
+/// Score V, E and T at a Momentary Blink target prompt, per difficulty.
+fn blink_target_scores(
+    board: &FlickerBoard,
+    difficulty: AiDifficulty,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let scores = flicker_scores(board.runner.state(), difficulty);
+    let read = |piece| {
+        board
+            .pieces
+            .iter()
+            .find(|(p, _)| *p == piece)
+            .and_then(|(_, id)| score_of(&scores, &choose_object(*id)))
+    };
+    (
+        read(OwnPiece::VanillaGiant),
+        read(OwnPiece::ValueEtb),
+        read(OwnPiece::Token),
+    )
+}
+
+// R1.4 (AC2, rescue): the creature an opposing removal will kill is the
+// flicker's target.
+#[test]
+fn flicker_targets_creature_threatened_by_opposing_removal() {
+    let mut board = flicker_board(
+        FlickerSpell::MomentaryBlink,
+        &[OwnPiece::VanillaGiant, OwnPiece::ValueEtb, OwnPiece::Token],
+        Some(FlickerThreat::OpposingMurderOnV),
+    );
+    begin_flicker_cast(&mut board);
+    let mut failures = Vec::new();
+    for difficulty in FLICKER_DIFFICULTIES {
+        let (v, e, t) = blink_target_scores(&board, difficulty);
+        eprintln!("[flicker R1.4] {difficulty:?}: V={v:?} E={e:?} T={t:?}");
+        let (Some(v), Some(e), Some(t)) = (v, e, t) else {
+            failures.push(format!("{difficulty:?}: a target candidate is missing"));
+            continue;
+        };
+        if !(v > e && v > t) {
+            failures.push(format!("{difficulty:?}: V={v} must beat E={e} and T={t}"));
+        }
+    }
+    let chosen = flicker_choose(board.runner.state(), AiDifficulty::VeryHard);
+    eprintln!("[flicker R1.4] VeryHard choose_action = {chosen:?}");
+    if chosen != choose_object(board.id(OwnPiece::VanillaGiant)) {
+        failures.push(format!("VeryHard: chose {chosen:?}, expected V"));
+    }
+    report_rows("R1.4", &failures);
+}
+
+// R1.4 hostile: a threat a flicker does not answer leaves the value-ETB
+// creature the preferred target — non-lethal damage (CR 704.5g), an
+// untargeted wipe and a player-targeted edict (CR 115.10a).
+#[test]
+fn flicker_ignores_threats_a_flicker_does_not_answer() {
+    let mut failures = Vec::new();
+    for threat in [
+        FlickerThreat::OpposingShockOnV,
+        FlickerThreat::OpposingDayOfJudgment,
+        FlickerThreat::OpposingEdictOnAi,
+    ] {
+        let mut board = flicker_board(
+            FlickerSpell::MomentaryBlink,
+            &[OwnPiece::VanillaGiant, OwnPiece::ValueEtb, OwnPiece::Token],
+            Some(threat),
+        );
+        begin_flicker_cast(&mut board);
+        let v_id = board.id(OwnPiece::VanillaGiant);
+        let offered_v = match &board.runner.state().waiting_for {
+            WaitingFor::TargetSelection { selection, .. } => selection
+                .current_legal_targets
+                .contains(&TargetRef::Object(v_id)),
+            _ => false,
+        };
+        assert!(offered_v, "{threat:?}: the target prompt must offer V");
+        for difficulty in FLICKER_DIFFICULTIES {
+            let (v, e, t) = blink_target_scores(&board, difficulty);
+            eprintln!("[flicker R1.4 hostile] {threat:?} {difficulty:?}: V={v:?} E={e:?} T={t:?}");
+            let (Some(v), Some(e), Some(t)) = (v, e, t) else {
+                failures.push(format!("{threat:?} {difficulty:?}: a target is missing"));
+                continue;
+            };
+            if !(e > v && e > t) {
+                failures.push(format!(
+                    "{threat:?} {difficulty:?}: E={e} must beat V={v} and T={t}"
+                ));
+            }
+        }
+    }
+    report_rows("R1.4 hostile", &failures);
+}
+
+/// The R1.4 own/team board in Two-Headed Giant: P0 (the AI) controls V, E and
+/// T and holds Momentary Blink; its teammate P1 has cast Murder targeting V.
+/// Stops at the Blink's target prompt.
+fn teammate_murder_board() -> FlickerBoard {
+    use engine::game::players;
+    use engine::types::format::FormatConfig;
+    use engine::types::mana::ManaColor;
+    use engine::types::mana::ManaCostShard::Black;
+
+    let mut scenario = GameScenario::new_with_format(FormatConfig::two_headed_giant(), 4, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1, PlayerId(2), PlayerId(3)] {
+        for _ in 0..10 {
+            scenario.add_card_to_library_top(player, "Library Filler");
+        }
+    }
+    let blink = FlickerSpell::MomentaryBlink.add_to_hand(&mut scenario);
+    add_lands(&mut scenario, P0, ManaColor::White, 2);
+    let pieces: Vec<(OwnPiece, ObjectId)> =
+        [OwnPiece::VanillaGiant, OwnPiece::ValueEtb, OwnPiece::Token]
+            .into_iter()
+            .map(|piece| (piece, add_own_piece(&mut scenario, P0, piece)))
+            .collect();
+    // P1 is P0's teammate in Two-Headed Giant (CR 810.1).
+    add_lands(&mut scenario, P1, ManaColor::Black, 3);
+    let murder = scenario
+        .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
+        .with_mana_cost(flicker_mana(&[Black, Black], 1))
+        .id();
+    let mut runner = scenario.build();
+    mark_tokens(&mut runner, &pieces);
+    let v = pieces[0].1;
+    give_turn(&mut runner, P1);
+    let _ = runner.cast(murder).target_object(v).commit();
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the teammate's Murder is on the stack"
+    );
+    // CR 810.2 + CR 805.5 + CR 805.5a: in Two-Headed Giant the team has
+    // priority, and a player may cast a spell while their team has priority.
+    // The engine's priority seat after the teammate's cast must belong to
+    // P0's team; the fixture then only selects which teammate acts within the
+    // team's priority.
+    let WaitingFor::Priority { player: seat } = runner.state().waiting_for else {
+        panic!(
+            "after the teammate's cast the team must hold priority; got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert!(
+        !players::is_opponent(runner.state(), P0, seat),
+        "the priority seat {seat:?} after the teammate's cast must be on P0's team"
+    );
+    eprintln!("[flicker R1.4 own/team] 2HG priority seat after the teammate's cast: {seat:?}");
+    if seat != P0 {
+        let state = runner.state_mut();
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    let mut board = FlickerBoard {
+        runner,
+        spell: blink,
+        pieces,
+    };
+    begin_flicker_cast(&mut board);
+    board
+}
+
+// R1.4 own/team (charter r9, rescue reading): Murder's "Destroy target
+// creature." fails on resolution once V has been flickered (CR 608.2b +
+// CR 400.7), whoever controls the Murder — so with the AI's own Murder (cast
+// by P0, which keeps priority, CR 117.3c) or its 2HG teammate's Murder on V,
+// the AI picks V.
+#[test]
+fn flicker_rescues_creature_from_own_or_teammate_removal() {
+    let mut failures = Vec::new();
+    let mut own_board = flicker_board(
+        FlickerSpell::MomentaryBlink,
+        &[OwnPiece::VanillaGiant, OwnPiece::ValueEtb, OwnPiece::Token],
+        Some(FlickerThreat::OwnMurderOnV),
+    );
+    begin_flicker_cast(&mut own_board);
+    for (arm, board) in [
+        ("own Murder", own_board),
+        ("2HG teammate Murder", teammate_murder_board()),
+    ] {
+        let v_id = board.id(OwnPiece::VanillaGiant);
+        let offered_v = match &board.runner.state().waiting_for {
+            WaitingFor::TargetSelection { selection, .. } => selection
+                .current_legal_targets
+                .contains(&TargetRef::Object(v_id)),
+            _ => false,
+        };
+        assert!(offered_v, "{arm}: the target prompt must offer V");
+        for difficulty in FLICKER_DIFFICULTIES {
+            let (v, e, t) = blink_target_scores(&board, difficulty);
+            eprintln!("[flicker R1.4 own/team] {arm} {difficulty:?}: V={v:?} E={e:?} T={t:?}");
+            let (Some(v), Some(e), Some(t)) = (v, e, t) else {
+                failures.push(format!("{arm} {difficulty:?}: a target is missing"));
+                continue;
+            };
+            if !(v > e && v > t) {
+                failures.push(format!(
+                    "{arm} {difficulty:?}: V={v} must beat E={e} and T={t}"
+                ));
+            }
+        }
+        let chosen = flicker_choose(board.runner.state(), AiDifficulty::VeryHard);
+        eprintln!("[flicker R1.4 own/team] {arm} VeryHard choose_action = {chosen:?}");
+        if chosen != choose_object(v_id) {
+            failures.push(format!("{arm} VeryHard: chose {chosen:?}, expected V"));
+        }
+    }
+    report_rows("R1.4 own/team", &failures);
+}
+
+// R1.5 (AC2, ETB): with no threat the value-ETB creature beats a larger
+// vanilla creature and a token.
+#[test]
+fn flicker_prefers_value_etb_over_larger_vanilla_and_token() {
+    let mut board = flicker_board(
+        FlickerSpell::MomentaryBlink,
+        &[OwnPiece::VanillaGiant, OwnPiece::ValueEtb, OwnPiece::Token],
+        None,
+    );
+    begin_flicker_cast(&mut board);
+    let mut failures = Vec::new();
+    for difficulty in FLICKER_DIFFICULTIES {
+        let (v, e, t) = blink_target_scores(&board, difficulty);
+        eprintln!("[flicker R1.5] {difficulty:?}: V={v:?} E={e:?} T={t:?}");
+        let (Some(v), Some(e), Some(t)) = (v, e, t) else {
+            failures.push(format!("{difficulty:?}: a target is missing"));
+            continue;
+        };
+        if !(e > v && v > t) {
+            failures.push(format!("{difficulty:?}: need E={e} > V={v} > T={t}"));
+        }
+    }
+    let chosen = flicker_choose(board.runner.state(), AiDifficulty::VeryHard);
+    eprintln!("[flicker R1.5] VeryHard choose_action = {chosen:?}");
+    if chosen != choose_object(board.id(OwnPiece::ValueEtb)) {
+        failures.push(format!("VeryHard: chose {chosen:?}, expected E"));
+    }
+    report_rows("R1.5", &failures);
+}
+
+// R1.6 (AC2, token, CR 111.8): a token is never preferred over a nontoken
+// target.
+#[test]
+fn flicker_never_targets_token_while_nontoken_alternative_exists() {
+    let mut board = flicker_board(
+        FlickerSpell::MomentaryBlink,
+        &[OwnPiece::VanillaGiant, OwnPiece::Token],
+        None,
+    );
+    begin_flicker_cast(&mut board);
+    let mut failures = Vec::new();
+    for difficulty in FLICKER_DIFFICULTIES {
+        let (v, _, t) = blink_target_scores(&board, difficulty);
+        eprintln!("[flicker R1.6] {difficulty:?}: V={v:?} T={t:?}");
+        let (Some(v), Some(t)) = (v, t) else {
+            failures.push(format!("{difficulty:?}: a target is missing"));
+            continue;
+        };
+        if v <= t {
+            failures.push(format!("{difficulty:?}: V={v} must beat T={t}"));
+        }
+    }
+    report_rows("R1.6", &failures);
+}
+
+// R1.9 (shippability): a flicker whose legal targets offer no value is not
+// cast — while its cast candidate is present (it got past the pre-filter) and
+// carries `AntiSelfHarmPolicy`'s no-value veto.
+//
+// The fixture is Cloudshift ({W}; no Flashback, CR 702.34a, and no Rebound,
+// CR 702.88a): a resolved Cloudshift goes to the graveyard (CR 608.2n) and
+// cannot be cast again, so a no-value cast only spends the card. The AI holds
+// Cloudshift, one untapped Plains and only vanilla creatures V and W.
+
+/// The R1.9 boards: no threat, and the three threats a flicker does not
+/// answer (non-lethal Shock, CR 704.5g; Day of Judgment, untargeted; Diabolic
+/// Edict, player-targeted — CR 115.10a).
+const NO_VALUE_BOARDS: [Option<FlickerThreat>; 4] = [
+    None,
+    Some(FlickerThreat::OpposingShockOnV),
+    Some(FlickerThreat::OpposingDayOfJudgment),
+    Some(FlickerThreat::OpposingEdictOnAi),
+];
+
+/// A no-value board for `spell`: the AI holds `spell` with exactly its mana
+/// value in untapped Plains and controls only vanilla V and W.
+fn no_value_board(spell: FlickerSpell, threat: Option<FlickerThreat>) -> FlickerBoard {
+    let plains = match spell {
+        FlickerSpell::MomentaryBlink => 2,
+        FlickerSpell::Ephemerate | FlickerSpell::Cloudshift => 1,
+    };
+    flicker_board_with_plains(
+        spell,
+        plains,
+        &[OwnPiece::VanillaGiant, OwnPiece::VanillaBears],
+        threat,
+    )
+}
+
+/// The decision-trace `Reject` entry of R1.9's veto: `AntiSelfHarmPolicy`
+/// rejects an own flicker whose legal targets offer no value, with the
+/// no-value check's `NoValue(CreatureOnlyOrSource)` fact.
+/// The tactical pre-filter's decision-trace event for R1.9's veto
+/// (orchestrator decision amending plan r9): the no-value check's
+/// `NoValue(ExcludedAtBase)` outcome, code 2.
+fn is_r1_9_gate_reject(line: &str, action: &GameAction) -> bool {
+    line.contains("message=tactical gate reject")
+        && line.contains(r#"gate_reject="flicker_no_value""#)
+        && line.contains("flicker_no_value_check=2")
+        && line.contains(&format!("action={action:?}"))
+}
+
+/// The pre-filter rejections score_candidates reports on `state`'s decision.
+fn gate_reject_lines(
+    state: &engine::types::game_state::GameState,
+    difficulty: AiDifficulty,
+) -> Vec<String> {
+    flicker_trace_capture::run_with_trace(|| {
+        let _ = flicker_scores(state, difficulty);
+    })
+    .into_iter()
+    .filter(|line| line.contains("message=tactical gate reject"))
+    .collect()
+}
+
+/// R1.9's assertions for `spell` on one no-value board, at every named
+/// difficulty: the AI does not cast it and Pass is finite; the engine issues
+/// the cast, and the tactical pre-filter removes it with R1.9's no-value
+/// reason (its decision-trace event), so it is absent from the scores.
+fn assert_no_value_flicker_not_cast(
+    row: &str,
+    spell: FlickerSpell,
+    threat: Option<FlickerThreat>,
+) -> Vec<String> {
+    let board = no_value_board(spell, threat);
+    let state = board.runner.state();
+    let cast = cast_spell_action(state, board.spell);
+    let mut failures = Vec::new();
+    let issued = engine::ai_support::build_decision_context(state)
+        .candidates
+        .iter()
+        .any(|candidate| candidate.action == cast);
+    if !issued {
+        failures.push(format!(
+            "{spell:?} {threat:?}: the engine must issue the cast"
+        ));
+    }
+    for difficulty in FLICKER_DIFFICULTIES {
+        let scores = flicker_scores(state, difficulty);
+        let cast_score = score_of(&scores, &cast);
+        let pass_score = score_of(&scores, &GameAction::PassPriority);
+        let chosen = flicker_choose(state, difficulty);
+        let rejects = gate_reject_lines(state, difficulty);
+        let reached = rejects.iter().any(|line| is_r1_9_gate_reject(line, &cast));
+        eprintln!(
+            "[flicker {row}] {spell:?} {threat:?} {difficulty:?}: cast={cast_score:?} pass={pass_score:?} choose={chosen:?} gate_no_value_reject={reached}"
+        );
+        if chosen == cast {
+            failures.push(format!(
+                "{spell:?} {threat:?} {difficulty:?}: chose the cast"
+            ));
+        }
+        if !pass_score.is_some_and(f64::is_finite) {
+            failures.push(format!(
+                "{spell:?} {threat:?} {difficulty:?}: pass absent or non-finite ({pass_score:?})"
+            ));
+        }
+        if cast_score.is_some() {
+            failures.push(format!(
+                "{spell:?} {threat:?} {difficulty:?}: the pre-filter must remove the cast ({cast_score:?})"
+            ));
+        }
+        // Reach guard: the pre-filter removed the cast with R1.9's reason.
+        if !reached {
+            failures.push(format!(
+                "{spell:?} {threat:?} {difficulty:?}: no R1.9 gate rejection for the cast: {rejects:?}"
+            ));
+        }
+    }
+    failures
+}
+
+#[test]
+fn no_value_flicker_spell_is_not_cast() {
+    let failures = assert_no_value_flicker_not_cast("R1.9", FlickerSpell::Cloudshift, None);
+    report_rows("R1.9", &failures);
+}
+
+#[test]
+fn no_value_flicker_spell_stays_uncast_against_unanswerable_threats() {
+    let mut failures = Vec::new();
+    for threat in NO_VALUE_BOARDS.into_iter().flatten() {
+        failures.extend(assert_no_value_flicker_not_cast(
+            "R1.9 hostile",
+            FlickerSpell::Cloudshift,
+            Some(threat),
+        ));
+    }
+    report_rows("R1.9 hostile", &failures);
+}
+
+// R1.9 recastable (charter r10): Momentary Blink (Flashback, CR 702.34a) and
+// Ephemerate (Rebound, CR 702.88a) on R1.9's four boards, with R1.9's
+// assertions — their no-value cast is vetoed like Cloudshift's.
+#[test]
+fn no_value_recastable_flicker_spell_is_not_cast() {
+    let mut failures = Vec::new();
+    for spell in [FlickerSpell::MomentaryBlink, FlickerSpell::Ephemerate] {
+        for threat in NO_VALUE_BOARDS {
+            failures.extend(assert_no_value_flicker_not_cast(
+                "R1.9 recastable",
+                spell,
+                threat,
+            ));
+        }
+    }
+    report_rows("R1.9 recastable", &failures);
+}
+
+/// The AI casts a creature and the engine resolves it, stopping at the AI's
+/// first decision after resolution (its ETB trigger's target prompt).
+fn cast_and_resolve_to_trigger_prompt(
+    runner: &mut engine::game::scenario::GameRunner,
+    creature: ObjectId,
+) {
+    let _ = runner.cast(creature).commit();
+    for _ in 0..8 {
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            return;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("passing priority must be accepted");
+    }
+    panic!(
+        "the creature never reached its trigger prompt; waiting_for = {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// An ETB-flicker creature card: its printed identity, its verbatim Oracle
+/// text and the keyword hints its `data/card-data.json` entry carries.
+struct EtbFlickerCreature {
+    name: &'static str,
+    oracle: &'static str,
+    keywords: &'static [&'static str],
+    subtypes: &'static [&'static str],
+    power: i32,
+    toughness: i32,
+    cost: ManaCost,
+}
+
+/// A board where the AI casts an ETB-flicker creature from hand at its
+/// precombat main (four untapped Plains), holding `pieces`.
+fn etb_flicker_board(
+    card: EtbFlickerCreature,
+    pieces: &[OwnPiece],
+) -> (
+    engine::game::scenario::GameRunner,
+    ObjectId,
+    Vec<(OwnPiece, ObjectId)>,
+) {
+    use engine::types::mana::ManaColor;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    stock_libraries(&mut scenario);
+    add_lands(&mut scenario, P0, ManaColor::White, 4);
+    let creature = scenario
+        .add_creature_to_hand(P0, card.name, card.power, card.toughness)
+        .with_subtypes(card.subtypes.to_vec())
+        .from_oracle_text_with_keywords(card.keywords, card.oracle)
+        .with_mana_cost(card.cost)
+        .id();
+    let placed: Vec<(OwnPiece, ObjectId)> = pieces
+        .iter()
+        .map(|piece| (*piece, add_own_piece(&mut scenario, P0, *piece)))
+        .collect();
+    let mut runner = scenario.build();
+    mark_tokens(&mut runner, &placed);
+    (runner, creature, placed)
+}
+
+fn guardian_board(
+    pieces: &[OwnPiece],
+) -> (
+    engine::game::scenario::GameRunner,
+    Vec<(OwnPiece, ObjectId)>,
+) {
+    use engine::types::mana::ManaCostShard::White;
+    let (mut runner, guardian, placed) = etb_flicker_board(
+        EtbFlickerCreature {
+            name: "Guardian of Ghirapur",
+            oracle: GUARDIAN_OF_GHIRAPUR,
+            keywords: GUARDIAN_OF_GHIRAPUR_KEYWORDS,
+            subtypes: &["Angel"],
+            power: 3,
+            toughness: 3,
+            cost: flicker_mana(&[White], 2),
+        },
+        pieces,
+    );
+    cast_and_resolve_to_trigger_prompt(&mut runner, guardian);
+    (runner, placed)
+}
+
+/// The "decline" candidates of an "up to one" target prompt.
+fn is_target_decline(action: &GameAction) -> bool {
+    matches!(action, GameAction::ChooseTarget { target: None })
+        || matches!(action, GameAction::SelectTargets { targets } if targets.is_empty())
+}
+
+fn decline_score(scores: &[(GameAction, f64)]) -> Option<f64> {
+    scores
+        .iter()
+        .filter(|(action, _)| is_target_decline(action))
+        .map(|(_, score)| *score)
+        .reduce(f64::max)
+}
+
+fn select_or_choose_score(scores: &[(GameAction, f64)], id: ObjectId) -> Option<f64> {
+    scores
+        .iter()
+        .filter(|(action, _)| match action {
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target)),
+            } => *target == id,
+            GameAction::SelectTargets { targets } => targets.as_slice() == [TargetRef::Object(id)],
+            _ => false,
+        })
+        .map(|(_, score)| *score)
+        .reduce(f64::max)
+}
+
+// R1.6, second test: a token-only optional flicker slot is declined.
+#[test]
+fn optional_flicker_slot_with_only_token_declines() {
+    let (runner, pieces) = guardian_board(&[OwnPiece::Token]);
+    let t = pieces[0].1;
+    let mut failures = Vec::new();
+    // In-row reach marker: the prompt offers T's target candidate and the
+    // decline, and T's candidate reached the flicker valuation (TokenCeases,
+    // CR 111.8).
+    let decision = engine::ai_support::build_decision_context(runner.state());
+    let token_candidate = decision
+        .candidates
+        .iter()
+        .map(|candidate| candidate.action.clone())
+        .find(|action| match action {
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target)),
+            } => *target == t,
+            GameAction::SelectTargets { targets } => targets.as_slice() == [TargetRef::Object(t)],
+            _ => false,
+        })
+        .expect("the Guardian prompt must offer T");
+    assert!(
+        decision
+            .candidates
+            .iter()
+            .any(|candidate| is_target_decline(&candidate.action)),
+        "the Guardian prompt must offer the decline"
+    );
+    let token_trace = trace_line_for(runner.state(), &token_candidate);
+    eprintln!("[flicker R1.6 guardian] T trace: {token_trace}");
+    if !(token_trace.contains("AntiSelfHarm:anti_self_harm_score=")
+        && token_trace.contains(r#"[(\"flicker_value_kind\", 5)]"#))
+    {
+        failures.push(format!(
+            "T's candidate must reach the flicker valuation (TokenCeases): {token_trace}"
+        ));
+    }
+    for difficulty in FLICKER_DIFFICULTIES {
+        let scores = flicker_scores(runner.state(), difficulty);
+        let decline = decline_score(&scores);
+        let token = select_or_choose_score(&scores, t);
+        eprintln!("[flicker R1.6 guardian] {difficulty:?}: decline={decline:?} T={token:?} all={scores:?}");
+        match (decline, token) {
+            (Some(decline), Some(token)) if decline > token => {}
+            _ => failures.push(format!(
+                "{difficulty:?}: decline={decline:?} must beat T={token:?}"
+            )),
+        }
+    }
+    report_rows("R1.6 guardian", &failures);
+}
+
+fn restoration_angel_board(
+    pieces: &[OwnPiece],
+) -> (
+    engine::game::scenario::GameRunner,
+    Vec<(OwnPiece, ObjectId)>,
+) {
+    use engine::types::mana::ManaCostShard::White;
+    let (mut runner, angel, placed) = etb_flicker_board(
+        EtbFlickerCreature {
+            name: "Restoration Angel",
+            oracle: RESTORATION_ANGEL,
+            keywords: RESTORATION_ANGEL_KEYWORDS,
+            subtypes: &["Angel"],
+            power: 3,
+            toughness: 4,
+            cost: flicker_mana(&[White], 3),
+        },
+        pieces,
+    );
+    cast_and_resolve_to_trigger_prompt(&mut runner, angel);
+    (runner, placed)
+}
+
+fn argmax(scores: &[(GameAction, f64)]) -> GameAction {
+    scores
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(action, _)| action.clone())
+        .expect("a decision must offer a candidate")
+}
+
+/// Drive Restoration Angel's trigger: apply the argmax target at `difficulty`,
+/// then pass until the optional-effect prompt. Returns the target chosen and
+/// the accept/decline scores.
+fn drive_restoration_angel(
+    runner: &mut engine::game::scenario::GameRunner,
+    difficulty: AiDifficulty,
+) -> RestorationAngelReading {
+    let target_scores = flicker_scores(runner.state(), difficulty);
+    let chosen = argmax(&target_scores);
+    runner
+        .act(chosen.clone())
+        .expect("the chosen target must be accepted");
+    for _ in 0..8 {
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ) {
+            break;
+        }
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("passing priority must be accepted");
+    }
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ),
+        "the trigger must reach its optional-effect prompt; got {:?}",
+        runner.state().waiting_for
+    );
+    let choice_scores = flicker_scores(runner.state(), difficulty);
+    let accept = score_of(
+        &choice_scores,
+        &GameAction::DecideOptionalEffect { accept: true },
+    );
+    let decline = score_of(
+        &choice_scores,
+        &GameAction::DecideOptionalEffect { accept: false },
+    );
+    RestorationAngelReading {
+        chosen,
+        target_scores,
+        accept,
+        decline,
+    }
+}
+
+/// Restoration Angel's two decisions at one difficulty: the argmax trigger
+/// target (with every target's score) and the optional-effect scores.
+struct RestorationAngelReading {
+    chosen: GameAction,
+    target_scores: Vec<(GameAction, f64)>,
+    accept: Option<f64>,
+    decline: Option<f64>,
+}
+
+// R1.11 (AC4, "you may" immediate-return blink trigger): Restoration Angel
+// blinks the value-ETB creature and declines a vanilla-or-token blink.
+#[test]
+fn restoration_angel_blinks_value_etb_creature() {
+    let mut failures = Vec::new();
+    for difficulty in FLICKER_DIFFICULTIES {
+        let (mut runner, pieces) =
+            restoration_angel_board(&[OwnPiece::ValueEtb, OwnPiece::VanillaGiant, OwnPiece::Token]);
+        let e = pieces[0].1;
+        let RestorationAngelReading {
+            chosen,
+            target_scores,
+            accept,
+            decline,
+        } = drive_restoration_angel(&mut runner, difficulty);
+        eprintln!(
+            "[flicker R1.11 positive] {difficulty:?}: target={chosen:?} targets={target_scores:?} accept={accept:?} decline={decline:?}"
+        );
+        if chosen != choose_object(e) {
+            failures.push(format!("{difficulty:?}: targeted {chosen:?}, expected E"));
+        }
+        match (accept, decline) {
+            (Some(accept), Some(decline)) if accept > decline => {}
+            _ => failures.push(format!(
+                "{difficulty:?}: accept={accept:?} must beat decline={decline:?}"
+            )),
+        }
+    }
+    report_rows("R1.11 positive", &failures);
+}
+
+#[test]
+fn restoration_angel_declines_blink_of_vanilla_or_token() {
+    let mut failures = Vec::new();
+    for difficulty in FLICKER_DIFFICULTIES {
+        let (mut runner, pieces) =
+            restoration_angel_board(&[OwnPiece::VanillaGiant, OwnPiece::Token]);
+        let RestorationAngelReading {
+            chosen,
+            target_scores,
+            accept,
+            decline,
+        } = drive_restoration_angel(&mut runner, difficulty);
+        eprintln!(
+            "[flicker R1.11 negative] {difficulty:?}: target={chosen:?} targets={target_scores:?} accept={accept:?} decline={decline:?}"
+        );
+        match (accept, decline) {
+            (Some(accept), Some(decline)) if decline > accept => {}
+            _ => failures.push(format!(
+                "{difficulty:?}: decline={decline:?} must beat accept={accept:?}"
+            )),
+        }
+        let choice = argmax(&flicker_scores(runner.state(), difficulty));
+        runner
+            .act(choice)
+            .expect("the optional-effect choice must be accepted");
+        runner.advance_until_stack_empty();
+        for (piece, id) in &pieces {
+            let still_there = runner.state().battlefield.contains(id);
+            if !still_there {
+                failures.push(format!(
+                    "{difficulty:?}: {piece:?} {id:?} left the battlefield (it was blinked)"
+                ));
+            }
+        }
+    }
+    report_rows("R1.11 negative", &failures);
+}
+
+// ── Flicker decision latency (perf evidence, accepted option B) ──────────
+//
+// Two large late-game boards whose timed decisions reach the phase-1 flicker
+// calls: (i) a cast decision whose flicker casts reach the no-value check's
+// board-wide step, and (ii) a target decision whose own targets reach the
+// flicker target valuation (rescue, ETB re-use, linked-exile release, token
+// and no-gain targets all present). The reach is proved by
+// `flicker_latency_boards_reach_flicker_valuation`; the two `#[ignore]`d
+// tests time `choose_action` on the same boards.
+
+struct FlickerLatencyBoard {
+    runner: engine::game::scenario::GameRunner,
+    ephemerate: ObjectId,
+    giant: ObjectId,
+    token: ObjectId,
+    banisher: Option<ObjectId>,
+}
+
+/// Cast an Oblivion-Ring-shaped permanent from the AI's hand and resolve it,
+/// exiling `exiled` through its ETB trigger.
+fn resolve_linked_exile_permanent(
+    runner: &mut engine::game::scenario::GameRunner,
+    permanent: ObjectId,
+    exiled: ObjectId,
+) {
+    let _ = runner.cast(permanent).target_object(exiled).resolve();
+    assert!(
+        runner
+            .state()
+            .exile_links
+            .iter()
+            .any(|link| link.source_id == permanent && link.exiled_id == exiled),
+        "the linked exile must be recorded"
+    );
+}
+
+fn flicker_latency_board(with_target_decision: bool) -> FlickerLatencyBoard {
+    use engine::types::mana::ManaColor;
+    use engine::types::mana::ManaCostShard::{Black, White};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    stock_libraries(&mut scenario);
+    add_lands(&mut scenario, P0, ManaColor::White, 10);
+    let ephemerate = FlickerSpell::Ephemerate.add_to_hand(&mut scenario);
+    let _cloudshift = FlickerSpell::Cloudshift.add_to_hand(&mut scenario);
+    let giant = add_own_piece(&mut scenario, P0, OwnPiece::VanillaGiant);
+    for _ in 0..4 {
+        add_own_piece(&mut scenario, P0, OwnPiece::VanillaGiant);
+    }
+    for _ in 0..4 {
+        add_own_piece(&mut scenario, P0, OwnPiece::VanillaBears);
+    }
+    let token = add_own_piece(&mut scenario, P0, OwnPiece::Token);
+    let rings: Vec<ObjectId> = (0..2)
+        .map(|_| {
+            scenario
+                .add_spell_to_hand(P0, "Oblivion Ring", false)
+                .as_enchantment()
+                .from_oracle_text(OBLIVION_RING)
+                .with_mana_cost(flicker_mana(&[White], 2))
+                .id()
+        })
+        .collect();
+    let banisher = with_target_decision.then(|| {
+        scenario
+            .add_creature_to_hand_from_oracle(P0, "Banisher Priest", 2, 2, BANISHER_PRIEST)
+            .with_mana_cost(flicker_mana(&[White, White], 1))
+            .id()
+    });
+    if with_target_decision {
+        add_own_piece(&mut scenario, P0, OwnPiece::ValueEtb);
+    }
+
+    // The opponent's board: creatures, two nonland permanents for the rings
+    // to hold, and lands (plus the Murder of board (ii)).
+    for index in 0..9 {
+        scenario.add_creature(P1, &format!("Opposing Soldier {index}"), 2, 2);
+    }
+    let ring_victims: Vec<ObjectId> = (0..2)
+        .map(|index| {
+            scenario
+                .add_enchantment_from_oracle(P1, &format!("Opposing Totem {index}"), "")
+                .id()
+        })
+        .collect();
+    let banished = scenario.add_creature(P1, "Opposing Champion", 4, 4).id();
+    add_lands(&mut scenario, P1, ManaColor::Black, 10);
+    let murder = with_target_decision.then(|| {
+        scenario
+            .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
+            .with_mana_cost(flicker_mana(&[Black, Black], 1))
+            .id()
+    });
+
+    let mut runner = scenario.build();
+    runner.state_mut().objects.get_mut(&token).unwrap().is_token = true;
+    for (ring, victim) in rings.iter().zip(&ring_victims) {
+        resolve_linked_exile_permanent(&mut runner, *ring, *victim);
+    }
+    if let Some(banisher) = banisher {
+        resolve_linked_exile_permanent(&mut runner, banisher, banished);
+    }
+    // Untap everything the setup casts tapped, so the timed decision sees the
+    // full mana of a late-game board.
+    for id in runner.state().battlefield.clone() {
+        runner.state_mut().objects.get_mut(&id).unwrap().tapped = false;
+    }
+    give_turn(&mut runner, P0);
+
+    if let Some(murder) = murder {
+        give_turn(&mut runner, P1);
+        let _ = runner.cast(murder).target_object(giant).commit();
+        pass_until_priority(&mut runner, P0);
+        let action = cast_spell_action(runner.state(), ephemerate);
+        runner
+            .act(action)
+            .expect("casting Ephemerate must be accepted");
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ),
+            "board (ii) must stop at Ephemerate's target prompt"
+        );
+    }
+
+    FlickerLatencyBoard {
+        runner,
+        ephemerate,
+        giant,
+        token,
+        banisher,
+    }
+}
+
+fn flicker_latency_cast_board() -> FlickerLatencyBoard {
+    flicker_latency_board(false)
+}
+
+fn flicker_latency_target_board() -> FlickerLatencyBoard {
+    flicker_latency_board(true)
+}
+
+fn time_choose_action(label: &str, state: &engine::types::game_state::GameState) {
+    const CALLS: u64 = 20;
+    // The deterministic configuration: each call does the same node-bounded
+    // work, so the wall-clock cap cannot clip both SHAs to the same time.
+    let config = flicker_config(state, AiDifficulty::Medium);
+    let start = std::time::Instant::now();
+    for seed in 0..CALLS {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let _ = choose_action(state, P0, &config, &mut rng);
+    }
+    let mean = start.elapsed().as_micros() as f64 / CALLS as f64;
+    println!("[flicker latency] {label}: mean {mean:.1} us per choose_action over {CALLS} calls");
+}
+
+#[test]
+#[ignore = "wall-clock A/B instrument; run with --run-ignored only"]
+fn flicker_cast_decision_latency() {
+    let board = flicker_latency_cast_board();
+    time_choose_action("cast decision", board.runner.state());
+}
+
+#[test]
+#[ignore = "wall-clock A/B instrument; run with --run-ignored only"]
+fn flicker_target_decision_latency() {
+    let board = flicker_latency_target_board();
+    time_choose_action("target decision", board.runner.state());
+}
+
+mod flicker_trace_capture {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    /// Captures `phase_ai::decision_trace` events (the `tests/decision_trace.rs`
+    /// capture-layer pattern).
+    #[derive(Default, Clone)]
+    struct CaptureLayer {
+        entries: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct StringVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for StringVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() != "phase_ai::decision_trace" {
+                return;
+            }
+            let mut line = String::new();
+            event.record(&mut StringVisitor(&mut line));
+            self.entries.lock().unwrap().push(line);
+        }
+    }
+
+    pub(super) fn run_with_trace(f: impl FnOnce()) -> Vec<String> {
+        let layer = CaptureLayer::default();
+        let captured = layer.entries.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            layer.with_filter(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("phase_ai::decision_trace", tracing::Level::DEBUG),
+            ),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+        let out = captured.lock().unwrap().clone();
+        out
+    }
+}
+
+/// The decision-trace line `emit_trace_for_candidate` writes for `action` on
+/// `state`'s current decision.
+fn trace_line_for(state: &engine::types::game_state::GameState, action: &GameAction) -> String {
+    use phase_ai::context::AiContext;
+    use phase_ai::session::AiSession;
+
+    let decision = engine::ai_support::build_decision_context(state);
+    let candidate = decision
+        .candidates
+        .iter()
+        .find(|candidate| candidate.action == *action)
+        .unwrap_or_else(|| panic!("{action:?} must be an engine-issued candidate"))
+        .clone();
+    let config = flicker_config(state, AiDifficulty::Medium);
+    let mut context = AiContext::empty(&config.weights);
+    context.session = std::sync::Arc::new(AiSession::empty());
+    context.player = P0;
+    let lines = flicker_trace_capture::run_with_trace(|| {
+        phase_ai::search::emit_trace_for_candidate(
+            state, &decision, &candidate, P0, &config, &context,
+        );
+    });
+    assert_eq!(lines.len(), 1, "one trace line per candidate: {lines:?}");
+    lines[0].clone()
+}
+
+// U-T1: the latency boards' timed decisions reach the flicker valuation —
+// the `AntiSelfHarm` reason carries the flicker branch's outcome fact.
+#[test]
+fn flicker_latency_boards_reach_flicker_valuation() {
+    // Every reading is printed before any assertion, so a base-SHA run records
+    // all four lines.
+    let cast_board = flicker_latency_cast_board();
+    let cast = cast_spell_action(cast_board.runner.state(), cast_board.ephemerate);
+    let cast_line = trace_line_for(cast_board.runner.state(), &cast);
+    eprintln!("[flicker U-T1] board (i) cast: {cast_line}");
+    let cast_rejects = gate_reject_lines(cast_board.runner.state(), AiDifficulty::Medium);
+    eprintln!("[flicker U-T1] board (i) gate rejects: {cast_rejects:?}");
+
+    let target_board = flicker_latency_target_board();
+    let state = target_board.runner.state();
+    let giant_line = trace_line_for(state, &choose_object(target_board.giant));
+    eprintln!("[flicker U-T1] board (ii) V: {giant_line}");
+    let banisher = target_board
+        .banisher
+        .expect("board (ii) has a Banisher Priest");
+    let banisher_line = trace_line_for(state, &choose_object(banisher));
+    eprintln!("[flicker U-T1] board (ii) Banisher Priest: {banisher_line}");
+    let token_line = trace_line_for(state, &choose_object(target_board.token));
+    eprintln!("[flicker U-T1] board (ii) token: {token_line}");
+
+    // Board (i): the timed decision's pre-filter ran the no-value check to
+    // its board-wide step and removed the Ephemerate cast (R1.9's gate veto).
+    assert!(
+        cast_rejects
+            .iter()
+            .any(|line| is_r1_9_gate_reject(line, &cast)),
+        "board (i)'s Ephemerate cast must be removed by the R1.9 gate veto: {cast_rejects:?}"
+    );
+    assert!(
+        giant_line.contains("AntiSelfHarm:anti_self_harm_score"),
+        "positive control on V: {giant_line}"
+    );
+    assert!(
+        giant_line.contains(r#"flicker_value_kind\", 1"#),
+        "V under the opposing Murder must be valued as a rescue: {giant_line}"
+    );
+    assert!(
+        banisher_line.contains("flicker_value_kind"),
+        "the Banisher Priest target must reach the flicker valuation: {banisher_line}"
+    );
+}

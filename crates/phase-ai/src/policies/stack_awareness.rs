@@ -6,12 +6,19 @@ use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
-use crate::eval::evaluate_creature;
+use engine::types::card_type::CoreType;
+
+use crate::ability_chain::ChainNode;
+use crate::card_value::intrinsic_value;
+use crate::eval::{evaluate_creature, evaluate_creature_intrinsic};
 use crate::features::DeckFeatures;
 
 use super::activation::turn_only;
 use super::context::{collect_ability_effects, collect_resolved_abilities, PolicyContext};
-use super::effect_classify::{effect_polarity, is_spell_beneficial, EffectPolarity};
+use super::effect_classify::{
+    effect_polarity, flicker_target_outcome, is_spell_beneficial, returning_player, EffectPolarity,
+    FlickerTargetOutcome,
+};
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 
 pub struct StackAwarenessPolicy;
@@ -322,6 +329,85 @@ pub(crate) fn has_pending_removal(state: &GameState, target_id: ObjectId) -> boo
 
 /// Estimate whether pending stack effects will remove this object (creature or spell).
 pub(crate) fn will_target_die_from_stack(state: &GameState, target_id: ObjectId) -> bool {
+    entries_remove_target(state, target_id, |_| true)
+}
+
+/// CR 608.2b + CR 400.7: a spell or ability that targets this object and
+/// would remove it, whoever controls it; flickering the object first leaves
+/// that target illegal, so the removal does nothing.
+///
+/// CR 400.7 + CR 102.3: an exile-and-return that hands the object straight
+/// back, or that the AI or a teammate controls and the flicker authority
+/// reads as a re-entry, is not removal. CR 115.10a: untargeted mass removal
+/// and player-targeted edicts never target the object, so they are not
+/// answered.
+pub(crate) fn pending_removal_will_remove(
+    state: &GameState,
+    ai_player: PlayerId,
+    target_id: ObjectId,
+) -> bool {
+    entries_remove_target(state, target_id, |entry| {
+        !entry_flickers_target_back(state, entry, target_id, ai_player)
+    })
+}
+
+/// True when some node of `entry`'s resolved chain targets `target_id` with a
+/// flicker pair that brings it back rather than removing it:
+/// (a) an immediate return that puts it back under `ai_player`'s control,
+/// whoever controls the entry (an opposing Eldrazi Displacer on the AI's own
+/// creature); or
+/// (b) a pair the flicker authority reads, from the entry controller's side,
+/// as a re-entry of the object (the AI's own Guardian of Ghirapur trigger, a
+/// teammate's Flickerwisp trigger) at any return timing. For an opponent's
+/// entry the authority reads `OpposingObject` first, so (b) never excuses an
+/// opposing flicker.
+fn entry_flickers_target_back(
+    state: &GameState,
+    entry: &StackEntry,
+    target_id: ObjectId,
+    ai_player: PlayerId,
+) -> bool {
+    let (Some(ability), Some(object)) = (entry.ability(), state.objects.get(&target_id)) else {
+        return false;
+    };
+    collect_resolved_abilities(ability).into_iter().any(|node| {
+        node.targets
+            .iter()
+            .any(|target| matches!(target, TargetRef::Object(id) if *id == target_id))
+            && ChainNode::Resolved(node)
+                .flicker_pair()
+                .is_some_and(|pair| {
+                    (pair.returns.is_immediate()
+                        && returning_player(&pair, object, entry.controller) == Some(ai_player))
+                        || flicker_target_outcome(state, &pair, target_id, entry.controller)
+                            == Some(FlickerTargetOutcome::Reenters)
+                })
+    })
+}
+
+/// What losing permanent `id` costs its controller: a creature's intrinsic
+/// value (without the tapped discount — a tapped creature is lost just the
+/// same), otherwise the card's intrinsic value. Never negative.
+pub(crate) fn threatened_permanent_value(state: &GameState, id: ObjectId) -> f64 {
+    let Some(object) = state.objects.get(&id) else {
+        return 0.0;
+    };
+    let value = if object.card_types.core_types.contains(&CoreType::Creature) {
+        evaluate_creature_intrinsic(state, id)
+    } else {
+        intrinsic_value(state, id)
+    };
+    value.max(0.0)
+}
+
+/// Whether the stack entries `keep_entry` admits will remove `target_id`
+/// (creature or spell): a destroy, counter, bounce or zone change away that
+/// targets it, or targeted fixed damage that adds up to lethal.
+fn entries_remove_target(
+    state: &GameState,
+    target_id: ObjectId,
+    keep_entry: impl Fn(&StackEntry) -> bool,
+) -> bool {
     let Some(object) = state.objects.get(&target_id) else {
         return false;
     };
@@ -329,6 +415,9 @@ pub(crate) fn will_target_die_from_stack(state: &GameState, target_id: ObjectId)
     let mut pending_damage: i32 = 0;
 
     for entry in state.stack.iter() {
+        if !keep_entry(entry) {
+            continue;
+        }
         let Some(ability) = entry.ability() else {
             continue;
         };
@@ -873,5 +962,337 @@ mod tests {
             "A rival counter aimed at the AI's own spell is a legitimate counter \
              target, got {score}"
         );
+    }
+}
+
+/// Phase-1 flicker rows U-S1 and U-S2: the pending-removal predicate reads
+/// the charter's r9 rescue reading.
+#[cfg(test)]
+mod flicker_rows {
+    use engine::game::ability_utils::build_resolved_from_def_with_targets;
+    use engine::game::scenario::{GameScenario, P0, P1};
+    use engine::types::ability::AbilityDefinition;
+    use engine::types::format::FormatConfig;
+    use engine::types::game_state::{StackEntry, StackEntryKind};
+    use engine::types::identifiers::{CardId, ObjectId};
+
+    use super::*;
+    use crate::policies::context::flicker_fixtures as fx;
+
+    #[derive(Clone, Copy)]
+    enum EntryKind {
+        Spell,
+        Activated,
+        Triggered,
+    }
+
+    /// Put `root` on the stack as `controller`'s `kind` entry from `source`,
+    /// targeting `targets` (the parsed card's own ability, as the engine
+    /// resolves it).
+    fn push_entry(
+        state: &mut GameState,
+        controller: PlayerId,
+        source: ObjectId,
+        kind: EntryKind,
+        root: &AbilityDefinition,
+        targets: Vec<TargetRef>,
+    ) {
+        let ability = Box::new(build_resolved_from_def_with_targets(
+            root, source, controller, targets,
+        ));
+        let id = ObjectId(state.next_object_id);
+        state.next_object_id += 1;
+        let kind = match kind {
+            EntryKind::Spell => StackEntryKind::Spell {
+                card_id: CardId(id.0),
+                ability: Some(ability),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+            EntryKind::Activated => StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability,
+            },
+            EntryKind::Triggered => StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability,
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        };
+        state.stack.push_back(StackEntry {
+            id,
+            source_id: source,
+            controller,
+            kind,
+        });
+    }
+
+    fn root(name: &str, types: &[&str], keywords: &[&str], oracle: &str) -> AbilityDefinition {
+        fx::roots(name, types, keywords, oracle).remove(0)
+    }
+
+    fn murder() -> AbilityDefinition {
+        root("Murder", &["Instant"], &[], fx::MURDER)
+    }
+
+    fn flickerwisp() -> AbilityDefinition {
+        root("Flickerwisp", &["Creature"], fx::FLYING, fx::FLICKERWISP)
+    }
+
+    /// One U-S1 reading: a two-player (or 2HG) board where the AI controls
+    /// the object `setup` returns, and one entry on the stack.
+    fn reading(
+        label: &str,
+        two_headed: bool,
+        setup: impl FnOnce(&mut GameScenario) -> (ObjectId, ObjectId),
+        controller: PlayerId,
+        kind: EntryKind,
+        ability: AbilityDefinition,
+        targets: Option<Vec<TargetRef>>,
+    ) -> bool {
+        let mut scenario = if two_headed {
+            GameScenario::new_with_format(FormatConfig::two_headed_giant(), 4, 42)
+        } else {
+            fx::scenario()
+        };
+        let (source, object) = setup(&mut scenario);
+        let mut runner = scenario.build();
+        // `None`: the entry targets the object under test.
+        let targets = targets.unwrap_or_else(|| vec![TargetRef::Object(object)]);
+        push_entry(
+            runner.state_mut(),
+            controller,
+            source,
+            kind,
+            &ability,
+            targets,
+        );
+        let removes = pending_removal_will_remove(runner.state(), P0, object);
+        eprintln!("[flicker U-S1] {label}: {removes}");
+        removes
+    }
+
+    fn v_and_source(
+        scenario: &mut GameScenario,
+        source_controller: PlayerId,
+    ) -> (ObjectId, ObjectId) {
+        let v = fx::giant(scenario, P0);
+        let source = scenario
+            .add_creature(source_controller, "Source", 1, 1)
+            .id();
+        (source, v)
+    }
+
+    // U-S1 (r6, charter r9).
+    #[test]
+    fn pending_removal_reads_the_rescue_reading() {
+        let rows: Vec<(&str, bool, bool)> = vec![
+            (
+                "opponent Murder -> V",
+                reading(
+                    "opponent Murder -> V",
+                    false,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Spell,
+                    murder(),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "AI's own Murder -> V",
+                reading(
+                    "AI's own Murder -> V",
+                    false,
+                    |s| v_and_source(s, P0),
+                    P0,
+                    EntryKind::Spell,
+                    murder(),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "2HG teammate Murder -> V",
+                reading(
+                    "2HG teammate Murder -> V",
+                    true,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Spell,
+                    murder(),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "opponent Flickerwisp trigger -> V",
+                reading(
+                    "opponent Flickerwisp trigger -> V",
+                    false,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Triggered,
+                    flickerwisp(),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "opponent Eldrazi Displacer -> AI-owned V",
+                reading(
+                    "opponent Eldrazi Displacer -> AI-owned V",
+                    false,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Activated,
+                    root(
+                        "Eldrazi Displacer",
+                        &["Creature"],
+                        fx::ELDRAZI_DISPLACER_KEYWORDS,
+                        fx::ELDRAZI_DISPLACER,
+                    ),
+                    None,
+                ),
+                false,
+            ),
+            (
+                "AI's own Guardian trigger -> V",
+                reading(
+                    "AI's own Guardian trigger -> V",
+                    false,
+                    |s| v_and_source(s, P0),
+                    P0,
+                    EntryKind::Triggered,
+                    root(
+                        "Guardian of Ghirapur",
+                        &["Creature"],
+                        fx::FLYING,
+                        fx::GUARDIAN_OF_GHIRAPUR,
+                    ),
+                    None,
+                ),
+                false,
+            ),
+            (
+                "2HG teammate Flickerwisp trigger -> AI's V",
+                reading(
+                    "2HG teammate Flickerwisp trigger -> AI's V",
+                    true,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Triggered,
+                    flickerwisp(),
+                    None,
+                ),
+                false,
+            ),
+            (
+                "2HG teammate Flickerwisp trigger -> stolen creature",
+                reading(
+                    "2HG teammate Flickerwisp trigger -> stolen creature",
+                    true,
+                    |s| {
+                        let stolen = s
+                            .add_creature(PlayerId(2), "Stolen Bear", 2, 2)
+                            .controlled_by(P0)
+                            .id();
+                        let source = s.add_creature(P1, "Source", 1, 1).id();
+                        (source, stolen)
+                    },
+                    P1,
+                    EntryKind::Triggered,
+                    flickerwisp(),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "opponent Murder -> indestructible V",
+                reading(
+                    "opponent Murder -> indestructible V",
+                    false,
+                    |s| {
+                        let v = s.add_creature(P0, "Hill Giant", 3, 3).indestructible().id();
+                        let source = s.add_creature(P1, "Source", 1, 1).id();
+                        (source, v)
+                    },
+                    P1,
+                    EntryKind::Spell,
+                    murder(),
+                    None,
+                ),
+                false,
+            ),
+            (
+                "opponent Shock -> 3/3",
+                reading(
+                    "opponent Shock -> 3/3",
+                    false,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Spell,
+                    root("Shock", &["Instant"], &[], fx::SHOCK),
+                    None,
+                ),
+                false,
+            ),
+            (
+                "opponent Day of Judgment",
+                reading(
+                    "opponent Day of Judgment",
+                    false,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Spell,
+                    root("Day of Judgment", &["Sorcery"], &[], fx::DAY_OF_JUDGMENT),
+                    Some(Vec::new()),
+                ),
+                false,
+            ),
+            (
+                "opponent Diabolic Edict -> AI",
+                reading(
+                    "opponent Diabolic Edict -> AI",
+                    false,
+                    |s| v_and_source(s, P1),
+                    P1,
+                    EntryKind::Spell,
+                    root("Diabolic Edict", &["Instant"], &[], fx::DIABOLIC_EDICT),
+                    Some(vec![TargetRef::Player(P0)]),
+                ),
+                false,
+            ),
+        ];
+        for (label, removes, expected) in rows {
+            assert_eq!(removes, expected, "{label}");
+        }
+    }
+
+    // U-S2: the shared body behaves as before for every entry.
+    #[test]
+    fn will_target_die_from_stack_unchanged_by_entry_predicate() {
+        let mut scenario = fx::scenario();
+        let v = fx::giant(&mut scenario, P0);
+        let source = scenario.add_creature(P0, "Source", 1, 1).id();
+        let mut runner = scenario.build();
+        push_entry(
+            runner.state_mut(),
+            P0,
+            source,
+            EntryKind::Spell,
+            &murder(),
+            vec![TargetRef::Object(v)],
+        );
+        let dies = will_target_die_from_stack(runner.state(), v);
+        eprintln!("[flicker U-S2] own Murder -> V: {dies}");
+        assert!(dies);
     }
 }

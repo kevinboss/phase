@@ -17,6 +17,8 @@ use engine::types::replacements::ReplacementEvent;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
+use crate::ability_chain::ChainNode;
+
 /// Effect-level classification flags shared across spells and activated abilities.
 /// Built from any ability's effect chain — no card-level assumptions.
 #[derive(Debug, Clone, Default)]
@@ -33,6 +35,42 @@ pub struct EffectProfile {
 impl EffectProfile {
     /// Build an EffectProfile by scanning a flat list of effects.
     pub fn from_effects(effects: &[&Effect]) -> Self {
+        Self::from_effects_with_removal_reading(
+            effects,
+            effects.iter().any(|e| is_direct_removal(e)),
+        )
+    }
+
+    /// Build an EffectProfile from every node of every ability in
+    /// `abilities` (all modes, [`ModeWalk::All`]), reading each node in its
+    /// chain: an exile leg paired with a return of the source or of a
+    /// permanent its controller controls is not direct removal.
+    ///
+    /// CR 400.7: an own-scoped exile-and-return re-enters the permanent as a
+    /// new object; it removes nothing. Opponent-scoped and unscoped flickers
+    /// keep the removal reading (Mystifying Maze, Flickerwisp aimed at an
+    /// opponent's permanent).
+    pub(crate) fn from_abilities<'a>(
+        abilities: impl IntoIterator<Item = &'a AbilityDefinition>,
+    ) -> Self {
+        let mut nodes: Vec<&AbilityDefinition> = Vec::new();
+        for ability in abilities {
+            visit_definition_nodes(ability, ModeWalk::All, &mut |node| nodes.push(node));
+        }
+        let effects: Vec<&Effect> = nodes.iter().map(|node| &*node.effect).collect();
+        let has_direct_removal_text = nodes.iter().any(|node| {
+            is_direct_removal(&node.effect)
+                && !ChainNode::Definition(node)
+                    .flicker_pair()
+                    .is_some_and(|pair| pair.subject.is_own())
+        });
+        Self::from_effects_with_removal_reading(&effects, has_direct_removal_text)
+    }
+
+    fn from_effects_with_removal_reading(
+        effects: &[&Effect],
+        has_direct_removal_text: bool,
+    ) -> Self {
         Self {
             has_search_library: effects
                 .iter()
@@ -43,7 +81,7 @@ impl EffectProfile {
             has_draw: effects.iter().any(|e| matches!(e, Effect::Draw { .. })),
             has_token_creation: effects.iter().any(|e| matches!(e, Effect::Token { .. })),
             has_counter_spell: effects.iter().any(|e| matches!(e, Effect::Counter { .. })),
-            has_direct_removal_text: effects.iter().any(|e| is_direct_removal(e)),
+            has_direct_removal_text,
             has_mass_damage_or_mass_shrink_text: effects
                 .iter()
                 .any(|e| is_mass_damage_or_shrink(e)),
@@ -332,8 +370,7 @@ pub fn effect_profile_for_action(
         }
         GameAction::ActivateAbility { .. } => {
             let ability = effective_activated_ability(state, action)?;
-            let effects: Vec<_> = collect_definition_effects(&ability);
-            Some(EffectProfile::from_effects(&effects))
+            Some(EffectProfile::from_abilities([&ability]))
         }
         _ => None,
     }
@@ -357,14 +394,11 @@ pub fn cast_facts_for_object(object: &GameObject) -> CastFacts<'_> {
         .filter(|replacement| qualifies_immediate_replacement(replacement))
         .collect();
 
-    let all_effects: Vec<_> = collect_unique_immediate_abilities_from_parts(
+    let immediate_abilities = collect_unique_immediate_abilities_from_parts(
         &primary_effects,
         &immediate_etb_triggers,
         &immediate_replacements,
-    )
-    .into_iter()
-    .flat_map(collect_definition_effects)
-    .collect();
+    );
 
     let requires_targets_in_spell_text = primary_effects.iter().any(|ability| {
         collect_definition_effects(ability)
@@ -388,7 +422,7 @@ pub fn cast_facts_for_object(object: &GameObject) -> CastFacts<'_> {
         .filter_map(|replacement| replacement.execute.as_deref())
         .find_map(copy_target_filter);
 
-    let profile = EffectProfile::from_effects(&all_effects);
+    let profile = EffectProfile::from_abilities(immediate_abilities);
 
     CastFacts {
         object,
@@ -432,25 +466,30 @@ pub(crate) fn collect_definition_effects_with(
     modes: ModeWalk,
 ) -> Vec<&Effect> {
     let mut effects = Vec::new();
-    push_ability_effects(&mut effects, ability, modes);
+    visit_definition_nodes(ability, modes, &mut |node| effects.push(&*node.effect));
     effects
 }
 
-fn push_ability_effects<'a>(
-    effects: &mut Vec<&'a Effect>,
+/// Visit every node of an ability tree in walk order — the node, its
+/// `sub_ability` chain, its `else_ability` branch, then (for
+/// [`ModeWalk::All`]) each of its `mode_abilities`.
+/// [`collect_definition_effects_with`] is this visitor pushing each node's
+/// effect, so the node view and the effect view are one traversal.
+pub(crate) fn visit_definition_nodes<'a>(
     ability: &'a AbilityDefinition,
     modes: ModeWalk,
+    visit: &mut impl FnMut(&'a AbilityDefinition),
 ) {
-    effects.push(&ability.effect);
+    visit(ability);
     if let Some(sub_ability) = &ability.sub_ability {
-        push_ability_effects(effects, sub_ability, modes);
+        visit_definition_nodes(sub_ability, modes, visit);
     }
     if let Some(else_ability) = &ability.else_ability {
-        push_ability_effects(effects, else_ability, modes);
+        visit_definition_nodes(else_ability, modes, visit);
     }
     if modes == ModeWalk::All {
         for mode_ability in &ability.mode_abilities {
-            push_ability_effects(effects, mode_ability, modes);
+            visit_definition_nodes(mode_ability, modes, visit);
         }
     }
 }
@@ -1122,5 +1161,166 @@ mod tests {
         assert!(!is_cast_family_action(&action));
         assert!(cast_object_for_action(&state, &action, PlayerId(0)).is_none());
         assert!(cast_facts_for_action(&state, &action, PlayerId(0)).is_none());
+    }
+}
+
+/// Phase-1 flicker rows U-F1–U-F3 (R1.3): an own-scoped flicker is not
+/// counted as direct removal; opponent-scoped and unscoped exiles still are.
+#[cfg(test)]
+mod flicker_rows {
+    use engine::game::scenario::{GameScenario, P0};
+    use engine::types::identifiers::ObjectId;
+    use engine::types::mana::ManaCostShard;
+
+    use super::*;
+    use crate::policies::context::flicker_fixtures as fx;
+
+    fn spell_removal(
+        scenario: &mut GameScenario,
+        name: &str,
+        is_instant: bool,
+        keywords: &[&str],
+        oracle: &str,
+    ) -> ObjectId {
+        fx::spell_in_hand(
+            scenario,
+            P0,
+            name,
+            is_instant,
+            keywords,
+            oracle,
+            fx::cost(&[ManaCostShard::White], 1),
+        )
+    }
+
+    fn object_reading(state: &GameState, id: ObjectId) -> bool {
+        cast_facts_for_object(&state.objects[&id])
+            .profile
+            .has_direct_removal_text
+    }
+
+    fn activation_reading(state: &GameState, source: ObjectId) -> bool {
+        effect_profile_for_action(state, &fx::activate_action(state, source), P0)
+            .expect("an activation has a profile")
+            .has_direct_removal_text
+    }
+
+    // U-F1 (R1.3).
+    #[test]
+    fn own_scoped_flicker_is_not_direct_removal() {
+        let mut scenario = fx::scenario();
+        let cards = [
+            spell_removal(
+                &mut scenario,
+                "Momentary Blink",
+                true,
+                fx::MOMENTARY_BLINK_KEYWORDS,
+                fx::MOMENTARY_BLINK,
+            ),
+            spell_removal(
+                &mut scenario,
+                "Ephemerate",
+                true,
+                fx::EPHEMERATE_KEYWORDS,
+                fx::EPHEMERATE,
+            ),
+            spell_removal(&mut scenario, "Cloudshift", true, &[], fx::CLOUDSHIFT),
+            spell_removal(
+                &mut scenario,
+                "Ghostly Flicker",
+                true,
+                &[],
+                fx::GHOSTLY_FLICKER,
+            ),
+            scenario
+                .add_creature_to_hand(P0, "Restoration Angel", 3, 4)
+                .with_subtypes(vec!["Angel"])
+                .from_oracle_text_with_keywords(
+                    fx::RESTORATION_ANGEL_KEYWORDS,
+                    fx::RESTORATION_ANGEL,
+                )
+                .id(),
+        ];
+        let smuggler = fx::creature(
+            &mut scenario,
+            P0,
+            "Nephalia Smuggler",
+            1,
+            1,
+            &[],
+            fx::NEPHALIA_SMUGGLER,
+        );
+        let spirit = fx::creature(
+            &mut scenario,
+            P0,
+            "Fleeting Spirit",
+            3,
+            1,
+            &[],
+            fx::FLEETING_SPIRIT,
+        );
+        let runner = scenario.build();
+        let state = runner.state();
+        for id in cards {
+            let reading = object_reading(state, id);
+            eprintln!("[flicker U-F1] {}: {reading}", state.objects[&id].name);
+            assert!(!reading, "{}", state.objects[&id].name);
+        }
+        for source in [smuggler, spirit] {
+            let reading = activation_reading(state, source);
+            eprintln!(
+                "[flicker U-F1] {} activation: {reading}",
+                state.objects[&source].name
+            );
+            assert!(!reading, "{}", state.objects[&source].name);
+        }
+    }
+
+    // U-F2 (R1.3 preservation).
+    #[test]
+    fn opponent_scoped_and_unscoped_exile_keep_removal_reading() {
+        let mut scenario = fx::scenario();
+        let maze = scenario
+            .add_land_from_oracle(P0, "Mystifying Maze", fx::MYSTIFYING_MAZE)
+            .id();
+        let cards = [
+            scenario
+                .add_creature_to_hand(P0, "Flickerwisp", 3, 1)
+                .from_oracle_text_with_keywords(fx::FLYING, fx::FLICKERWISP)
+                .id(),
+            spell_removal(&mut scenario, "Turn to Mist", true, &[], fx::TURN_TO_MIST),
+            scenario
+                .add_creature_to_hand_from_oracle(P0, "Banisher Priest", 2, 2, fx::BANISHER_PRIEST)
+                .id(),
+            spell_removal(
+                &mut scenario,
+                "Swords to Plowshares",
+                true,
+                &[],
+                fx::SWORDS_TO_PLOWSHARES,
+            ),
+            spell_removal(&mut scenario, "Murder", true, &[], fx::MURDER),
+        ];
+        let runner = scenario.build();
+        let state = runner.state();
+        let maze_reading = activation_reading(state, maze);
+        eprintln!("[flicker U-F2] Mystifying Maze activation: {maze_reading}");
+        assert!(maze_reading);
+        for id in cards {
+            let reading = object_reading(state, id);
+            eprintln!("[flicker U-F2] {}: {reading}", state.objects[&id].name);
+            assert!(reading, "{}", state.objects[&id].name);
+        }
+    }
+
+    // U-F3: pairing is per ability, so Oblivion Ring's ETB exile and LTB
+    // return (two linked abilities, CR 607.2a) stay a removal reading.
+    #[test]
+    fn per_ability_profile_keeps_o_ring_removal() {
+        let ring = fx::roots("Oblivion Ring", &["Enchantment"], &[], fx::OBLIVION_RING);
+        assert_eq!(ring.len(), 2, "ETB exile and LTB return");
+        let reading = EffectProfile::from_abilities(&ring).has_direct_removal_text;
+        eprintln!("[flicker U-F3] Oblivion Ring: {reading}");
+        assert!(reading);
     }
 }

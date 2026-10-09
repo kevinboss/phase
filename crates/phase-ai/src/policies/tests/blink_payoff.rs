@@ -284,3 +284,96 @@ fn non_blink_spell_inert() {
     assert_eq!(kind, "blink_payoff_inert");
     assert_eq!(delta, 0.0);
 }
+
+// ─── live matcher through the flicker authority ──────────────────────────────
+
+/// An object in hand whose abilities and triggers are parsed from verbatim
+/// Oracle text through the production parser.
+fn oracle_object(
+    state: &mut GameState,
+    idx: u64,
+    name: &str,
+    core: Vec<CoreType>,
+    keywords: &[&str],
+    oracle: &str,
+) -> ObjectId {
+    let types: Vec<String> = core.iter().map(|core| format!("{core:?}")).collect();
+    let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+    let parsed = engine::parser::oracle::parse_oracle_text(oracle, name, &keywords, &types, &[]);
+    let oid = spell_object(state, idx, core);
+    state.objects.get_mut(&oid).unwrap().name = name.to_string();
+    for ability in parsed.abilities {
+        push_ability(state, oid, ability);
+    }
+    for trigger in parsed.triggers {
+        push_trigger(state, oid, trigger);
+    }
+    oid
+}
+
+fn blink_kind_for(state: &GameState, oid: ObjectId) -> String {
+    let candidate = cast_candidate(oid);
+    let decision = decision();
+    let (context, config) = ai_context(0.8, 8, 12);
+    let ctx = ctx(state, &candidate, &decision, &context, &config);
+    delta_of(policy().verdict(&ctx)).1
+}
+
+#[test]
+fn live_matcher_reads_scheduled_returns_through_the_flicker_authority() {
+    let mut state = GameState::new_two_player(7);
+    // CR 603.7: Guardian of Ghirapur's ETB flicker returns at the next end
+    // step — a flicker engine the live tier must recognize.
+    let guardian = oracle_object(
+        &mut state,
+        11,
+        "Guardian of Ghirapur",
+        vec![CoreType::Creature],
+        &["Flying"],
+        "Flying\nWhen this creature enters, exile up to one other target creature or artifact you control. Return it to the battlefield under its owner's control at the beginning of the next end step.",
+    );
+    // Rona exiles from a hand, then puts onto the battlefield: not a flicker.
+    let rona = oracle_object(
+        &mut state,
+        12,
+        "Rona, Tolarian Obliterator",
+        vec![CoreType::Creature],
+        &["Trample"],
+        "Trample\nWhenever a source deals damage to Rona, that source's controller exiles a card from their hand at random. If it's a land card, you may put it onto the battlefield under your control. Otherwise, you may cast it without paying its mana cost.",
+    );
+    // CR 607.2a: Oblivion Ring's exile and return are linked abilities.
+    let ring = oracle_object(
+        &mut state,
+        13,
+        "Oblivion Ring",
+        vec![CoreType::Enchantment],
+        &[],
+        "When this enchantment enters, exile another target nonland permanent.\nWhen this enchantment leaves the battlefield, return the exiled card to the battlefield under its owner's control.",
+    );
+    // Mystifying Maze's printed activated ability on a castable artifact shell:
+    // an opponent-scoped exile is tempo, not a flicker engine.
+    let maze_shell = oracle_object(
+        &mut state,
+        14,
+        "Maze Shell",
+        vec![CoreType::Artifact],
+        &[],
+        "{4}, {T}: Exile target attacking creature an opponent controls. At the beginning of the next end step, return it to the battlefield tapped under its owner's control.",
+    );
+
+    let readings = [
+        ("Guardian of Ghirapur", guardian, "deploy_flicker_engine"),
+        ("Rona, Tolarian Obliterator", rona, "blink_payoff_inert"),
+        ("Oblivion Ring", ring, "blink_payoff_inert"),
+        ("Maze Shell", maze_shell, "blink_payoff_inert"),
+    ];
+    let mut failures = Vec::new();
+    for (name, oid, expected) in readings {
+        let kind = blink_kind_for(&state, oid);
+        eprintln!("[flicker U-P1] {name}: {kind}");
+        if kind != expected {
+            failures.push(format!("{name}: {kind}, expected {expected}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}

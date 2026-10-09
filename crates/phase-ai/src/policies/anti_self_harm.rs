@@ -17,15 +17,15 @@ use engine::types::ability::AbilityCondition;
 #[cfg(test)]
 use engine::types::ability::DelayedTriggerPlayerBinding;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition,
-    Effect, EffectScope, QuantityExpr, ReplacementMode, SubAbilityLink, TapStateChange,
-    TargetFilter, TargetRef,
+    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, CostCategory,
+    DelayedTriggerCondition, Effect, EffectScope, QuantityExpr, ReplacementMode, SubAbilityLink,
+    TapStateChange, TargetFilter, TargetRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
 #[cfg(test)]
 use engine::types::counter::CounterType;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{ExileLinkKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, WardCost};
 use engine::types::phase::Phase;
@@ -33,28 +33,33 @@ use engine::types::replacements::ReplacementEvent;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
+use crate::ability_chain::{self, is_own_flicker_node, ChainNode, ExileSubject, FlickerPair};
 use crate::card_value::intrinsic_value;
-use crate::cast_facts::collect_definition_effects;
+use crate::cast_facts::{collect_definition_effects, visit_definition_nodes, ModeWalk};
+use crate::config::PolicyPenalties;
 use crate::damage_reflection::opponent_creature_reflection_penalty;
 use crate::eval::{evaluate_creature, threat_level};
+use crate::features::blink::object_has_value_etb;
 use engine::game::players;
 
 use super::activation::turn_only;
-use super::context::PolicyContext;
+use super::context::{visit_resolved_abilities, PolicyContext};
 use super::copy_value::{
     copy_effect_strips_legendary, copy_target_penalties, score_legend_rule_keep,
 };
 use super::effect_classify::{
     aggregate_player_impact, aura_polarity, effect_polarity, effect_targets_object,
-    exact_pending_player_impact, extract_target_filter, is_spell_beneficial, lethal_to_creature,
-    targeted_object_impact, targeted_player_impact, targets_creatures, targets_creatures_only,
-    EffectPolarity, PLAYER_IMPACT_PREFERENCE_BAND,
+    exact_pending_player_impact, extract_target_filter, flicker_reading_for_target,
+    flicker_target_outcome, is_spell_beneficial, lethal_to_creature, targeted_object_impact,
+    targeted_player_impact, targets_creatures, targets_creatures_only, EffectPolarity,
+    FlickerTargetOutcome, PLAYER_IMPACT_PREFERENCE_BAND,
 };
 use super::registry::{
     DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy, CRITICAL_MAX,
 };
 use super::removal_lethality;
 use super::self_cost::count_death_triggers_on_board;
+use super::stack_awareness::{pending_removal_will_remove, threatened_permanent_value};
 use super::strategy_helpers::can_pay_ward_cost;
 use crate::features::DeckFeatures;
 #[cfg(test)]
@@ -68,26 +73,166 @@ pub struct AntiSelfHarmPolicy;
 // registry-scaled anti-self-harm penalties stay within the critical band.
 const ANTI_SELF_HARM_RAW_CRITICAL_CEILING: f64 = CRITICAL_MAX / 1.3;
 
+/// Score of declining an optional ("up to one") target slot.
+pub(crate) const DECLINED_TARGET_SCORE: f64 = -0.25;
+
 impl AntiSelfHarmPolicy {
+    /// The raw score `verdict` clamps (tests read it directly).
+    #[cfg(test)]
     pub fn score(&self, ctx: &PolicyContext<'_>) -> f64 {
+        self.scored(ctx).value
+    }
+
+    /// The score together with how the flicker branch reached it, so the
+    /// verdict reason can carry that outcome without a second walk.
+    fn scored(&self, ctx: &PolicyContext<'_>) -> AntiSelfHarmScore {
         match &ctx.candidate.action {
             GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. } => {
                 score_pre_cast(ctx)
             }
             GameAction::ChooseTarget { target } => target
                 .as_ref()
-                .map_or(-0.25, |target| score_target_ref(ctx, target)),
+                .map_or(AntiSelfHarmScore::plain(DECLINED_TARGET_SCORE), |target| {
+                    score_target_ref(ctx, target)
+                }),
             GameAction::SelectTargets { targets } => targets
                 .iter()
                 .map(|target| score_target_ref(ctx, target))
-                .sum(),
-            GameAction::SelectModes { .. } => score_selected_modes(ctx),
+                .fold(AntiSelfHarmScore::plain(0.0), AntiSelfHarmScore::combine),
+            GameAction::SelectModes { .. } => AntiSelfHarmScore::plain(score_selected_modes(ctx)),
             // Penalise accepting an optional effect whose life cost would kill or nearly kill us.
-            GameAction::DecideOptionalEffect { accept: true } => score_optional_effect_accept(ctx),
-            GameAction::ChooseLegend { keep } => score_legend_rule_keep(ctx.state, *keep),
-            _ => 0.0,
+            GameAction::DecideOptionalEffect { accept: true } => {
+                AntiSelfHarmScore::plain(score_optional_effect_accept(ctx))
+            }
+            GameAction::ChooseLegend { keep } => {
+                AntiSelfHarmScore::plain(score_legend_rule_keep(ctx.state, *keep))
+            }
+            _ => AntiSelfHarmScore::plain(0.0),
         }
     }
+}
+
+/// [`AntiSelfHarmPolicy`]'s score plus the flicker branch's outcome, when
+/// that branch ran for the candidate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AntiSelfHarmScore {
+    pub(crate) value: f64,
+    pub(crate) flicker: Option<FlickerReach>,
+}
+
+impl AntiSelfHarmScore {
+    fn plain(value: f64) -> Self {
+        Self {
+            value,
+            flicker: None,
+        }
+    }
+
+    /// Sum two scores, keeping the first flicker outcome.
+    fn combine(self, other: Self) -> Self {
+        Self {
+            value: self.value + other.value,
+            flicker: self.flicker.or(other.flicker),
+        }
+    }
+}
+
+/// Which flicker step produced a score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlickerReach {
+    /// A flicker target was valued.
+    TargetValued(FlickerValueKind),
+    /// The no-value check of an own flicker cast or activation reached its
+    /// board-wide step.
+    NoValueCheck(FlickerCheckOutcome),
+}
+
+/// The outcome of the no-value check's board-wide step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlickerCheckOutcome {
+    /// Some own exile leg has a legal target the flicker gains on.
+    Gain,
+    /// No legal target of any own exile leg gains anything; the shape of the
+    /// own legs decides whether the candidate is vetoed or charged.
+    NoValue(OwnLegShape),
+}
+
+/// How base treated a no-value own flicker candidate, which decides whether
+/// the no-value check vetoes it or charges it (base parity; orchestrator
+/// decision amending plan r9 S10.3). At `PHASE_BASE_SHA` an own flicker
+/// reached search only when both of base's exclusions let it through:
+/// - the pre-filter's redundancy path (`tactical_gate`
+///   `is_redundant_creature_only_removal`) rejects a cast or activation with a
+///   creature-only harmful leg and no live opponent target, so any own
+///   creature-only exile leg was excluded;
+/// - the own-board activation veto (`harmful_activation_reaches_only_own_board`)
+///   rejects an activation whose harmful legs reach only the AI's board unless
+///   `is_deliberate_self_target_rider` matches an immediate return, so an
+///   activation with a scheduled return (Abuelo, Aetherling) was excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnLegShape {
+    /// Base excluded the candidate from search (a creature-only own leg, or an
+    /// activation without an immediate return): the tactical pre-filter
+    /// removes it (`flicker_no_value_gate_reject`), keeping that outcome.
+    ExcludedAtBase,
+    /// A spell none of whose own exile legs is creature-only (Ghostly Flicker,
+    /// Gone Fishing): base let search decide, so it is charged the
+    /// wasted-cast penalty.
+    NoncreatureSpellLeg,
+    /// An activation none of whose own exile legs is creature-only and whose
+    /// return is immediate (Ruin Ghost): base let search decide, so it is
+    /// charged the wasted-cast penalty.
+    ImmediateReturnActivation,
+}
+
+impl FlickerCheckOutcome {
+    /// Stable code for the decision-trace fact.
+    pub(crate) fn trace_code(self) -> i64 {
+        match self {
+            FlickerCheckOutcome::Gain => 1,
+            FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase) => 2,
+            FlickerCheckOutcome::NoValue(
+                OwnLegShape::NoncreatureSpellLeg | OwnLegShape::ImmediateReturnActivation,
+            ) => 3,
+        }
+    }
+}
+
+/// Where a flicker target's value comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlickerValueKind {
+    /// CR 608.2b + CR 400.7: a pending removal would remove it, whoever
+    /// controls the removal.
+    Rescue,
+    /// CR 603.6a: its value ETB triggers again.
+    EtbReuse,
+    /// It re-enters with nothing gained.
+    NoGain,
+    /// CR 110.2a: it returns under another player's control.
+    ControlLoss,
+    /// It never returns (CR 111.8 token; CR 712.14a non-double-faced card
+    /// under a transformed return).
+    TokenCeases,
+}
+
+impl FlickerValueKind {
+    /// Stable code for the decision-trace fact.
+    fn trace_code(self) -> i64 {
+        match self {
+            FlickerValueKind::Rescue => 1,
+            FlickerValueKind::EtbReuse => 2,
+            FlickerValueKind::NoGain => 3,
+            FlickerValueKind::ControlLoss => 4,
+            FlickerValueKind::TokenCeases => 5,
+        }
+    }
+}
+
+/// The value of flickering one AI-controlled object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FlickerTargetValue {
+    pub(crate) kind: FlickerValueKind,
+    pub(crate) score: f64,
 }
 
 impl TacticalPolicy for AntiSelfHarmPolicy {
@@ -131,12 +276,23 @@ impl TacticalPolicy for AntiSelfHarmPolicy {
             return PolicyVerdict::reject(reason);
         }
 
+        let scored = self.scored(ctx);
+        let reason = PolicyReason::new("anti_self_harm_score");
+        let reason = match scored.flicker {
+            Some(FlickerReach::TargetValued(kind)) => {
+                reason.with_fact("flicker_value_kind", kind.trace_code())
+            }
+            Some(FlickerReach::NoValueCheck(outcome)) => {
+                reason.with_fact("flicker_no_value_check", outcome.trace_code())
+            }
+            None => reason,
+        };
         PolicyVerdict::score(
-            self.score(ctx).clamp(
+            scored.value.clamp(
                 -ANTI_SELF_HARM_RAW_CRITICAL_CEILING,
                 ANTI_SELF_HARM_RAW_CRITICAL_CEILING,
             ),
-            PolicyReason::new("anti_self_harm_score"),
+            reason,
         )
     }
 }
@@ -341,7 +497,7 @@ fn effect_loses_game_for_controller(effect: &Effect) -> bool {
 /// would hurt the AI.  Two cases:
 /// - Beneficial spell (pump/aura buff) but AI has no creatures → would buff opponents.
 /// - Harmful spell (destroy) but opponents have no creatures → would kill own.
-fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
+fn score_pre_cast(ctx: &PolicyContext<'_>) -> AntiSelfHarmScore {
     // CR 704.5j: Penalise casting a legendary permanent when we already control one
     // with the same name — the legend rule SBA will force us to put one into the
     // graveyard. Skip same-name copies that the engine's legend-rule SBA would
@@ -367,7 +523,8 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
         })
         .unwrap_or(0.0);
 
-    let effects = ctx.effects();
+    let nodes = ctx.effect_nodes();
+    let effects: Vec<&Effect> = nodes.iter().map(|node| node.effect()).collect();
 
     // A `ChangeZone` onto the battlefield draws its target from the library,
     // graveyard, hand or exile — never from our own battlefield — so the
@@ -390,11 +547,12 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
     });
     // For harmful spells, only penalise when targeting is creature-exclusive.
     // Burn spells with TargetFilter::Any can still go face — don't block those.
-    let mut has_harmful_creature_only_target = effects.iter().any(|effect| {
-        !matches!(effect, Effect::Bounce { .. })
-            && matches!(effect_polarity(effect), EffectPolarity::Harmful)
-            && targets_creatures_only(effect)
-    });
+    // CR 400.7: an own flicker leg re-enters its permanent rather than removing
+    // it, so it is not in the harmful class; its no-value case is the
+    // flicker no-value check's.
+    let mut has_harmful_creature_only_target = nodes
+        .iter()
+        .any(|node| is_harmful_creature_only_removal_leg(*node));
     let has_harmful_bounce = effects.iter().any(is_hostile_or_neutral_bounce);
 
     // Auras have no active effects — detect polarity via static definitions.
@@ -428,8 +586,27 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
         None => (0.0, 0.0),
     };
 
+    // R1.9: an own flicker whose legal targets offer no value wastes the card
+    // or the activation. A candidate base excluded from search is removed by
+    // the tactical pre-filter (no term here); one base admitted is charged
+    // (`OwnLegShape`).
+    let no_value_check = flicker_no_value_check(ctx);
+    let no_value_penalty = match no_value_check {
+        Some(FlickerCheckOutcome::NoValue(
+            OwnLegShape::NoncreatureSpellLeg | OwnLegShape::ImmediateReturnActivation,
+        )) => ctx.penalties().wasted_cast_penalty,
+        Some(
+            FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase) | FlickerCheckOutcome::Gain,
+        )
+        | None => 0.0,
+    };
+    let flicker = no_value_check.map(FlickerReach::NoValueCheck);
+
     if !has_beneficial_creature_target && !has_harmful_creature_only_target && !has_harmful_bounce {
-        return legend_penalty + etb_whiff_penalty + copy_whiff_penalty;
+        return AntiSelfHarmScore {
+            value: legend_penalty + etb_whiff_penalty + copy_whiff_penalty + no_value_penalty,
+            flicker,
+        };
     }
 
     let has_own_creature = ctx.state.battlefield.iter().any(|&id| {
@@ -446,14 +623,10 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
     let has_targetable_opponent_creature = if effects.is_empty() {
         harmful_aura_has_opponent_creature_target(ctx)
     } else {
-        effects
+        nodes
             .iter()
-            .filter(|effect| {
-                !matches!(effect, Effect::Bounce { .. })
-                    && matches!(effect_polarity(effect), EffectPolarity::Harmful)
-                    && targets_creatures_only(effect)
-            })
-            .any(|effect| harmful_effect_has_opponent_creature_target(ctx, effect))
+            .filter(|node| is_harmful_creature_only_removal_leg(**node))
+            .any(|node| harmful_effect_has_opponent_creature_target(ctx, *node, &effects))
     };
 
     let mut penalty = 0.0;
@@ -505,6 +678,8 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
 
     penalty += legend_penalty;
 
+    penalty += no_value_penalty;
+
     // Penalize pump spells during opponent's combat that would require tapping creature
     // mana sources. auto_tap prefers pure lands (tier 0) over non-land dorks (tier 1),
     // so creature sources are only tapped when lands can't cover the full mana cost.
@@ -526,13 +701,380 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
         }
     }
 
-    penalty
+    AntiSelfHarmScore {
+        value: penalty,
+        flicker,
+    }
 }
 
-/// Penalise accepting an optional effect when the life cost would be lethal or near-lethal.
-/// Applies to ETB replacements like Multiversal Passage ("pay 2 life or enter tapped").
-fn score_optional_effect_accept(_ctx: &PolicyContext<'_>) -> f64 {
-    0.0
+/// A harmful, creature-only leg of the harmful-target whiff class: not a bounce
+/// (its own class) and not an own flicker leg (CR 400.7: re-entry, not
+/// removal).
+fn is_harmful_creature_only_removal_leg(node: ChainNode<'_>) -> bool {
+    let effect = node.effect();
+    !matches!(effect, Effect::Bounce { .. })
+        && matches!(effect_polarity(effect), EffectPolarity::Harmful)
+        && targets_creatures_only(effect)
+        && !is_own_flicker_leg(node)
+}
+
+/// An exile leg paired with a return of the source or of a permanent its
+/// controller controls.
+fn is_own_flicker_leg(node: ChainNode<'_>) -> bool {
+    node.flicker_pair()
+        .is_some_and(|pair| pair.subject.is_own())
+}
+
+/// CR 603.5: a "may" trigger's choice is made as it resolves. Accepting an
+/// optional flicker (Restoration Angel) is worth the flicker value of the
+/// targets it already holds — the AI's own objects the parked ability's
+/// flicker exile legs target. Any other optional effect scores `0.0`
+/// (declining always scores `0.0`).
+fn score_optional_effect_accept(ctx: &PolicyContext<'_>) -> f64 {
+    let WaitingFor::OptionalEffectChoice { source_id, .. } = &ctx.decision.waiting_for else {
+        return 0.0;
+    };
+    let Some(frame) = ctx.state.active_optional_effect_frame() else {
+        return 0.0;
+    };
+    let ability = frame.ability.as_ref();
+    if ability.source_id != *source_id || ability.controller != ctx.ai_player {
+        return 0.0;
+    }
+    let mut score = 0.0;
+    visit_resolved_abilities(ability, &mut |node| {
+        let Some(pair) = ChainNode::Resolved(node).flicker_pair() else {
+            return;
+        };
+        for target in &node.targets {
+            let TargetRef::Object(id) = target else {
+                continue;
+            };
+            let value =
+                flicker_target_outcome(ctx.state, &pair, *id, ctx.ai_player).and_then(|outcome| {
+                    flicker_target_value(ctx.state, ctx.ai_player, *id, outcome, ctx.penalties())
+                });
+            if let Some(value) = value {
+                score += value.score;
+            }
+        }
+    });
+    score
+}
+
+/// The value of flickering `object_id`, an object the AI controls, given the
+/// flicker's `outcome` on it. `None` for any other controller, and for an
+/// opposing or unresolved outcome (those keep the removal valuation).
+///
+/// Every score of a target that returns is one of `threatened + rescue_bonus`,
+/// `etb_bonus`, `no_value_penalty` or `control_loss_penalty`, plus at most one
+/// release penalty; a target that never returns takes the token floor, which
+/// the penalty ordering invariant puts below all of them.
+pub(crate) fn flicker_target_value(
+    state: &GameState,
+    ai_player: PlayerId,
+    object_id: ObjectId,
+    outcome: FlickerTargetOutcome,
+    penalties: &PolicyPenalties,
+) -> Option<FlickerTargetValue> {
+    let object = state.objects.get(&object_id)?;
+    if object.controller != ai_player {
+        return None;
+    }
+    let (kind, score) = match outcome {
+        // CR 111.8: a token never returns; CR 712.14a: neither does a card that
+        // isn't double-faced under a transformed return. A constant floor.
+        FlickerTargetOutcome::Ceases => (
+            FlickerValueKind::TokenCeases,
+            penalties.flicker_token_target_score,
+        ),
+        // CR 110.2a: the permanent comes back under another player — never a
+        // rescue.
+        FlickerTargetOutcome::ReturnsToAnotherPlayer => (
+            FlickerValueKind::ControlLoss,
+            penalties.flicker_control_loss_penalty
+                + linked_exile_release_penalty(state, ai_player, object_id, penalties),
+        ),
+        // CR 608.2b + CR 400.7: a pending removal targeting it, whoever
+        // controls it, is left with an illegal target. No release term: a removal that resolves would
+        // release the card anyway.
+        FlickerTargetOutcome::Reenters
+            if pending_removal_will_remove(state, ai_player, object_id) =>
+        {
+            (
+                FlickerValueKind::Rescue,
+                threatened_permanent_value(state, object_id)
+                    + penalties.flicker_rescue_target_bonus,
+            )
+        }
+        // CR 603.6a: its value ETB triggers again as it re-enters.
+        FlickerTargetOutcome::Reenters if object_has_value_etb(object) => (
+            FlickerValueKind::EtbReuse,
+            penalties.flicker_etb_retrigger_bonus
+                + linked_exile_release_penalty(state, ai_player, object_id, penalties),
+        ),
+        FlickerTargetOutcome::Reenters => (
+            FlickerValueKind::NoGain,
+            penalties.flicker_no_value_penalty
+                + linked_exile_release_penalty(state, ai_player, object_id, penalties),
+        ),
+        FlickerTargetOutcome::OpposingObject | FlickerTargetOutcome::Unresolved => return None,
+    };
+    Some(FlickerTargetValue { kind, score })
+}
+
+/// The cost of `object_id` leaving the battlefield when it holds an
+/// opponent's card in a linked exile that returns as it leaves: CR 610.3 (a
+/// Banisher-Priest-shaped "until" exile) and CR 607.2a + CR 603.6c (an
+/// Oblivion-Ring-shaped exile returned by its linked leaves-the-battlefield
+/// trigger, which the engine records with the same until-duration link).
+/// Charged at most once.
+fn linked_exile_release_penalty(
+    state: &GameState,
+    ai_player: PlayerId,
+    object_id: ObjectId,
+    penalties: &PolicyPenalties,
+) -> f64 {
+    if state.exile_links.is_empty() {
+        return 0.0;
+    }
+    let releases_opponent_card = state.exile_links.iter().any(|link| {
+        link.source_id == object_id
+            && exile_link_returns_when_source_leaves(&link.kind)
+            && state
+                .objects
+                .get(&link.exiled_id)
+                .is_some_and(|exiled| players::is_opponent(state, ai_player, exiled.owner))
+    });
+    if releases_opponent_card {
+        penalties.flicker_releases_exile_penalty
+    } else {
+        0.0
+    }
+}
+
+/// CR 610.3a: only an "until this leaves the battlefield" link returns the
+/// exiled card when its source leaves.
+fn exile_link_returns_when_source_leaves(kind: &ExileLinkKind) -> bool {
+    match kind {
+        ExileLinkKind::UntilSourceLeaves { .. } => true,
+        ExileLinkKind::UntilOpponentBecomesMonarch { .. }
+        | ExileLinkKind::TrackedBySource
+        | ExileLinkKind::ParadigmSource { .. }
+        | ExileLinkKind::Cipher
+        | ExileLinkKind::Haunt
+        | ExileLinkKind::HideawayLookable { .. }
+        | ExileLinkKind::CraftMaterial => false,
+    }
+}
+
+/// True when some legal target in `targets` is an AI-controlled object that
+/// `pair` re-enters with a gain: the return itself alters it (CR 712.14a
+/// transformed / CR 122.6 with counters — for a target whose outcome is
+/// `Reenters`; a non-double-faced object under a transformed return reads
+/// `Ceases`), or its re-entry rescues it from a pending removal or re-uses
+/// a value ETB.
+///
+/// A `Source` leg passes the source itself, so a self-blink gains exactly when
+/// the source is rescued, has a value ETB, or returns altered.
+pub(crate) fn legal_targets_offer_flicker_gain(
+    ctx: &PolicyContext<'_>,
+    targets: &[TargetRef],
+    pair: &FlickerPair,
+) -> bool {
+    targets.iter().any(|target| {
+        let TargetRef::Object(id) = target else {
+            return false;
+        };
+        let reenters = flicker_target_outcome(ctx.state, pair, *id, ctx.ai_player)
+            == Some(FlickerTargetOutcome::Reenters);
+        let ai_controlled = ctx
+            .state
+            .objects
+            .get(id)
+            .is_some_and(|object| object.controller == ctx.ai_player);
+        reenters
+            && ai_controlled
+            && (pair.returns.alters_permanent()
+                || flicker_target_value(
+                    ctx.state,
+                    ctx.ai_player,
+                    *id,
+                    FlickerTargetOutcome::Reenters,
+                    ctx.penalties(),
+                )
+                .is_some_and(|value| match value.kind {
+                    FlickerValueKind::Rescue | FlickerValueKind::EtbReuse => true,
+                    FlickerValueKind::NoGain
+                    | FlickerValueKind::ControlLoss
+                    | FlickerValueKind::TokenCeases => false,
+                }))
+    })
+}
+
+/// R1.9 — does an own flicker cast or activation have any legal target worth
+/// flickering? A flicker whose every legal target gains nothing wastes the
+/// card or the activation. At the decision root the tactical pre-filter removes
+/// it when base excluded such a candidate from search, and `score_pre_cast`
+/// charges it when base admitted it (see [`OwnLegShape`]).
+///
+/// `None` when a gate stopped the check before its board-wide step; the gates
+/// run cheapest first:
+/// 1. card-local: every node of the executed abilities is an own flicker node
+///    and at least one is an own exile leg (a modal spell with a non-flicker
+///    mode, a chain with any other node, or an unscoped or opponent-scoped leg
+///    is not a pure own flicker);
+/// 2. card-local: an activation's cost is mana and/or tap only;
+/// 3. root only;
+/// 4. board-wide: the legal targets of each own exile leg.
+fn flicker_no_value_check(ctx: &PolicyContext<'_>) -> Option<FlickerCheckOutcome> {
+    let legs = own_flicker_legs(ctx)?;
+    flicker_legs_outcome(ctx, &legs)
+}
+
+/// The card-local and root-only steps of the no-value check (gates 1–3): an
+/// own-flicker-only candidate's own exile legs and their base-parity
+/// [`OwnLegShape`]. `None` when a gate stops the check.
+struct OwnFlickerLegs<'a> {
+    shape: OwnLegShape,
+    legs: Vec<(&'a Effect, FlickerPair)>,
+}
+
+fn own_flicker_legs<'a>(ctx: &'a PolicyContext<'_>) -> Option<OwnFlickerLegs<'a>> {
+    let modes = match &ctx.candidate.action {
+        GameAction::CastSpell { .. } => ModeWalk::All,
+        GameAction::ActivateAbility { .. } => ModeWalk::RootOnly,
+        _ => return None,
+    };
+    let abilities = action_ability_definitions(ctx);
+    let mut pure = !abilities.is_empty();
+    let mut own_legs: Vec<(&Effect, FlickerPair)> = Vec::new();
+    let mut node_effects: Vec<&Effect> = Vec::new();
+    for ability in &abilities {
+        visit_definition_nodes(ability, modes, &mut |node| {
+            node_effects.push(&node.effect);
+            let chain = ChainNode::Definition(node);
+            if !is_own_flicker_node(chain) {
+                pure = false;
+                return;
+            }
+            if let Some(pair) = chain.flicker_pair() {
+                own_legs.push((&*node.effect, pair));
+            }
+        });
+    }
+    if !pure || own_legs.is_empty() {
+        return None;
+    }
+    if matches!(ctx.candidate.action, GameAction::ActivateAbility { .. })
+        && !abilities
+            .iter()
+            .all(|ability| cost_is_mana_or_tap_only(ability))
+    {
+        return None;
+    }
+    if !ctx.at_root() {
+        return None;
+    }
+    // Base parity (see `OwnLegShape`): the pre-filter excluded any
+    // creature-only own leg; the activation veto excluded an activation
+    // without an immediate return.
+    let gate_admitted = own_legs
+        .iter()
+        .all(|(effect, _)| !targets_creatures_only(effect));
+    let shape = match &ctx.candidate.action {
+        GameAction::CastSpell { .. } if gate_admitted => OwnLegShape::NoncreatureSpellLeg,
+        GameAction::ActivateAbility { .. }
+            if gate_admitted && node_effects.iter().any(is_deliberate_self_target_rider) =>
+        {
+            OwnLegShape::ImmediateReturnActivation
+        }
+        _ => OwnLegShape::ExcludedAtBase,
+    };
+    Some(OwnFlickerLegs {
+        shape,
+        legs: own_legs,
+    })
+}
+
+/// The board-wide step of the no-value check (gate 4): `Gain` when some own
+/// exile leg has a legal target the flicker gains on, else `NoValue(shape)`.
+/// `None` without a source object to read targets from.
+fn flicker_legs_outcome(
+    ctx: &PolicyContext<'_>,
+    own: &OwnFlickerLegs<'_>,
+) -> Option<FlickerCheckOutcome> {
+    let source = ctx.source_object()?;
+    let gains = own.legs.iter().any(|(effect, pair)| {
+        let targets = match &pair.subject {
+            // CR 115.10a: a self-blink names its source without the word
+            // "target", so the source is not targeted and targeting legality
+            // (shroud, CR 702.18a) does not apply — read it card-locally.
+            ExileSubject::Source => vec![TargetRef::Object(source.id)],
+            ExileSubject::Filtered(_) => extract_target_filter(effect)
+                .map(|filter| ctx.legal_targets(filter, source.id))
+                .unwrap_or_default(),
+        };
+        legal_targets_offer_flicker_gain(ctx, &targets, pair)
+    });
+    Some(if gains {
+        FlickerCheckOutcome::Gain
+    } else {
+        FlickerCheckOutcome::NoValue(own.shape)
+    })
+}
+
+/// R1.9 at the tactical pre-filter (orchestrator decision amending plan r9):
+/// `Some(outcome)` when an own flicker that base's pre-filter or activation
+/// veto excluded from search (`OwnLegShape::ExcludedAtBase`) still has no
+/// legal target worth flickering, so the gate removes it exactly where base
+/// removed it. The board-wide step runs only for that card-local shape;
+/// shapes base admitted are charged by `score_pre_cast` instead.
+pub(crate) fn flicker_no_value_gate_reject(ctx: &PolicyContext<'_>) -> Option<FlickerCheckOutcome> {
+    let own = own_flicker_legs(ctx)?;
+    match own.shape {
+        OwnLegShape::ExcludedAtBase => match flicker_legs_outcome(ctx, &own)? {
+            outcome @ FlickerCheckOutcome::NoValue(_) => Some(outcome),
+            FlickerCheckOutcome::Gain => None,
+        },
+        OwnLegShape::NoncreatureSpellLeg | OwnLegShape::ImmediateReturnActivation => None,
+    }
+}
+
+/// CR 601.2h + CR 602.2b: the cost is paid as part of activating; a cost whose
+/// own consequence can be the play (a loyalty gain, a discard or sacrifice) is
+/// priced by the cost policies, not by the flicker's target value. Read through
+/// the single cost authority (`AbilityDefinition::cost_categories`). A cost
+/// with no category (an effect cost without counters, an unimplemented cost)
+/// is not mana/tap only.
+fn cost_is_mana_or_tap_only(ability: &AbilityDefinition) -> bool {
+    if ability.cost.is_none() {
+        return true;
+    }
+    let categories = ability.cost_categories();
+    !categories.is_empty() && categories.iter().all(|c| category_is_mana_or_tap(*c))
+}
+
+fn category_is_mana_or_tap(category: CostCategory) -> bool {
+    match category {
+        CostCategory::ManaOnly | CostCategory::TapsSelf | CostCategory::UntapsSelf => true,
+        CostCategory::SacrificesPermanent
+        | CostCategory::PaysLife
+        | CostCategory::PaysLoyalty
+        | CostCategory::Discards
+        | CostCategory::ExilesCards
+        | CostCategory::TapsOtherCreatures
+        | CostCategory::RemovesCounters
+        | CostCategory::PaysEnergy
+        | CostCategory::PaysSpeed
+        | CostCategory::ReturnsToHand
+        | CostCategory::Unattaches
+        | CostCategory::Mills
+        | CostCategory::PutsCounters
+        | CostCategory::Reveals
+        | CostCategory::Exerts
+        | CostCategory::KeywordCost => false,
+    }
 }
 
 fn optional_effect_life_cost_is_lethal(ctx: &PolicyContext<'_>) -> bool {
@@ -693,17 +1235,28 @@ fn harmful_aura_has_opponent_creature_target(ctx: &PolicyContext<'_>) -> bool {
 /// engine, whether a legal opponent-creature target exists. Returns `true` when
 /// the effect carries no usable filter (fail-open: don't over-penalize an
 /// effect we can't analyze).
-fn harmful_effect_has_opponent_creature_target(ctx: &PolicyContext<'_>, effect: &Effect) -> bool {
-    let Some(filter) = extract_target_filter(effect) else {
+///
+/// An unscoped flicker leg ("exile target creature", Turn to Mist) also has a
+/// worthwhile target when one of its legal targets is an own permanent whose
+/// re-entry gains (CR 400.7 + CR 603.6a): aimed there it is the play, not a
+/// whiffed removal.
+fn harmful_effect_has_opponent_creature_target(
+    ctx: &PolicyContext<'_>,
+    node: ChainNode<'_>,
+    effects: &[&Effect],
+) -> bool {
+    let Some(filter) = extract_target_filter(node.effect()) else {
         return true;
     };
     let Some(source) = ctx.source_object() else {
         return true;
     };
-    let effects = ctx.effects();
-    ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
-        is_useful_removal_target(ctx, id, &effects)
-    })
+    let targets = ctx.legal_targets(filter, source.id);
+    ctx.any_legal_opponent_creature(&targets, |id| is_useful_removal_target(ctx, id, effects))
+        || node.flicker_pair().is_some_and(|pair| {
+            pair.subject == ExileSubject::Filtered(None)
+                && legal_targets_offer_flicker_gain(ctx, &targets, &pair)
+        })
 }
 
 /// Whether a removal target is worth casting at: the AI can pay any ward cost
@@ -807,18 +1360,11 @@ fn is_deliberate_self_target_rider(effect: &&Effect) -> bool {
     }
     // Flicker exiles the target and returns it as a new object, so
     // aiming it at one's own permanent is the entire point of the card. The
-    // return leg names the exiled target either directly (`ParentTarget` —
-    // Cloudshift, Acrobatic Maneuver) or through the chain's tracked set
-    // (`TrackedSet` — Flicker, Ephemerate, Ghostly Flicker); both are the same
-    // "return it to the battlefield" clause and neither may be vetoed.
-    matches!(
-        effect,
-        Effect::ChangeZone {
-            destination: Zone::Battlefield,
-            target: TargetFilter::ParentTarget | TargetFilter::TrackedSet { .. },
-            ..
-        }
-    )
+    // return leg is read by the flicker authority (`ability_chain::flicker_return`);
+    // an immediate return names the exiled target either directly
+    // (`ParentTarget` — Cloudshift, Acrobatic Maneuver) or through the chain's
+    // tracked set (Flicker, Ephemerate, Ghostly Flicker).
+    ability_chain::flicker_return(effect).is_some_and(|returns| returns.is_immediate())
 }
 
 /// At a single-object target slot, refuse to spend a harmful spell on
@@ -853,7 +1399,13 @@ fn own_permanent_with_opponent_alternative(
         return None;
     }
 
-    if ctx.effects().iter().any(is_deliberate_self_target_rider) {
+    // Own bounce: aiming it at one's own permanent is the play. A flicker that
+    // re-enters this permanent is the play too (CR 400.7), whatever its return
+    // timing; one that loses it (a token, CR 111.8; a control-losing return,
+    // CR 110.2a) stays vetoed while the slot offers an opponent's object.
+    if ctx.effects().iter().any(is_hostile_or_neutral_bounce)
+        || flicker_reading_for_target(ctx, object_id) == Some(FlickerTargetOutcome::Reenters)
+    {
         return None;
     }
 
@@ -918,10 +1470,12 @@ fn own_permanent_with_opponent_alternative(
 /// which already honours hexproof, shroud, protection and ward.
 fn harmful_activation_reaches_only_own_board(ctx: &PolicyContext<'_>) -> Option<PolicyReason> {
     let source = ctx.source_object()?;
-    let effects = ctx.effects();
+    let nodes = ctx.effect_nodes();
+    let effects: Vec<&Effect> = nodes.iter().map(|node| node.effect()).collect();
 
-    // Own bounce / flicker: aiming these at one's own permanent IS the play.
-    if effects.iter().any(is_deliberate_self_target_rider) {
+    // Own bounce: aiming it at one's own permanent IS the play. Own flicker is
+    // read per target in the loop below.
+    if effects.iter().any(is_hostile_or_neutral_bounce) {
         return None;
     }
 
@@ -966,7 +1520,8 @@ fn harmful_activation_reaches_only_own_board(ctx: &PolicyContext<'_>) -> Option<
     }
 
     let mut harmful_own_board_effects = 0i64;
-    for effect in &effects {
+    for node in &nodes {
+        let effect = node.effect();
         let Some(filter) = extract_target_filter(effect) else {
             continue;
         };
@@ -990,6 +1545,27 @@ fn harmful_activation_reaches_only_own_board(ctx: &PolicyContext<'_>) -> Option<
         });
         if reaches_beyond_own_board {
             return None;
+        }
+
+        // CR 400.7: a flicker that re-enters an own permanent is the play.
+        // CR 111.8 / CR 110.2a: one whose only own targets are tokens or
+        // control-losing returns is not, so it falls through to the harmful
+        // count. Reads the `targets` this loop already computed.
+        if let Some(pair) = node.flicker_pair() {
+            let reenters_own = targets.iter().any(|target| match target {
+                TargetRef::Object(id) => {
+                    ctx.state
+                        .objects
+                        .get(id)
+                        .is_some_and(|object| object.controller == ctx.ai_player)
+                        && flicker_target_outcome(ctx.state, &pair, *id, ctx.ai_player)
+                            == Some(FlickerTargetOutcome::Reenters)
+                }
+                TargetRef::Player(_) => false,
+            });
+            if reenters_own {
+                return None;
+            }
         }
 
         match effect_polarity(effect) {
@@ -1256,16 +1832,59 @@ fn target_reject_reason(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<P
     }
 }
 
-fn score_target_ref(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
+fn score_target_ref(ctx: &PolicyContext<'_>, target: &TargetRef) -> AntiSelfHarmScore {
     if matches!(target, TargetRef::Player(_))
         && exact_pending_player_impact(ctx, target) == Some(0.0)
     {
-        return 0.0;
+        return AntiSelfHarmScore::plain(0.0);
     }
     if target_reject_reason(ctx, target).is_some() {
-        return 0.0;
+        return AntiSelfHarmScore::plain(0.0);
     }
+    if let TargetRef::Object(object_id) = target {
+        if let Some(scored) = flicker_target_score(ctx, *object_id) {
+            return scored;
+        }
+    }
+    AntiSelfHarmScore::plain(score_target_ref_default(ctx, target))
+}
 
+/// The flicker valuation of one object target, when a flicker exile leg of
+/// the candidate reaches it and the object is the AI's (or a teammate's that
+/// re-enters). Opponents' objects keep the removal valuation below.
+fn flicker_target_score(ctx: &PolicyContext<'_>, object_id: ObjectId) -> Option<AntiSelfHarmScore> {
+    let outcome = flicker_reading_for_target(ctx, object_id)?;
+    let object = ctx.state.objects.get(&object_id)?;
+    if object.controller == ctx.ai_player {
+        return flicker_target_value(
+            ctx.state,
+            ctx.ai_player,
+            object_id,
+            outcome,
+            ctx.penalties(),
+        )
+        .map(|value| AntiSelfHarmScore {
+            value: value.score,
+            flicker: Some(FlickerReach::TargetValued(value.kind)),
+        });
+    }
+    match outcome {
+        // CR 102.3: a teammate's permanent that re-enters is neither the AI's
+        // value nor its harm.
+        FlickerTargetOutcome::Reenters
+            if !players::is_opponent(ctx.state, ctx.ai_player, object.controller) =>
+        {
+            Some(AntiSelfHarmScore::plain(0.0))
+        }
+        FlickerTargetOutcome::Reenters
+        | FlickerTargetOutcome::ReturnsToAnotherPlayer
+        | FlickerTargetOutcome::Ceases
+        | FlickerTargetOutcome::OpposingObject
+        | FlickerTargetOutcome::Unresolved => None,
+    }
+}
+
+fn score_target_ref_default(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
     let beneficial = is_spell_beneficial(ctx);
     match target {
         TargetRef::Player(player_id) => {
@@ -8814,5 +9433,1280 @@ mod tests {
             0.0,
             "the battlefield scan must not run in lookahead"
         );
+    }
+}
+
+/// Phase-1 flicker rows (U-H1–U-H17): every fixture is built from verbatim
+/// Oracle text through the scenario builders, driven to its real decision, and
+/// scored through a production-shaped policy context. Each row prints its
+/// reading before asserting, so a base-SHA run records which half is red.
+#[cfg(test)]
+mod flicker_rows {
+    use engine::game::game_object::BackFaceData;
+    use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use engine::types::card::LayoutKind;
+    use engine::types::card_type::{CardType, CoreType, Supertype};
+    use engine::types::keywords::Keyword;
+    use engine::types::mana::{ManaColor, ManaCostShard};
+
+    use super::*;
+    use crate::policies::context::flicker_fixtures as fx;
+    use crate::policies::context::SearchDepth;
+    use crate::policies::registry::{PolicyId, PolicyRegistry};
+
+    const ROOT: SearchDepth = SearchDepth::Root;
+    const LOOKAHEAD: SearchDepth = SearchDepth::Lookahead;
+
+    fn wasted() -> f64 {
+        PolicyPenalties::default().wasted_cast_penalty
+    }
+
+    fn verdict_at(state: &GameState, action: &GameAction, depth: SearchDepth) -> PolicyVerdict {
+        let probe = fx::Probe::new(state, action);
+        AntiSelfHarmPolicy.verdict(&probe.ctx(state, depth))
+    }
+
+    fn score_at(state: &GameState, action: &GameAction, depth: SearchDepth) -> f64 {
+        let probe = fx::Probe::new(state, action);
+        AntiSelfHarmPolicy.score(&probe.ctx(state, depth))
+    }
+
+    fn registry_score_at(state: &GameState, action: &GameAction, depth: SearchDepth) -> f64 {
+        let probe = fx::Probe::new(state, action);
+        PolicyRegistry::shared().score(&probe.ctx(state, depth))
+    }
+
+    fn registry_verdict_of(
+        state: &GameState,
+        action: &GameAction,
+        policy: PolicyId,
+    ) -> Option<PolicyVerdict> {
+        let probe = fx::Probe::new(state, action);
+        PolicyRegistry::shared()
+            .verdicts(&probe.ctx(state, ROOT))
+            .into_iter()
+            .find(|(id, _)| *id == policy)
+            .map(|(_, verdict)| verdict)
+    }
+
+    fn reject_kind(verdict: &PolicyVerdict) -> Option<&'static str> {
+        match verdict {
+            PolicyVerdict::Reject { reason } => Some(reason.kind),
+            PolicyVerdict::Score { .. } => None,
+        }
+    }
+
+    fn reason_of(verdict: &PolicyVerdict) -> &PolicyReason {
+        match verdict {
+            PolicyVerdict::Reject { reason } | PolicyVerdict::Score { reason, .. } => reason,
+        }
+    }
+
+    fn fact(verdict: &PolicyVerdict, key: &str) -> Option<i64> {
+        reason_of(verdict)
+            .facts
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| *value)
+    }
+
+    /// R1.9's veto (orchestrator decision amending plan r9): the tactical
+    /// pre-filter removes the candidate with the no-value check's
+    /// `NoValue(ExcludedAtBase)` outcome, and the policy itself scores it with
+    /// that fact (code 2) and no term.
+    fn gate_vetoes_no_value(state: &GameState, action: &GameAction) -> bool {
+        let probe = fx::Probe::new(state, action);
+        let ctx = probe.ctx(state, ROOT);
+        let outcome = flicker_no_value_gate_reject(&ctx);
+        let verdict = AntiSelfHarmPolicy.verdict(&ctx);
+        let gate = fx::gate_passes(state, action);
+        eprintln!(
+            "[flicker gate] {action:?}: gate outcome={outcome:?} gate passes={gate} policy fact={:?}",
+            fact(&verdict, "flicker_no_value_check")
+        );
+        outcome == Some(FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase))
+            && !gate
+            && reject_kind(&verdict).is_none()
+            && fact(&verdict, "flicker_no_value_check") == Some(2)
+    }
+
+    /// A no-value-check penalty reading: a score (not a veto) whose reason is
+    /// `anti_self_harm_score` with the base-admitted fact (3).
+    fn is_no_value_penalty_reason(verdict: &PolicyVerdict) -> bool {
+        reject_kind(verdict).is_none()
+            && reason_of(verdict).kind == "anti_self_harm_score"
+            && fact(verdict, "flicker_no_value_check") == Some(3)
+    }
+
+    fn print(row: &str, label: &str, verdict: &PolicyVerdict, score: Option<f64>) {
+        eprintln!(
+            "[flicker {row}] {label}: verdict={} facts={:?} score={score:?}",
+            match verdict {
+                PolicyVerdict::Reject { reason } => format!("Reject({})", reason.kind),
+                PolicyVerdict::Score { delta, reason } =>
+                    format!("Score({delta}, {})", reason.kind),
+            },
+            reason_of(verdict).facts
+        );
+    }
+
+    fn blink(scenario: &mut GameScenario) -> ObjectId {
+        fx::spell_in_hand(
+            scenario,
+            P0,
+            "Momentary Blink",
+            true,
+            fx::MOMENTARY_BLINK_KEYWORDS,
+            fx::MOMENTARY_BLINK,
+            fx::cost(&[ManaCostShard::White], 1),
+        )
+    }
+
+    fn cloudshift(scenario: &mut GameScenario) -> ObjectId {
+        fx::spell_in_hand(
+            scenario,
+            P0,
+            "Cloudshift",
+            true,
+            &[],
+            fx::CLOUDSHIFT,
+            fx::cost(&[ManaCostShard::White], 0),
+        )
+    }
+
+    fn ephemerate(scenario: &mut GameScenario) -> ObjectId {
+        fx::spell_in_hand(
+            scenario,
+            P0,
+            "Ephemerate",
+            true,
+            fx::EPHEMERATE_KEYWORDS,
+            fx::EPHEMERATE,
+            fx::cost(&[ManaCostShard::White], 0),
+        )
+    }
+
+    fn ghostly_flicker(scenario: &mut GameScenario) -> ObjectId {
+        fx::spell_in_hand(
+            scenario,
+            P0,
+            "Ghostly Flicker",
+            true,
+            &[],
+            fx::GHOSTLY_FLICKER,
+            fx::cost(&[ManaCostShard::Blue], 2),
+        )
+    }
+
+    fn opposing_murder(scenario: &mut GameScenario) -> ObjectId {
+        fx::lands(scenario, P1, ManaColor::Black, 3);
+        fx::spell_in_hand(
+            scenario,
+            P1,
+            "Murder",
+            true,
+            &[],
+            fx::MURDER,
+            fx::cost(&[ManaCostShard::Black, ManaCostShard::Black], 1),
+        )
+    }
+
+    fn smuggler(scenario: &mut GameScenario) -> ObjectId {
+        fx::creature(
+            scenario,
+            P0,
+            "Nephalia Smuggler",
+            1,
+            1,
+            &[],
+            fx::NEPHALIA_SMUGGLER,
+        )
+    }
+
+    fn abuelo(scenario: &mut GameScenario) -> ObjectId {
+        fx::creature(
+            scenario,
+            P0,
+            "Abuelo, Ancestral Echo",
+            2,
+            2,
+            fx::ABUELO_KEYWORDS,
+            fx::ABUELO,
+        )
+    }
+
+    fn displacer(scenario: &mut GameScenario) -> ObjectId {
+        fx::lands(scenario, P0, ManaColor::White, 2);
+        scenario.add_land_from_oracle(P0, "Wastes", fx::WASTES);
+        fx::creature(
+            scenario,
+            P0,
+            "Eldrazi Displacer",
+            3,
+            3,
+            fx::ELDRAZI_DISPLACER_KEYWORDS,
+            fx::ELDRAZI_DISPLACER,
+        )
+    }
+
+    fn venser(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_planeswalker_from_oracle(P0, "Venser, Visionary Traveler", "Venser", 4, fx::VENSER)
+            .id()
+    }
+
+    fn mark_token(runner: &mut GameRunner, id: ObjectId) {
+        fx::make_token(runner.state_mut(), id);
+    }
+
+    // U-H1: rescue outranks ETB re-use, which outranks a no-gain re-entry,
+    // which ranks below declining.
+    #[test]
+    fn flicker_target_value_orders_rescue_etb_no_gain() {
+        let mut scenario = fx::scenario();
+        let v = fx::giant(&mut scenario, P0);
+        let e = fx::visionary(&mut scenario, P0);
+        let w = fx::bears(&mut scenario, P0);
+        let murder = opposing_murder(&mut scenario);
+        let mut runner = scenario.build();
+        fx::opponent_casts(&mut runner, murder, Some(TargetRef::Object(v)));
+        let state = runner.state();
+        let penalties = PolicyPenalties::default();
+        let value = |id| {
+            flicker_target_value(state, P0, id, FlickerTargetOutcome::Reenters, &penalties)
+                .expect("an AI-controlled object is valued")
+        };
+        let (rescue, etb, no_gain) = (value(v), value(e), value(w));
+        eprintln!("[flicker U-H1] V={rescue:?} E={etb:?} W={no_gain:?}");
+        assert_eq!(rescue.kind, FlickerValueKind::Rescue);
+        assert_eq!(etb.kind, FlickerValueKind::EtbReuse);
+        assert_eq!(no_gain.kind, FlickerValueKind::NoGain);
+        assert!(rescue.score > etb.score);
+        assert!(etb.score > no_gain.score);
+        assert!(no_gain.score < DECLINED_TARGET_SCORE);
+    }
+
+    // U-H2 (R1.7): flickering a permanent that holds an opponent's card in a
+    // linked exile releases that card (CR 610.3; CR 607.2a + CR 603.6c).
+    #[test]
+    fn linked_exile_release_ranks_below_equal_target() {
+        // Banisher Priest at Momentary Blink's slot.
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 8);
+        let w = fx::bears(&mut scenario, P0);
+        let banisher = scenario
+            .add_creature_to_hand_from_oracle(P0, "Banisher Priest", 2, 2, fx::BANISHER_PRIEST)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White, ManaCostShard::White], 1))
+            .id();
+        let lent_banisher = scenario
+            .add_creature_to_hand_from_oracle(P0, "Banisher Priest", 2, 2, fx::BANISHER_PRIEST)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White, ManaCostShard::White], 1))
+            .id();
+        let victim = scenario.add_creature(P1, "Opposing Champion", 4, 4).id();
+        // An AI-owned creature the opponent controls: exiling it holds the
+        // AI's own card.
+        let lent = scenario
+            .add_creature(P0, "Lent Bear", 2, 2)
+            .controlled_by(P1)
+            .id();
+        let spell = blink(&mut scenario);
+        let murder = opposing_murder(&mut scenario);
+        let mut runner = scenario.build();
+        let _ = runner.cast(banisher).target_object(victim).resolve();
+        let _ = runner.cast(lent_banisher).target_object(lent).resolve();
+        for id in runner.state().battlefield.clone() {
+            runner.state_mut().objects.get_mut(&id).unwrap().tapped = false;
+        }
+        fx::give_turn(runner.state_mut(), P0);
+        let mut target_runner = GameRunner::from_state(runner.state().clone());
+        fx::begin_cast(&mut target_runner, spell);
+        let state = target_runner.state();
+        let banisher_score = score_at(state, &fx::choose(banisher), ROOT);
+        let w_score = score_at(state, &fx::choose(w), ROOT);
+        eprintln!("[flicker U-H2] Blink slot: Banisher={banisher_score} W={w_score}");
+        assert!(banisher_score < w_score);
+
+        let penalties = PolicyPenalties::default();
+        let lent_value = flicker_target_value(
+            state,
+            P0,
+            lent_banisher,
+            FlickerTargetOutcome::Reenters,
+            &penalties,
+        )
+        .expect("valued");
+        eprintln!("[flicker U-H2] Banisher holding the AI's own card: {lent_value:?}");
+        assert_eq!(lent_value.kind, FlickerValueKind::NoGain);
+        assert_eq!(lent_value.score, penalties.flicker_no_value_penalty);
+
+        // A threatened Banisher is a rescue, without the release term.
+        fx::opponent_casts(&mut runner, murder, Some(TargetRef::Object(banisher)));
+        let threatened = flicker_target_value(
+            runner.state(),
+            P0,
+            banisher,
+            FlickerTargetOutcome::Reenters,
+            &penalties,
+        )
+        .expect("valued");
+        eprintln!("[flicker U-H2] threatened Banisher: {threatened:?}");
+        assert_eq!(threatened.kind, FlickerValueKind::Rescue);
+        assert_eq!(
+            threatened.score,
+            threatened_permanent_value(runner.state(), banisher)
+                + penalties.flicker_rescue_target_bonus
+        );
+
+        // Oblivion Ring at Felidar Guardian's slot.
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 8);
+        let ring = scenario
+            .add_spell_to_hand(P0, "Oblivion Ring", false)
+            .as_enchantment()
+            .from_oracle_text(fx::OBLIVION_RING)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White], 2))
+            .id();
+        let totem = scenario
+            .add_enchantment_from_oracle(P0, "Plain Totem", "")
+            .id();
+        let opposing_totem = scenario
+            .add_enchantment_from_oracle(P1, "Opposing Totem", "")
+            .id();
+        let felidar = scenario
+            .add_creature_to_hand_from_oracle(P0, "Felidar Guardian", 1, 4, fx::FELIDAR_GUARDIAN)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White], 3))
+            .id();
+        let mut runner = scenario.build();
+        let _ = runner.cast(ring).target_object(opposing_totem).resolve();
+        fx::give_turn(runner.state_mut(), P0);
+        fx::resolve_to_prompt(&mut runner, felidar);
+        let state = runner.state();
+        let ring_score = score_at(state, &fx::choose(ring), ROOT);
+        let totem_score = score_at(state, &fx::choose(totem), ROOT);
+        eprintln!("[flicker U-H2] Felidar slot: Oblivion Ring={ring_score} totem={totem_score}");
+        assert!(ring_score < totem_score);
+    }
+
+    // U-H3 (R1.7): a return "under its owner's control" hands a stolen
+    // creature back (CR 110.2a); "under your control" keeps it.
+    #[test]
+    fn control_losing_return_ranks_below_equal_target() {
+        for (name, blink_spell) in [("Momentary Blink", true), ("Cloudshift", false)] {
+            let mut scenario = fx::scenario();
+            fx::lands(&mut scenario, P0, ManaColor::White, 2);
+            let w = fx::bears(&mut scenario, P0);
+            let stolen = scenario
+                .add_creature(P1, "Stolen Bear", 2, 2)
+                .controlled_by(P0)
+                .id();
+            let spell = if blink_spell {
+                blink(&mut scenario)
+            } else {
+                cloudshift(&mut scenario)
+            };
+            let mut runner = scenario.build();
+            fx::begin_cast(&mut runner, spell);
+            let state = runner.state();
+            let stolen_score = score_at(state, &fx::choose(stolen), ROOT);
+            let own_score = score_at(state, &fx::choose(w), ROOT);
+            eprintln!("[flicker U-H3] {name}: stolen={stolen_score} own W={own_score}");
+            if blink_spell {
+                assert!(stolen_score < own_score);
+            } else {
+                assert_eq!(stolen_score, own_score);
+            }
+        }
+    }
+
+    // U-H4 (R1.1 seam): an own flicker cast is not charged as a whiffed
+    // removal.
+    #[test]
+    fn own_flicker_cast_carries_no_wasted_cast_penalty() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 2);
+        let v = fx::giant(&mut scenario, P0);
+        fx::visionary(&mut scenario, P0);
+        let spell = blink(&mut scenario);
+        let murder = opposing_murder(&mut scenario);
+        let mut runner = scenario.build();
+        let cast = fx::cast_action(runner.state(), spell);
+        let with_etb = score_at(runner.state(), &cast, ROOT);
+        fx::opponent_casts(&mut runner, murder, Some(TargetRef::Object(v)));
+        let with_murder = score_at(runner.state(), &cast, ROOT);
+        eprintln!("[flicker U-H4] E on board={with_etb} Murder on V={with_murder}");
+        assert_eq!(with_etb, 0.0);
+        assert_eq!(with_murder, 0.0);
+    }
+
+    /// One no-value board for U-H5: the AI controls only vanilla V (and W,
+    /// lands), plus `extra` pieces; returns the runner and the action.
+    enum NoValueArm {
+        Blink,
+        Ephemerate,
+        Smuggler,
+        Abuelo,
+        GhostlyFlicker,
+        RuinGhost,
+    }
+
+    fn no_value_arm(arm: &NoValueArm, with_etb: bool) -> (GameRunner, GameAction) {
+        let mut scenario = fx::scenario();
+        fx::giant(&mut scenario, P0);
+        if with_etb {
+            fx::visionary(&mut scenario, P0);
+        }
+        let source = match arm {
+            NoValueArm::Blink => {
+                fx::lands(&mut scenario, P0, ManaColor::White, 2);
+                blink(&mut scenario)
+            }
+            NoValueArm::Ephemerate => {
+                fx::lands(&mut scenario, P0, ManaColor::White, 1);
+                ephemerate(&mut scenario)
+            }
+            NoValueArm::Smuggler => {
+                fx::lands(&mut scenario, P0, ManaColor::Blue, 4);
+                smuggler(&mut scenario)
+            }
+            NoValueArm::Abuelo => {
+                fx::lands(&mut scenario, P0, ManaColor::White, 2);
+                fx::lands(&mut scenario, P0, ManaColor::Blue, 1);
+                abuelo(&mut scenario)
+            }
+            NoValueArm::GhostlyFlicker => {
+                fx::bears(&mut scenario, P0);
+                fx::lands(&mut scenario, P0, ManaColor::Blue, 3);
+                ghostly_flicker(&mut scenario)
+            }
+            NoValueArm::RuinGhost => {
+                fx::lands(&mut scenario, P0, ManaColor::White, 2);
+                fx::creature(&mut scenario, P0, "Ruin Ghost", 1, 1, &[], fx::RUIN_GHOST)
+            }
+        };
+        let runner = scenario.build();
+        let action = match arm {
+            NoValueArm::Blink | NoValueArm::Ephemerate | NoValueArm::GhostlyFlicker => {
+                fx::cast_action(runner.state(), source)
+            }
+            NoValueArm::Smuggler | NoValueArm::Abuelo | NoValueArm::RuinGhost => {
+                fx::activate_action(runner.state(), source)
+            }
+        };
+        (runner, action)
+    }
+
+    // U-H5 (R1.9 seam): at the decision root, a no-value own flicker is
+    // vetoed when every own exile leg is creature-only (or names its source),
+    // and charged the wasted-cast penalty when a leg admits noncreatures.
+    // Lookahead has neither.
+    #[test]
+    fn no_value_flicker_cast_is_vetoed_or_charged_at_root_only() {
+        for (label, arm) in [
+            ("Momentary Blink", NoValueArm::Blink),
+            ("Ephemerate", NoValueArm::Ephemerate),
+            ("Nephalia Smuggler", NoValueArm::Smuggler),
+            ("Abuelo", NoValueArm::Abuelo),
+        ] {
+            let (runner, action) = no_value_arm(&arm, false);
+            let state = runner.state();
+            let verdict = verdict_at(state, &action, ROOT);
+            let registry = registry_score_at(state, &action, ROOT);
+            print("U-H5", &format!("{label} root"), &verdict, Some(registry));
+            assert!(gate_vetoes_no_value(state, &action), "{label}: {verdict:?}");
+
+            let (runner, action) = no_value_arm(&arm, true);
+            let state = runner.state();
+            let guard = verdict_at(state, &action, ROOT);
+            let guard_score = score_at(state, &action, ROOT);
+            print(
+                "U-H5",
+                &format!("{label} + E root"),
+                &guard,
+                Some(guard_score),
+            );
+            assert!(reject_kind(&guard).is_none(), "{label} + E: {guard:?}");
+            assert_eq!(guard_score, 0.0, "{label} + E");
+            assert_eq!(
+                fact(&guard, "flicker_no_value_check"),
+                Some(1),
+                "{label} + E"
+            );
+        }
+        for (label, arm) in [
+            ("Ghostly Flicker", NoValueArm::GhostlyFlicker),
+            ("Ruin Ghost", NoValueArm::RuinGhost),
+        ] {
+            let (runner, action) = no_value_arm(&arm, false);
+            let state = runner.state();
+            let verdict = verdict_at(state, &action, ROOT);
+            let score = score_at(state, &action, ROOT);
+            print("U-H5", &format!("{label} root"), &verdict, Some(score));
+            assert!(is_no_value_penalty_reason(&verdict), "{label}: {verdict:?}");
+            assert_eq!(score, wasted(), "{label}");
+        }
+        // The activation split (base parity): Abuelo's scheduled return was
+        // excluded from search at base (own-board activation veto), so it is
+        // vetoed; Ruin Ghost's immediate return was admitted (the rider), so
+        // it is charged.
+        let (abuelo_runner, abuelo_action) = no_value_arm(&NoValueArm::Abuelo, false);
+        let (ghost_runner, ghost_action) = no_value_arm(&NoValueArm::RuinGhost, false);
+        let abuelo_verdict = verdict_at(abuelo_runner.state(), &abuelo_action, ROOT);
+        let ghost_verdict = verdict_at(ghost_runner.state(), &ghost_action, ROOT);
+        print(
+            "U-H5",
+            "activation split: Abuelo (scheduled)",
+            &abuelo_verdict,
+            None,
+        );
+        print(
+            "U-H5",
+            "activation split: Ruin Ghost (immediate)",
+            &ghost_verdict,
+            None,
+        );
+        assert!(gate_vetoes_no_value(abuelo_runner.state(), &abuelo_action));
+        assert!(is_no_value_penalty_reason(&ghost_verdict));
+        assert!(fx::gate_passes(ghost_runner.state(), &ghost_action));
+
+        let (runner, action) = no_value_arm(&NoValueArm::GhostlyFlicker, true);
+        let guard = verdict_at(runner.state(), &action, ROOT);
+        let guard_score = score_at(runner.state(), &action, ROOT);
+        print(
+            "U-H5",
+            "Ghostly Flicker + E root",
+            &guard,
+            Some(guard_score),
+        );
+        assert!(reject_kind(&guard).is_none());
+        assert_eq!(guard_score, 0.0);
+        assert_eq!(fact(&guard, "flicker_no_value_check"), Some(1));
+
+        for (label, arm) in [
+            ("Momentary Blink", NoValueArm::Blink),
+            ("Ghostly Flicker", NoValueArm::GhostlyFlicker),
+        ] {
+            let (runner, action) = no_value_arm(&arm, false);
+            let verdict = verdict_at(runner.state(), &action, LOOKAHEAD);
+            let score = score_at(runner.state(), &action, LOOKAHEAD);
+            print("U-H5", &format!("{label} lookahead"), &verdict, Some(score));
+            assert!(reject_kind(&verdict).is_none(), "{label}: {verdict:?}");
+            assert_eq!(score, 0.0, "{label}");
+        }
+    }
+
+    // U-H6 (R1.2a/b, B6): a flicker aimed at an own permanent that re-enters
+    // is not vetoed; one aimed at an own token is.
+    #[test]
+    fn flicker_aimed_at_own_permanent_is_not_vetoed() {
+        // Flickerwisp's ETB trigger with an opposing creature legal.
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 3);
+        let e = fx::visionary(&mut scenario, P0);
+        let t = fx::token_body(&mut scenario, P0);
+        scenario.add_creature(P1, "Opposing Bear", 2, 2);
+        let wisp = scenario
+            .add_creature_to_hand(P0, "Flickerwisp", 3, 1)
+            .from_oracle_text_with_keywords(fx::FLYING, fx::FLICKERWISP)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White, ManaCostShard::White], 1))
+            .id();
+        let mut runner = scenario.build();
+        mark_token(&mut runner, t);
+        fx::resolve_to_prompt(&mut runner, wisp);
+        let state = runner.state();
+        let at_e = verdict_at(state, &fx::choose(e), ROOT);
+        print("U-H6", "Flickerwisp -> E", &at_e, None);
+        assert!(reject_kind(&at_e).is_none());
+        let at_t = verdict_at(state, &fx::choose(t), ROOT);
+        print("U-H6", "Flickerwisp -> own T (hostile)", &at_t, None);
+        assert!(reject_kind(&at_t).is_some());
+
+        // Abuelo with own V and E only.
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 2);
+        fx::lands(&mut scenario, P0, ManaColor::Blue, 1);
+        fx::giant(&mut scenario, P0);
+        fx::visionary(&mut scenario, P0);
+        let source = abuelo(&mut scenario);
+        let runner = scenario.build();
+        let action = fx::activate_action(runner.state(), source);
+        let verdict = verdict_at(runner.state(), &action, ROOT);
+        print("U-H6", "Abuelo with V and E", &verdict, None);
+        assert!(reject_kind(&verdict).is_none());
+
+        // Venser's +1 with own V and lands only.
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 2);
+        fx::giant(&mut scenario, P0);
+        let source = venser(&mut scenario);
+        let runner = scenario.build();
+        let action = fx::activate_action(runner.state(), source);
+        let verdict = verdict_at(runner.state(), &action, ROOT);
+        print("U-H6", "Venser +1 with V and lands", &verdict, None);
+        assert!(reject_kind(&verdict).is_none());
+    }
+
+    // U-H7 (R1.8): an optional flicker slot whose only target gains nothing
+    // is declined.
+    #[test]
+    fn optional_flicker_slot_with_only_no_value_targets_declines() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 3);
+        let v = fx::giant(&mut scenario, P0);
+        let guardian = scenario
+            .add_creature_to_hand(P0, "Guardian of Ghirapur", 3, 3)
+            .from_oracle_text_with_keywords(fx::FLYING, fx::GUARDIAN_OF_GHIRAPUR)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White], 2))
+            .id();
+        let mut runner = scenario.build();
+        fx::resolve_to_prompt(&mut runner, guardian);
+        let state = runner.state();
+        let decision = engine::ai_support::build_decision_context(state);
+        let mut declines = Vec::new();
+        let mut v_scores = Vec::new();
+        for candidate in &decision.candidates {
+            let score = score_at(state, &candidate.action, ROOT);
+            match &candidate.action {
+                GameAction::ChooseTarget { target: None } => declines.push(score),
+                GameAction::SelectTargets { targets } if targets.is_empty() => declines.push(score),
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(id)),
+                } if *id == v => v_scores.push(score),
+                GameAction::SelectTargets { targets }
+                    if targets.as_slice() == [TargetRef::Object(v)] =>
+                {
+                    v_scores.push(score)
+                }
+                _ => {}
+            }
+        }
+        eprintln!("[flicker U-H7] decline={declines:?} V={v_scores:?}");
+        assert!(!declines.is_empty() && !v_scores.is_empty());
+        let best_decline = declines.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(v_scores.iter().all(|score| *score < best_decline));
+    }
+
+    fn restoration_angel_frame(target: &str) -> (GameRunner, ObjectId) {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 4);
+        let e = fx::visionary(&mut scenario, P0);
+        let v = fx::giant(&mut scenario, P0);
+        let t = fx::token_body(&mut scenario, P0);
+        let angel = scenario
+            .add_creature_to_hand(P0, "Restoration Angel", 3, 4)
+            .with_subtypes(vec!["Angel"])
+            .from_oracle_text_with_keywords(fx::RESTORATION_ANGEL_KEYWORDS, fx::RESTORATION_ANGEL)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White], 3))
+            .id();
+        let mut runner = scenario.build();
+        mark_token(&mut runner, t);
+        fx::resolve_to_prompt(&mut runner, angel);
+        let chosen = match target {
+            "E" => e,
+            "V" => v,
+            _ => t,
+        };
+        runner
+            .act(fx::choose(chosen))
+            .expect("the trigger target must be accepted");
+        drive_to_optional_choice(&mut runner);
+        (runner, chosen)
+    }
+
+    fn drive_to_optional_choice(runner: &mut GameRunner) {
+        for _ in 0..8 {
+            if matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalEffectChoice { .. }
+            ) {
+                return;
+            }
+            runner
+                .act(GameAction::PassPriority)
+                .expect("passing priority must be accepted");
+        }
+        panic!(
+            "never reached the optional-effect prompt; waiting_for = {:?}",
+            runner.state().waiting_for
+        );
+    }
+
+    const ACCEPT: GameAction = GameAction::DecideOptionalEffect { accept: true };
+
+    // U-H8 (R1.11 seam): accepting a parked "may" flicker is worth its
+    // target's flicker value (CR 603.5).
+    #[test]
+    fn optional_flicker_accept_reads_the_parked_target() {
+        for (label, expect_positive) in [("E", true), ("V", false), ("T", false)] {
+            let (runner, _) = restoration_angel_frame(label);
+            let accept = score_at(runner.state(), &ACCEPT, ROOT);
+            eprintln!("[flicker U-H8] Restoration Angel -> {label}: accept={accept}");
+            if expect_positive {
+                assert!(accept > 0.0);
+            } else {
+                assert!(accept < 0.0);
+            }
+        }
+
+        // Reach guard: a non-flicker optional (draw) frame scores 0.0.
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::Blue, 5);
+        let mer_man = scenario
+            .add_creature_to_hand_from_oracle(
+                P0,
+                "Mer Man",
+                3,
+                3,
+                "When this creature enters, you may draw a card.",
+            )
+            .with_mana_cost(fx::cost(&[ManaCostShard::Blue], 4))
+            .id();
+        let mut runner = scenario.build();
+        let _ = runner.cast(mer_man).commit();
+        drive_to_optional_choice(&mut runner);
+        let draw_accept = score_at(runner.state(), &ACCEPT, ROOT);
+        eprintln!("[flicker U-H8] Mer Man draw frame: accept={draw_accept}");
+        assert_eq!(draw_accept, 0.0);
+
+        // Reach guard: a frame whose ability the opponent controls scores 0.0
+        // for the AI.
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P1, ManaColor::White, 4);
+        fx::visionary(&mut scenario, P1);
+        let angel = scenario
+            .add_creature_to_hand(P1, "Restoration Angel", 3, 4)
+            .with_subtypes(vec!["Angel"])
+            .from_oracle_text_with_keywords(fx::RESTORATION_ANGEL_KEYWORDS, fx::RESTORATION_ANGEL)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White], 3))
+            .id();
+        let mut runner = scenario.build();
+        fx::give_turn(runner.state_mut(), P1);
+        let _ = runner.cast(angel).commit();
+        for _ in 0..8 {
+            match runner.state().waiting_for.clone() {
+                WaitingFor::OptionalEffectChoice { .. } => break,
+                WaitingFor::Priority { .. } => {
+                    runner.act(GameAction::PassPriority).expect("pass");
+                }
+                _ => {
+                    runner
+                        .choose_first_legal_target()
+                        .expect("the opponent's trigger target");
+                }
+            }
+        }
+        let opponent_accept = score_at(runner.state(), &ACCEPT, ROOT);
+        eprintln!("[flicker U-H8] P1's Restoration Angel frame: accept={opponent_accept}");
+        assert_eq!(opponent_accept, 0.0);
+    }
+
+    fn unscoped_flicker(card: &str, with_etb: bool) -> (GameRunner, GameAction) {
+        let mut scenario = fx::scenario();
+        if with_etb {
+            fx::visionary(&mut scenario, P0);
+        } else {
+            fx::giant(&mut scenario, P0);
+        }
+        let source = match card {
+            "Turn to Mist" => {
+                fx::lands(&mut scenario, P0, ManaColor::White, 2);
+                fx::spell_in_hand(
+                    &mut scenario,
+                    P0,
+                    "Turn to Mist",
+                    true,
+                    &[],
+                    fx::TURN_TO_MIST,
+                    fx::cost(&[ManaCostShard::WhiteBlue], 1),
+                )
+            }
+            "Otherworldly Journey" => {
+                fx::lands(&mut scenario, P0, ManaColor::White, 2);
+                fx::spell_in_hand(
+                    &mut scenario,
+                    P0,
+                    "Otherworldly Journey",
+                    true,
+                    &[],
+                    fx::OTHERWORLDLY_JOURNEY,
+                    fx::cost(&[ManaCostShard::White], 1),
+                )
+            }
+            _ => displacer(&mut scenario),
+        };
+        let runner = scenario.build();
+        let action = if card == "Eldrazi Displacer" {
+            fx::activate_action(runner.state(), source)
+        } else {
+            fx::cast_action(runner.state(), source)
+        };
+        (runner, action)
+    }
+
+    // U-H9 (B4): an unscoped flicker aimed at an own value-ETB permanent is
+    // not a whiffed removal.
+    #[test]
+    fn unscoped_flicker_with_value_target_is_not_a_wasted_cast() {
+        for card in ["Turn to Mist", "Otherworldly Journey", "Eldrazi Displacer"] {
+            let (runner, action) = unscoped_flicker(card, true);
+            let score = score_at(runner.state(), &action, ROOT);
+            eprintln!("[flicker U-H9] {card} with E: score={score}");
+            assert_eq!(score, 0.0, "{card}");
+        }
+        for card in ["Turn to Mist", "Eldrazi Displacer"] {
+            let (runner, action) = unscoped_flicker(card, false);
+            let score = score_at(runner.state(), &action, ROOT);
+            eprintln!("[flicker U-H9] {card} with only V: score={score}");
+            assert_eq!(score, wasted(), "{card}");
+        }
+    }
+
+    // U-H10 (B1): an own flicker chain with any other node, or a modal spell
+    // with a non-flicker mode, is outside the no-value check.
+    #[test]
+    fn impure_own_flicker_chains_are_not_no_value_checked() {
+        let base_board = |opposing: bool| {
+            let mut scenario = fx::scenario();
+            fx::lands(&mut scenario, P0, ManaColor::White, 2);
+            fx::lands(&mut scenario, P0, ManaColor::Blue, 4);
+            fx::giant(&mut scenario, P0);
+            fx::bears(&mut scenario, P0);
+            if opposing {
+                scenario.add_creature(P1, "Opposing Bear", 2, 2);
+            }
+            scenario
+        };
+
+        let mut scenario = base_board(false);
+        let stratagem = fx::spell_in_hand(
+            &mut scenario,
+            P0,
+            "Illusionist's Stratagem",
+            true,
+            &[],
+            fx::ILLUSIONISTS_STRATAGEM,
+            fx::cost(&[ManaCostShard::Blue], 3),
+        );
+        let reach = blink(&mut scenario);
+        let runner = scenario.build();
+        let state = runner.state();
+        let action = fx::cast_action(state, stratagem);
+        let verdict = verdict_at(state, &action, ROOT);
+        let score = score_at(state, &action, ROOT);
+        let gate = fx::gate_passes(state, &action);
+        print("U-H10", "Illusionist's Stratagem", &verdict, Some(score));
+        eprintln!("[flicker U-H10] Illusionist's Stratagem gate passes = {gate}");
+        assert_eq!(fact(&verdict, "flicker_no_value_check"), None);
+        assert_eq!(score, 0.0);
+        assert!(gate);
+        assert!(gate_vetoes_no_value(state, &fx::cast_action(state, reach)));
+
+        for opposing in [true, false] {
+            let mut scenario = base_board(opposing);
+            fx::lands(&mut scenario, P0, ManaColor::White, 3);
+            let settle = fx::spell_in_hand(
+                &mut scenario,
+                P0,
+                "Settle Beyond Reality",
+                false,
+                &[],
+                fx::SETTLE_BEYOND_REALITY,
+                fx::cost(&[ManaCostShard::White], 4),
+            );
+            let reach = blink(&mut scenario);
+            let runner = scenario.build();
+            let state = runner.state();
+            let action = fx::cast_action(state, settle);
+            let verdict = verdict_at(state, &action, ROOT);
+            let score = score_at(state, &action, ROOT);
+            print(
+                "U-H10",
+                &format!("Settle Beyond Reality, opposing creature = {opposing}"),
+                &verdict,
+                Some(score),
+            );
+            assert_eq!(fact(&verdict, "flicker_no_value_check"), None);
+            assert_eq!(score, if opposing { 0.0 } else { wasted() });
+            assert!(gate_vetoes_no_value(state, &fx::cast_action(state, reach)));
+        }
+    }
+
+    // U-H11 (B1, cost-as-value): a loyalty-cost flicker is outside the
+    // no-value check (CR 606.4: the +1 is the activation's own value).
+    #[test]
+    fn cost_as_value_flicker_activations_are_not_no_value_checked() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 2);
+        fx::lands(&mut scenario, P0, ManaColor::Blue, 1);
+        fx::giant(&mut scenario, P0);
+        let venser = venser(&mut scenario);
+        let abuelo = abuelo(&mut scenario);
+        let runner = scenario.build();
+        let state = runner.state();
+        let action = fx::activate_action(state, venser);
+        let verdict = verdict_at(state, &action, ROOT);
+        let score = score_at(state, &action, ROOT);
+        print("U-H11", "Venser +1", &verdict, Some(score));
+        assert!(reject_kind(&verdict).is_none());
+        assert_eq!(score, 0.0);
+        assert!(fx::gate_passes(state, &action));
+        assert!(gate_vetoes_no_value(
+            state,
+            &fx::activate_action(state, abuelo)
+        ));
+    }
+
+    // U-H12 (R1.9, activation): a no-value own flicker activation is removed
+    // by the pre-filter's no-value veto (U-G1 shows base's redundancy path no
+    // longer reads it as removal).
+    #[test]
+    fn no_value_own_flicker_activation_is_not_taken() {
+        let (runner, action) = no_value_arm(&NoValueArm::Smuggler, false);
+        let state = runner.state();
+        let gate = fx::gate_passes(state, &action);
+        let verdict = verdict_at(state, &action, ROOT);
+        print("U-H12", "Nephalia Smuggler", &verdict, None);
+        eprintln!("[flicker U-H12] Nephalia Smuggler gate passes = {gate}");
+        // Removed by the pre-filter's no-value veto, not by base's
+        // redundancy path (the own leg is not redundant removal).
+        assert!(!gate);
+        assert!(gate_vetoes_no_value(state, &action));
+    }
+
+    // U-H13 (B3): a token (CR 111.8) ranks below every flicker target that
+    // returns.
+    #[test]
+    fn token_is_never_the_preferred_flicker_target() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 8);
+        let t = fx::token_body(&mut scenario, P0);
+        let own_banisher = scenario
+            .add_creature_to_hand_from_oracle(P0, "Banisher Priest", 2, 2, fx::BANISHER_PRIEST)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White, ManaCostShard::White], 1))
+            .id();
+        let stolen_banisher = scenario
+            .add_creature_to_hand_from_oracle(P0, "Banisher Priest", 2, 2, fx::BANISHER_PRIEST)
+            .with_mana_cost(fx::cost(&[ManaCostShard::White, ManaCostShard::White], 1))
+            .id();
+        let stolen = scenario
+            .add_creature(P1, "Stolen Bear", 2, 2)
+            .controlled_by(P0)
+            .id();
+        let victim_a = scenario.add_creature(P1, "Opposing Champion", 4, 4).id();
+        let victim_b = scenario.add_creature(P1, "Opposing Knight", 2, 2).id();
+        let spell = blink(&mut scenario);
+        let mut runner = scenario.build();
+        mark_token(&mut runner, t);
+        let _ = runner.cast(own_banisher).target_object(victim_a).resolve();
+        let _ = runner
+            .cast(stolen_banisher)
+            .target_object(victim_b)
+            .resolve();
+        // The second Banisher is the opponent's card the AI controls.
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&stolen_banisher)
+            .unwrap()
+            .owner = P1;
+        for id in runner.state().battlefield.clone() {
+            runner.state_mut().objects.get_mut(&id).unwrap().tapped = false;
+        }
+        fx::give_turn(runner.state_mut(), P0);
+        fx::begin_cast(&mut runner, spell);
+        let state = runner.state();
+        let score = |id| score_at(state, &fx::choose(id), ROOT);
+        let (t_score, banisher, stolen_score, stolen_banisher_score) = (
+            score(t),
+            score(own_banisher),
+            score(stolen),
+            score(stolen_banisher),
+        );
+        eprintln!(
+            "[flicker U-H13] T={t_score} Banisher={banisher} stolen={stolen_score} stolen Banisher={stolen_banisher_score}"
+        );
+        assert!(banisher > t_score);
+        assert!(stolen_score > t_score);
+        assert!(stolen_banisher_score > t_score);
+    }
+
+    // U-H14 (B6): the activation and target vetoes fire on a flicker whose
+    // own targets are tokens (CR 111.8) or control-losing returns (CR 110.2a).
+    #[test]
+    fn flicker_vetoes_fire_on_tokens_and_control_loss() {
+        let smuggler_board = |own: Option<&str>| {
+            let mut scenario = fx::scenario();
+            fx::lands(&mut scenario, P0, ManaColor::Blue, 4);
+            let t = fx::token_body(&mut scenario, P0);
+            match own {
+                Some("V") => {
+                    fx::giant(&mut scenario, P0);
+                }
+                Some(_) => {
+                    fx::visionary(&mut scenario, P0);
+                }
+                None => {}
+            }
+            let source = smuggler(&mut scenario);
+            let mut runner = scenario.build();
+            mark_token(&mut runner, t);
+            let action = fx::activate_action(runner.state(), source);
+            (runner, action)
+        };
+        let (runner, action) = smuggler_board(None);
+        let verdict = verdict_at(runner.state(), &action, ROOT);
+        print("U-H14", "Nephalia Smuggler, only own T", &verdict, None);
+        assert_eq!(
+            reject_kind(&verdict),
+            Some("anti_self_harm_harmful_activation_own_board_only")
+        );
+        // Reach guard: with own V the own-board veto stands down (V
+        // re-enters); the no-value check then vetoes the vanilla re-entry.
+        let (runner, action) = smuggler_board(Some("V"));
+        let verdict = verdict_at(runner.state(), &action, ROOT);
+        print("U-H14", "Nephalia Smuggler, own T and V", &verdict, None);
+        assert_ne!(
+            reject_kind(&verdict),
+            Some("anti_self_harm_harmful_activation_own_board_only")
+        );
+        let (runner, action) = smuggler_board(Some("E"));
+        let verdict = verdict_at(runner.state(), &action, ROOT);
+        print("U-H14", "Nephalia Smuggler, own T and E", &verdict, None);
+        assert!(reject_kind(&verdict).is_none());
+
+        // Eldrazi Displacer with only own T and a stolen creature.
+        let mut scenario = fx::scenario();
+        let t = fx::token_body(&mut scenario, P0);
+        scenario
+            .add_creature(P1, "Stolen Bear", 2, 2)
+            .controlled_by(P0);
+        let source = displacer(&mut scenario);
+        let mut runner = scenario.build();
+        mark_token(&mut runner, t);
+        let action = fx::activate_action(runner.state(), source);
+        let verdict = verdict_at(runner.state(), &action, ROOT);
+        print(
+            "U-H14",
+            "Eldrazi Displacer, own T and stolen",
+            &verdict,
+            None,
+        );
+        assert_eq!(
+            reject_kind(&verdict),
+            Some("anti_self_harm_harmful_activation_own_board_only")
+        );
+
+        // Eldrazi Displacer's target slot: own T with an opposing creature
+        // legal.
+        let mut scenario = fx::scenario();
+        let t = fx::token_body(&mut scenario, P0);
+        scenario.add_creature(P1, "Opposing Bear", 2, 2);
+        let source = displacer(&mut scenario);
+        let mut runner = scenario.build();
+        mark_token(&mut runner, t);
+        let index = fx::exile_ability_index(runner.state(), source);
+        fx::begin_activation(&mut runner, source, index);
+        let verdict = verdict_at(runner.state(), &fx::choose(t), ROOT);
+        print("U-H14", "Eldrazi Displacer -> own T", &verdict, None);
+        assert!(reject_kind(&verdict).is_some());
+    }
+
+    fn aetherling_board(threat: bool) -> (GameRunner, GameAction) {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::Blue, 1);
+        fx::giant(&mut scenario, P0);
+        let aetherling = fx::creature(&mut scenario, P0, "Aetherling", 4, 5, &[], fx::AETHERLING);
+        let murder = threat.then(|| opposing_murder(&mut scenario));
+        let mut runner = scenario.build();
+        if let Some(murder) = murder {
+            fx::opponent_casts(&mut runner, murder, Some(TargetRef::Object(aetherling)));
+        }
+        let action = fx::activate_action(runner.state(), aetherling);
+        (runner, action)
+    }
+
+    /// Nicol Bolas, the Ravager with his back face (Nicol Bolas, the Arisen)
+    /// attached, and the mana for his transform activation.
+    fn nicol_bolas_board(shroud: bool) -> (GameRunner, GameAction) {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::Blue, 3);
+        fx::lands(&mut scenario, P0, ManaColor::Black, 2);
+        fx::lands(&mut scenario, P0, ManaColor::Red, 2);
+        let bolas = fx::creature(
+            &mut scenario,
+            P0,
+            "Nicol Bolas, the Ravager",
+            4,
+            4,
+            fx::FLYING,
+            fx::NICOL_BOLAS,
+        );
+        let mut runner = scenario.build();
+        let object = runner.state_mut().objects.get_mut(&bolas).unwrap();
+        object.back_face = Some(BackFaceData {
+            name: "Nicol Bolas, the Arisen".to_string(),
+            loyalty: Some(7),
+            card_types: CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Planeswalker],
+                subtypes: vec!["Bolas".to_string()],
+            },
+            layout_kind: Some(LayoutKind::Transform),
+            ..BackFaceData::default()
+        });
+        if shroud {
+            object.keywords.push(Keyword::Shroud);
+        }
+        let action = fx::activate_action(runner.state(), bolas);
+        (runner, action)
+    }
+
+    // U-H15 (F1): a mana-cost self-blink is no-value checked through its
+    // source; a rescue and an altered return are gain.
+    #[test]
+    fn self_blink_activation_reads_rescue_transform_and_no_value() {
+        let (runner, action) = aetherling_board(false);
+        let root = verdict_at(runner.state(), &action, ROOT);
+        let lookahead = verdict_at(runner.state(), &action, LOOKAHEAD);
+        let lookahead_score = score_at(runner.state(), &action, LOOKAHEAD);
+        print("U-H15", "(a) Aetherling root", &root, None);
+        print(
+            "U-H15",
+            "(a) Aetherling lookahead",
+            &lookahead,
+            Some(lookahead_score),
+        );
+        assert!(gate_vetoes_no_value(runner.state(), &action));
+        assert!(reject_kind(&root).is_none());
+        assert!(reject_kind(&lookahead).is_none());
+        assert_eq!(lookahead_score, 0.0);
+
+        let (runner, action) = aetherling_board(true);
+        let rescue = verdict_at(runner.state(), &action, ROOT);
+        let rescue_score = score_at(runner.state(), &action, ROOT);
+        print(
+            "U-H15",
+            "(b) Aetherling under Murder",
+            &rescue,
+            Some(rescue_score),
+        );
+        assert!(reject_kind(&rescue).is_none());
+        assert_eq!(rescue_score, 0.0);
+
+        for (label, shroud) in [
+            ("(c) Nicol Bolas", false),
+            ("(d) Nicol Bolas with shroud", true),
+        ] {
+            let (runner, action) = nicol_bolas_board(shroud);
+            let verdict = verdict_at(runner.state(), &action, ROOT);
+            let score = score_at(runner.state(), &action, ROOT);
+            print("U-H15", label, &verdict, Some(score));
+            assert!(reject_kind(&verdict).is_none(), "{label}");
+            assert_eq!(score, 0.0, "{label}");
+            assert_eq!(fact(&verdict, "flicker_no_value_check"), Some(1), "{label}");
+        }
+    }
+
+    fn fleeting_spirit_board(threat: bool) -> (GameRunner, GameAction) {
+        let mut scenario = fx::scenario();
+        scenario.add_card_to_hand(P0, "Spare Card");
+        let spirit = fx::creature(
+            &mut scenario,
+            P0,
+            "Fleeting Spirit",
+            3,
+            1,
+            &[],
+            fx::FLEETING_SPIRIT,
+        );
+        let murder = threat.then(|| opposing_murder(&mut scenario));
+        let mut runner = scenario.build();
+        if let Some(murder) = murder {
+            fx::opponent_casts(&mut runner, murder, Some(TargetRef::Object(spirit)));
+        }
+        let action = fx::activate_action(runner.state(), spirit);
+        (runner, action)
+    }
+
+    // U-H16 (F1): a self-blink whose cost is its own consequence (a discard)
+    // is priced by the cost policy, not vetoed by this one.
+    #[test]
+    fn cost_priced_self_blink_verdict_follows_the_cost_policy() {
+        for (label, threat) in [("(a) no threat", false), ("(b) Murder on it", true)] {
+            let (runner, action) = fleeting_spirit_board(threat);
+            let state = runner.state();
+            let anti = verdict_at(state, &action, ROOT);
+            let anti_score = score_at(state, &action, ROOT);
+            let cost = registry_verdict_of(state, &action, PolicyId::SelfCostValue)
+                .expect("SelfCostValuePolicy scores the activation");
+            let registry = registry_score_at(state, &action, ROOT);
+            print(
+                "U-H16",
+                &format!("{label} AntiSelfHarm"),
+                &anti,
+                Some(anti_score),
+            );
+            print(
+                "U-H16",
+                &format!("{label} SelfCostValue"),
+                &cost,
+                Some(registry),
+            );
+            assert!(reject_kind(&anti).is_none(), "{label}");
+            assert_eq!(anti_score, 0.0, "{label}");
+            if threat {
+                assert!(reject_kind(&cost).is_none());
+                assert_eq!(reason_of(&cost).kind, "self_cost_benefit_present");
+                assert!(registry.is_finite());
+            } else {
+                assert_eq!(reject_kind(&cost), Some("self_cost_trivial_benefit"));
+                assert_eq!(registry, f64::NEG_INFINITY);
+            }
+        }
+    }
+
+    // U-H17 (F1): a return that alters the permanent (CR 122.6: with a
+    // counter) is the flicker's own gain.
+    #[test]
+    fn altered_return_is_the_flickers_own_gain() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 2);
+        fx::lands(&mut scenario, P0, ManaColor::Green, 1);
+        fx::lands(&mut scenario, P0, ManaColor::Blue, 1);
+        fx::giant(&mut scenario, P0);
+        let daydream = fx::spell_in_hand(
+            &mut scenario,
+            P0,
+            "Daydream",
+            false,
+            fx::DAYDREAM_KEYWORDS,
+            fx::DAYDREAM,
+            fx::cost(&[ManaCostShard::White], 0),
+        );
+        let mentor = fx::creature(
+            &mut scenario,
+            P0,
+            "Lilysplash Mentor",
+            4,
+            4,
+            fx::LILYSPLASH_MENTOR_KEYWORDS,
+            fx::LILYSPLASH_MENTOR,
+        );
+        let reach = blink(&mut scenario);
+        let runner = scenario.build();
+        let state = runner.state();
+        for (label, action) in [
+            ("Daydream", fx::cast_action(state, daydream)),
+            ("Lilysplash Mentor", fx::activate_action(state, mentor)),
+        ] {
+            let gate = fx::gate_passes(state, &action);
+            let verdict = verdict_at(state, &action, ROOT);
+            let score = score_at(state, &action, ROOT);
+            print("U-H17", label, &verdict, Some(score));
+            eprintln!("[flicker U-H17] {label} gate passes = {gate}");
+            assert!(gate, "{label}");
+            assert!(reject_kind(&verdict).is_none(), "{label}");
+            assert_eq!(score, 0.0, "{label}");
+        }
+        assert!(gate_vetoes_no_value(state, &fx::cast_action(state, reach)));
     }
 }

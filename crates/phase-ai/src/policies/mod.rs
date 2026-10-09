@@ -2,7 +2,7 @@ pub(crate) mod activation;
 pub mod activation_patience;
 mod aggro_pressure;
 mod anthem_priority;
-mod anti_self_harm;
+pub(crate) mod anti_self_harm;
 mod blight_value;
 mod board_development;
 mod board_wipe_telegraph;

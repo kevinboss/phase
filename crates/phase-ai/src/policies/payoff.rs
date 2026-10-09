@@ -24,7 +24,7 @@ use engine::types::player::PlayerId;
 
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
-use crate::ability_chain::collect_chain_effects;
+use crate::ability_chain::{collect_chain_effects, AbilityScope};
 use crate::config::PolicyPenalties;
 use crate::features::DeckFeatures;
 
@@ -371,14 +371,17 @@ fn blink_activation(features: &DeckFeatures) -> Option<f32> {
 // CR 603.7: deploying the flicker engine.
 fn matches_blink_flicker(object: &GameObject) -> bool {
     object.abilities.iter().any(|ability| {
-        crate::features::blink::effects_include_flicker(&collect_chain_effects(ability))
+        crate::features::blink::ability_is_flicker_engine(ability, AbilityScope::Unconditional)
     }) || object
         .trigger_definitions
         .iter_unchecked()
         .map(|entry| &entry.definition)
         .any(|trigger| {
             trigger.execute.as_deref().is_some_and(|execute| {
-                crate::features::blink::effects_include_flicker(&collect_chain_effects(execute))
+                crate::features::blink::ability_is_flicker_engine(
+                    execute,
+                    AbilityScope::Unconditional,
+                )
             })
         })
 }

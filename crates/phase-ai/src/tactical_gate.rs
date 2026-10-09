@@ -47,14 +47,19 @@ use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 use std::ops::ControlFlow;
 
+use crate::ability_chain::{ChainNode, ExileSubject};
 use crate::cast_facts::CastCostMode;
 use crate::combat_ai::is_lethal_attack_available;
 use crate::config::AiConfig;
 use crate::context::AiContext;
 use crate::planner::PreparedCandidate;
+use crate::policies::anti_self_harm::{
+    flicker_no_value_gate_reject, legal_targets_offer_flicker_gain,
+};
 use crate::policies::context::{collect_ability_effects, PolicyContext};
 use crate::policies::effect_classify::{
-    effect_polarity, extract_target_filter, targets_creatures_only, EffectPolarity,
+    effect_polarity, extract_target_filter, flicker_reading_for_target, targets_creatures_only,
+    EffectPolarity,
 };
 use crate::policies::stack_awareness::{has_pending_removal, will_target_die_from_stack};
 use crate::policies::strategy_helpers::can_pay_ward_cost;
@@ -339,7 +344,8 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    let effects = ctx.effects();
+    let nodes = ctx.effect_nodes();
+    let effects: Vec<&Effect> = nodes.iter().map(|node| node.effect()).collect();
     if effects.is_empty() {
         return GateDecision::Allow;
     }
@@ -357,7 +363,23 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    if is_redundant_creature_only_removal(ctx, &effects) {
+    if is_redundant_creature_only_removal(ctx, &nodes) {
+        return GateDecision::Reject;
+    }
+
+    // R1.9: an own flicker whose legal targets offer no value is not taken.
+    // Where base's redundancy path or own-board activation veto excluded the
+    // candidate from search, this removes it here too, so search never
+    // simulates it. The rejection is reported on the decision-trace target
+    // with the no-value check's typed outcome.
+    if let Some(outcome) = flicker_no_value_gate_reject(ctx) {
+        tracing::debug!(
+            target: "phase_ai::decision_trace",
+            gate_reject = "flicker_no_value",
+            flicker_no_value_check = outcome.trace_code(),
+            action = ?ctx.candidate.action,
+            "tactical gate reject"
+        );
         return GateDecision::Reject;
     }
 
@@ -1247,9 +1269,15 @@ fn target_choice_penalty(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
         }
     }
 
-    let harmful = effects
-        .iter()
-        .any(|effect| matches!(effect_polarity(effect), EffectPolarity::Harmful));
+    // CR 608.2b + CR 400.7: a flicker answers a pending removal instead of
+    // duplicating it, so a flicker target is read per target (its re-entry
+    // is not harm); any other target keeps the effect-level reading.
+    let harmful = match flicker_reading_for_target(ctx, *object_id) {
+        Some(outcome) => outcome.polarity() == EffectPolarity::Harmful,
+        None => effects
+            .iter()
+            .any(|effect| matches!(effect_polarity(effect), EffectPolarity::Harmful)),
+    };
     if harmful
         && has_pending_removal(ctx.state, *object_id)
         && will_target_die_from_stack(ctx.state, *object_id)
@@ -1260,7 +1288,7 @@ fn target_choice_penalty(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
     }
 }
 
-fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
+fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, nodes: &[ChainNode<'_>]) -> bool {
     // The source supplies the targeting quality (color/type) the engine needs
     // to evaluate Protection / HexproofFrom; without it, fail open.
     let Some(source) = ctx.source_object() else {
@@ -1278,10 +1306,18 @@ fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effec
     }
 
     let mut saw_creature_only_harm = false;
-    for effect in effects {
+    for node in nodes {
+        let effect = node.effect();
         if !(matches!(effect_polarity(effect), EffectPolarity::Harmful)
             && targets_creatures_only(effect))
         {
+            continue;
+        }
+        let flicker = node.flicker_pair();
+        // CR 400.7: an own flicker leg re-enters its permanent; it is not
+        // removal, redundant or otherwise (its no-value case is
+        // `AntiSelfHarmPolicy`'s).
+        if flicker.as_ref().is_some_and(|pair| pair.subject.is_own()) {
             continue;
         }
         saw_creature_only_harm = true;
@@ -1292,13 +1328,21 @@ fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effec
         // CR 702.11/702.16/702.18 + CR 608.2b: defer targeting legality to the
         // engine (Shroud, Hexproof-vs-opponents, "Hexproof from [quality]",
         // Protection, ignore-hexproof) instead of re-checking keywords here.
-        let has_live_opponent_target =
-            ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
-                // A target already dying to a stack effect is not a reason to
-                // keep this redundant removal.
-                !will_target_die_from_stack(ctx.state, id)
-            });
+        let targets = ctx.legal_targets(filter, source.id);
+        let has_live_opponent_target = ctx.any_legal_opponent_creature(&targets, |id| {
+            // A target already dying to a stack effect is not a reason to
+            // keep this redundant removal.
+            !will_target_die_from_stack(ctx.state, id)
+        });
         if has_live_opponent_target {
+            return false;
+        }
+        // CR 400.7 + CR 603.6a: an unscoped flicker aimed at an own permanent
+        // whose re-entry gains is the play, not redundant removal.
+        if flicker.as_ref().is_some_and(|pair| {
+            pair.subject == ExileSubject::Filtered(None)
+                && legal_targets_offer_flicker_gain(ctx, &targets, pair)
+        }) {
             return false;
         }
     }
@@ -8331,5 +8375,279 @@ mod tests {
 
         assert_parses_as_temporary_pump(state, dragon);
         assert_eq!(gate_activation(state, dragon), GateDecision::Reject);
+    }
+}
+
+/// Phase-1 flicker rows U-G1–U-G4: the tactical pre-filter reads an own
+/// flicker leg as re-entry (CR 400.7), not as redundant removal.
+#[cfg(test)]
+mod flicker_rows {
+    use engine::game::combat::{AttackerInfo, CombatState};
+    use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use engine::types::identifiers::ObjectId;
+    use engine::types::mana::{ManaColor, ManaCostShard};
+
+    use super::*;
+    use crate::policies::context::flicker_fixtures as fx;
+    use crate::policies::context::SearchDepth;
+
+    /// The gate's reading of `action`, with the context the production gate
+    /// builds (`gate_prepared_candidates`: no cast facts, root).
+    fn gate(state: &GameState, action: &GameAction) -> GateDecision {
+        let probe = fx::Probe::new(state, action);
+        let mut ctx = probe.ctx(state, SearchDepth::Root);
+        ctx.cast_facts = None;
+        assess_candidate(&ctx)
+    }
+
+    fn penalty(state: &GameState, action: &GameAction, target: ObjectId) -> f64 {
+        let probe = fx::Probe::new(state, action);
+        target_choice_penalty(
+            &probe.ctx(state, SearchDepth::Root),
+            &TargetRef::Object(target),
+        )
+    }
+
+    fn own_flicker(scenario: &mut GameScenario, name: &str) -> ObjectId {
+        let (keywords, oracle): (&[&str], &str) = match name {
+            "Momentary Blink" => (fx::MOMENTARY_BLINK_KEYWORDS, fx::MOMENTARY_BLINK),
+            "Ephemerate" => (fx::EPHEMERATE_KEYWORDS, fx::EPHEMERATE),
+            _ => (&[], fx::CLOUDSHIFT),
+        };
+        fx::spell_in_hand(
+            scenario,
+            P0,
+            name,
+            true,
+            keywords,
+            oracle,
+            fx::cost(&[ManaCostShard::White], 1),
+        )
+    }
+
+    // U-G1 (R1.1, R1.2): base's redundancy path no longer reads an own
+    // flicker leg as removal (CR 400.7). With a value target the candidate
+    // passes the gate; with only vanilla targets the gate removes it through
+    // R1.9's no-value veto (orchestrator decision amending plan r9), a reason
+    // distinct from the redundancy path.
+    #[test]
+    fn own_flicker_cast_and_activation_pass_the_redundancy_gate() {
+        use crate::policies::anti_self_harm::{
+            flicker_no_value_gate_reject, FlickerCheckOutcome, OwnLegShape,
+        };
+        for with_etb in [true, false] {
+            let mut scenario = fx::scenario();
+            fx::lands(&mut scenario, P0, ManaColor::White, 2);
+            fx::lands(&mut scenario, P0, ManaColor::Blue, 4);
+            fx::giant(&mut scenario, P0);
+            if with_etb {
+                fx::visionary(&mut scenario, P0);
+            }
+            let spells: Vec<(&str, ObjectId)> = ["Momentary Blink", "Ephemerate", "Cloudshift"]
+                .into_iter()
+                .map(|name| (name, own_flicker(&mut scenario, name)))
+                .collect();
+            let smuggler = fx::creature(
+                &mut scenario,
+                P0,
+                "Nephalia Smuggler",
+                1,
+                1,
+                &[],
+                fx::NEPHALIA_SMUGGLER,
+            );
+            let runner = scenario.build();
+            let state = runner.state();
+            let mut actions: Vec<(&str, GameAction)> = spells
+                .iter()
+                .map(|(name, id)| (*name, fx::cast_action(state, *id)))
+                .collect();
+            actions.push(("Nephalia Smuggler", fx::activate_action(state, smuggler)));
+            for (name, action) in actions {
+                let probe = fx::Probe::new(state, &action);
+                let mut ctx = probe.ctx(state, SearchDepth::Root);
+                ctx.cast_facts = None;
+                let redundant = is_redundant_creature_only_removal(&ctx, &ctx.effect_nodes());
+                let no_value = flicker_no_value_gate_reject(&ctx);
+                let reading = assess_candidate(&ctx);
+                eprintln!(
+                    "[flicker U-G1] {name}, own E = {with_etb}: gate={reading:?} redundant={redundant} no_value={no_value:?}"
+                );
+                assert!(!redundant, "{name}");
+                if with_etb {
+                    assert_ne!(reading, GateDecision::Reject, "{name}");
+                    assert_eq!(no_value, None, "{name}");
+                } else {
+                    assert_eq!(reading, GateDecision::Reject, "{name}");
+                    assert_eq!(
+                        no_value,
+                        Some(FlickerCheckOutcome::NoValue(OwnLegShape::ExcludedAtBase)),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    // U-G2 (preservation): an opponent-scoped flicker whose only target is
+    // already dying stays redundant.
+    #[test]
+    fn opponent_scoped_flicker_with_dying_target_stays_redundant() {
+        for dying in [true, false] {
+            let mut scenario = fx::scenario();
+            fx::lands(&mut scenario, P0, ManaColor::Black, 4);
+            fx::lands(&mut scenario, P0, ManaColor::White, 4);
+            let maze = scenario
+                .add_land_from_oracle(P0, "Mystifying Maze", fx::MYSTIFYING_MAZE)
+                .id();
+            let attacker = fx::giant(&mut scenario, P1);
+            let murder = fx::spell_in_hand(
+                &mut scenario,
+                P0,
+                "Murder",
+                true,
+                &[],
+                fx::MURDER,
+                fx::cost(&[ManaCostShard::Black, ManaCostShard::Black], 1),
+            );
+            let mut runner = scenario.build();
+            {
+                let state = runner.state_mut();
+                state.phase = Phase::DeclareBlockers;
+                state.active_player = P1;
+                state.priority_player = P0;
+                state.waiting_for = WaitingFor::Priority { player: P0 };
+                state.combat = Some(CombatState {
+                    attackers: vec![AttackerInfo::attacking_player(attacker, P0)],
+                    ..Default::default()
+                });
+            }
+            if dying {
+                let _ = runner.cast(murder).target_object(attacker).commit();
+                fx::pass_until_priority(&mut runner, P0);
+                // The auto-payment may tap the Maze for Murder's generic mana;
+                // untap it so its own activation is offered.
+                runner.state_mut().objects.get_mut(&maze).unwrap().tapped = false;
+            }
+            let state = runner.state();
+            let reading = gate(state, &fx::activate_action(state, maze));
+            eprintln!("[flicker U-G2] Mystifying Maze, attacker dying = {dying}: {reading:?}");
+            if dying {
+                assert_eq!(reading, GateDecision::Reject);
+            } else {
+                assert_ne!(reading, GateDecision::Reject);
+            }
+        }
+    }
+
+    // U-G3 (R1.4 seam): a flicker answers a pending removal instead of
+    // duplicating it (CR 608.2b + CR 400.7).
+    #[test]
+    fn flicker_target_is_not_penalized_as_redundant_removal() {
+        let mut scenario = fx::scenario();
+        fx::lands(&mut scenario, P0, ManaColor::White, 2);
+        fx::lands(&mut scenario, P0, ManaColor::Black, 3);
+        fx::lands(&mut scenario, P1, ManaColor::Black, 3);
+        let v = fx::giant(&mut scenario, P0);
+        // A second own creature, so each cast stops at its target prompt.
+        fx::bears(&mut scenario, P0);
+        let blink = own_flicker(&mut scenario, "Momentary Blink");
+        let own_murder = fx::spell_in_hand(
+            &mut scenario,
+            P0,
+            "Murder",
+            true,
+            &[],
+            fx::MURDER,
+            fx::cost(&[ManaCostShard::Black, ManaCostShard::Black], 1),
+        );
+        let opposing_murder = fx::spell_in_hand(
+            &mut scenario,
+            P1,
+            "Murder",
+            true,
+            &[],
+            fx::MURDER,
+            fx::cost(&[ManaCostShard::Black, ManaCostShard::Black], 1),
+        );
+        let mut runner = scenario.build();
+        fx::opponent_casts(&mut runner, opposing_murder, Some(TargetRef::Object(v)));
+        let mut murder_runner = GameRunner::from_state(runner.state().clone());
+        fx::begin_cast(&mut runner, blink);
+        let flicker = penalty(runner.state(), &fx::choose(v), v);
+        fx::begin_cast(&mut murder_runner, own_murder);
+        let duplicate = penalty(murder_runner.state(), &fx::choose(v), v);
+        eprintln!("[flicker U-G3] Blink -> V: {flicker}; Murder -> V: {duplicate}");
+        assert_eq!(flicker, 0.0);
+        assert_eq!(duplicate, -10.0);
+    }
+
+    // U-G4 (B4, R1.2a): an unscoped flicker aimed at an own value-ETB
+    // permanent is the play, not redundant removal (CR 400.7 + CR 603.6a).
+    #[test]
+    fn unscoped_flicker_with_value_target_passes_the_redundancy_gate() {
+        for (with_etb, cards) in [
+            (
+                true,
+                &["Turn to Mist", "Otherworldly Journey", "Eldrazi Displacer"][..],
+            ),
+            (false, &["Turn to Mist", "Eldrazi Displacer"][..]),
+        ] {
+            for card in cards {
+                let mut scenario = fx::scenario();
+                fx::lands(&mut scenario, P0, ManaColor::White, 2);
+                if with_etb {
+                    fx::visionary(&mut scenario, P0);
+                } else {
+                    fx::giant(&mut scenario, P0);
+                }
+                let source = match *card {
+                    "Turn to Mist" => fx::spell_in_hand(
+                        &mut scenario,
+                        P0,
+                        "Turn to Mist",
+                        true,
+                        &[],
+                        fx::TURN_TO_MIST,
+                        fx::cost(&[ManaCostShard::WhiteBlue], 1),
+                    ),
+                    "Otherworldly Journey" => fx::spell_in_hand(
+                        &mut scenario,
+                        P0,
+                        "Otherworldly Journey",
+                        true,
+                        &[],
+                        fx::OTHERWORLDLY_JOURNEY,
+                        fx::cost(&[ManaCostShard::White], 1),
+                    ),
+                    _ => {
+                        scenario.add_land_from_oracle(P0, "Wastes", fx::WASTES);
+                        fx::creature(
+                            &mut scenario,
+                            P0,
+                            "Eldrazi Displacer",
+                            3,
+                            3,
+                            fx::ELDRAZI_DISPLACER_KEYWORDS,
+                            fx::ELDRAZI_DISPLACER,
+                        )
+                    }
+                };
+                let runner = scenario.build();
+                let state = runner.state();
+                let action = if *card == "Eldrazi Displacer" {
+                    fx::activate_action(state, source)
+                } else {
+                    fx::cast_action(state, source)
+                };
+                let reading = gate(state, &action);
+                eprintln!("[flicker U-G4] {card}, own E = {with_etb}: {reading:?}");
+                if with_etb {
+                    assert_ne!(reading, GateDecision::Reject, "{card}");
+                } else {
+                    assert_eq!(reading, GateDecision::Reject, "{card}");
+                }
+            }
+        }
     }
 }

@@ -3,21 +3,22 @@
 //!
 //! Parser AST verification — VERIFIED (no parser remediation required; every
 //! axis classifies from the existing typed AST, never by card name):
-//! - Flicker enabler: an ability/trigger effect chain that BOTH exiles a
-//!   friendly permanent AND returns it to the battlefield in the same chain.
-//!   Real flicker cards parse as a two-step `ChangeZone` chain — Ephemerate
-//!   (`card-data.json`) is
+//! - Flicker enabler: an ability/trigger chain whose exile leg moves a
+//!   permanent from the battlefield (CR 701.13a) and is paired, along that
+//!   leg's own `sub_ability` links, with a return of the exiled card to the
+//!   battlefield — immediate (Ephemerate:
 //!   `ChangeZone { destination: Exile, target: Typed(Creature, controller: You) }`
-//!   followed by a `sub_ability`
-//!   `ChangeZone { destination: Battlefield, target: TrackedSet { .. } }`.
-//!   `crate::ability_chain::collect_chain_effects` flattens the `sub_ability`
-//!   chain, so both steps land in one slice. CR 603.7 (the tracked set is the
-//!   "it"/"that card" anaphor referring back to the exiled object) + CR 110.1
-//!   (the returned card becomes a new permanent as it re-enters). The
-//!   battlefield-return step targets a `TrackedSet`/`TrackedSetFiltered`, which
-//!   is what distinguishes a flicker-return from a graveyard reanimation
-//!   (`origin: Graveyard, target: Typed(Creature)`, the reanimator axis) and
-//!   from a one-way removal exile (no return step at all).
+//!   followed by `ChangeZone { destination: Battlefield, target: TrackedSet }`)
+//!   or through a delayed trigger at the beginning of the next end step
+//!   (CR 603.7: Guardian of Ghirapur, Flickerwisp, Fleeting Spirit). The
+//!   pairing is the single flicker authority
+//!   [`crate::ability_chain::ChainNode::flicker_pair`]. The return names the
+//!   exiled card through the tracked-set / parent-target anaphor, which is
+//!   what distinguishes a flicker-return from a graveyard reanimation and from
+//!   a one-way removal exile. Deck-time detection walks every branch a card
+//!   can take (`AbilityScope::Potential`), so a modal blink mode (CR 700.2:
+//!   Kykar, Zephyr Awakener) counts; an exile from a hand, library or
+//!   graveyard (Rona, Tolarian Obliterator) does not.
 //! - ETB-value payoff: a creature whose `TriggerMode::ChangesZone` trigger fires
 //!   on itself or a friendly creature entering the battlefield (CR 603.6a) and
 //!   whose executed chain produces card-advantage / board / removal value worth
@@ -32,14 +33,17 @@
 //! is payoff-gated so non-blink decks (and the general `etb_value` scoring) are
 //! unaffected.
 
+use engine::game::game_object::GameObject;
 use engine::game::DeckEntry;
-use engine::types::ability::{ControllerRef, Effect, TargetFilter, TriggerDefinition, TypeFilter};
+use engine::types::ability::{
+    AbilityDefinition, ControllerRef, Effect, TargetFilter, TriggerDefinition, TypeFilter,
+};
 use engine::types::card::CardFace;
 use engine::types::card_type::CoreType;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
-use crate::ability_chain::collect_chain_effects;
+use crate::ability_chain::{collect_chain_effects, visit_scoped_nodes, AbilityScope, ChainNode};
 use crate::features::commitment;
 
 /// Commitment floor below which `BlinkPayoffPolicy` opts out. Matches the
@@ -66,8 +70,10 @@ const ETB_PAYOFF_FULL_DENSITY: f32 = 12.0;
 /// casting value-ETB creatures when the deck is blink-committed.
 #[derive(Debug, Clone, Default)]
 pub struct BlinkFeature {
-    /// Cards whose effect chain exiles a friendly permanent and immediately
-    /// returns it to the battlefield (CR 603.7 + CR 110.1). The flicker engine.
+    /// Cards with a chain that exiles a friendly or unscoped permanent from
+    /// the battlefield and returns it — immediately, or through a delayed
+    /// trigger at the beginning of a later step (CR 603.7) — in any branch or
+    /// mode the card can take (CR 700.2). The flicker engine.
     pub flicker_count: u32,
     /// Value-ETB creatures — a `ChangesZone`→battlefield self/friendly trigger
     /// producing card-advantage / board / removal value (CR 603.6a). The payoff
@@ -143,22 +149,23 @@ fn blink_commitment(flicker_count: u32, etb_payoff_count: u32, total_nonland: u3
 }
 
 /// True if this face is a flicker enabler — at least one of its ability or
-/// trigger effect chains BOTH exiles a friendly permanent AND returns it to
-/// the battlefield within that same chain. CR 603.7.
+/// trigger chains pairs an exile of a friendly or unscoped permanent with a
+/// return of the exiled card (CR 603.7), in any branch or mode the card can
+/// take.
 ///
-/// Each chain is checked in isolation so that two independent, unrelated
-/// abilities (e.g. one that exiles and one that puts something onto the
-/// battlefield for a different reason) cannot combine to produce a false
-/// positive.
+/// Deck-time detection asks "can this card ever flicker?", which is
+/// [`AbilityScope::Potential`]. Pairing is per-ability by construction, so two
+/// independent abilities (one that exiles and one that puts something onto
+/// the battlefield) cannot combine into a false positive.
 pub fn is_flicker_enabler(face: &CardFace) -> bool {
     face.abilities
         .iter()
-        .any(|ability| effects_include_flicker(&collect_chain_effects(ability)))
+        .any(|ability| ability_is_flicker_engine(ability, AbilityScope::Potential))
         || face.triggers.iter().any(|trigger| {
             trigger
                 .execute
                 .as_deref()
-                .is_some_and(|execute| effects_include_flicker(&collect_chain_effects(execute)))
+                .is_some_and(|execute| ability_is_flicker_engine(execute, AbilityScope::Potential))
         })
 }
 
@@ -169,13 +176,31 @@ pub fn is_etb_payoff(face: &CardFace) -> bool {
     face_is_creature(face) && face.triggers.iter().any(trigger_is_value_etb)
 }
 
-/// Single authority — true if the effect slice both exiles a friendly permanent
-/// AND returns the exiled object to the battlefield (the flicker signature).
-/// Shared by deck-time `CardFace` detection ([`is_flicker_enabler`]) and the
-/// live-game `BlinkPayoffPolicy` so the two never drift.
-pub(crate) fn effects_include_flicker(effects: &[&Effect]) -> bool {
-    effects.iter().copied().any(effect_is_friendly_exile)
-        && effects.iter().copied().any(effect_is_flicker_return)
+/// Parts predicate — true if some node of `ability`, walked at `scope`, starts
+/// a flicker (an exile leg paired with its return) whose subject is not
+/// opponent-scoped. An opponent-scoped exile is tempo, not a value flicker.
+/// Shared by deck-time detection ([`is_flicker_enabler`], `Potential`) and the
+/// live `BlinkPayoffPolicy` (`Unconditional`), which differ only in the scope
+/// they pass.
+pub(crate) fn ability_is_flicker_engine(ability: &AbilityDefinition, scope: AbilityScope) -> bool {
+    let mut found = false;
+    visit_scoped_nodes(ability, scope, &mut |node| {
+        found = found
+            || ChainNode::Definition(node)
+                .flicker_pair()
+                .is_some_and(|pair| !pair.subject.is_opponent_scoped());
+    });
+    found
+}
+
+/// CR 603.6a: true if `object` has a self/friendly value ETB — the payoff a
+/// flicker re-uses.
+pub(crate) fn object_has_value_etb(object: &GameObject) -> bool {
+    object
+        .trigger_definitions
+        .iter_unchecked()
+        .map(|entry| &entry.definition)
+        .any(trigger_is_value_etb)
 }
 
 /// Single authority — true if this trigger is a self/friendly value ETB. Shared
@@ -204,44 +229,6 @@ pub(crate) fn trigger_is_value_etb(trigger: &TriggerDefinition) -> bool {
             .copied()
             .any(effect_is_etb_value)
     })
-}
-
-/// CR 603.7 + CR 110.1: the exile half of a flicker — a `ChangeZone` to exile of
-/// a friendly (or unscoped) permanent. An opponent-scoped exile is removal/tempo
-/// disruption, not a value flicker, so it is rejected.
-fn effect_is_friendly_exile(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::ChangeZone {
-            destination: Zone::Exile,
-            target,
-            ..
-        } if target_is_not_opponent_scoped(target)
-    )
-}
-
-/// CR 603.7: the return half of a flicker — a `ChangeZone` to the battlefield
-/// referring back to the just-exiled object via one of the two anaphors real
-/// flicker cards use: a `TrackedSet`/`TrackedSetFiltered` (Ephemerate, Ghostly
-/// Flicker, Eldrazi Displacer) or the parent ability's target `ParentTarget`
-/// ("exile target creature you control, then return *that card*" — Cloudshift,
-/// Soulherder, Restoration Angel, Felidar Guardian, Conjurer's Closet).
-/// Referring back to the exiled object (rather than a `Typed` graveyard creature)
-/// is what separates a flicker-return from a reanimation; pairing it with the
-/// exile step (the `&&` in `effects_include_flicker`) is what separates it from a
-/// one-way "put a creature onto the battlefield" effect that reuses
-/// `ParentTarget`.
-fn effect_is_flicker_return(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::ChangeZone {
-            destination: Zone::Battlefield,
-            target: TargetFilter::TrackedSet { .. }
-                | TargetFilter::TrackedSetFiltered { .. }
-                | TargetFilter::ParentTarget,
-            ..
-        }
-    )
 }
 
 /// CR 603.6a: the trigger fires on the source itself entering (`SelfRef`, the
@@ -277,9 +264,9 @@ fn type_filter_is_creature(tf: &TypeFilter) -> bool {
     }
 }
 
-/// CR 608.2b: unwrap a flicker-exile target filter and report whether it is NOT
-/// opponent-scoped (i.e., a friendly or unscoped permanent the deck would blink
-/// for value). `And` rejects if any conjunct is opponent-scoped.
+/// Unwrap an ETB trigger's `valid_card` filter and report whether it is NOT
+/// opponent-scoped (a friendly or unscoped creature whose entering the deck
+/// re-uses). `And` rejects if any conjunct is opponent-scoped.
 fn target_is_not_opponent_scoped(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(typed) => !matches!(typed.controller, Some(ControllerRef::Opponent)),
