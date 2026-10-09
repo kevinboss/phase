@@ -3279,7 +3279,7 @@ fn teammate_murder_board() -> FlickerBoard {
     board
 }
 
-// R1.4 own/team (charter r9, rescue reading): Murder's "Destroy target
+// R1.4 own/team (rescue reading): Murder's "Destroy target
 // creature." fails on resolution once V has been flickered (CR 608.2b +
 // CR 400.7), whoever controls the Murder — so with the AI's own Murder (cast
 // by P0, which keeps priority, CR 117.3c) or its 2HG teammate's Murder on V,
@@ -3416,9 +3416,8 @@ fn no_value_board(spell: FlickerSpell, threat: Option<FlickerThreat>) -> Flicker
     )
 }
 
-/// The tactical pre-filter's decision-trace event for R1.9's veto
-/// (orchestrator decision amending plan r9): the no-value check's
-/// `NoValue(RemovedFromSearch)` outcome, code 2.
+/// The tactical pre-filter's decision-trace event for a no-value own flicker:
+/// the no-value check's `NoValue(RemovedFromSearch)` outcome, code 2.
 fn is_r1_9_gate_reject(line: &str, action: &GameAction) -> bool {
     line.contains("message=tactical gate reject")
         && line.contains(r#"gate_reject="flicker_no_value""#)
@@ -3515,7 +3514,7 @@ fn no_value_flicker_spell_stays_uncast_against_unanswerable_threats() {
     report_rows("R1.9 hostile", &failures);
 }
 
-// R1.9 recastable (charter r10): Momentary Blink (Flashback, CR 702.34a) and
+// R1.9 recastable: Momentary Blink (Flashback, CR 702.34a) and
 // Ephemerate (Rebound, CR 702.88a) on R1.9's four boards, with R1.9's
 // assertions — their no-value cast is vetoed like Cloudshift's.
 #[test]

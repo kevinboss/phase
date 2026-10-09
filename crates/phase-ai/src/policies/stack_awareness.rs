@@ -1087,7 +1087,8 @@ mod flicker_rows {
         (source, v)
     }
 
-    // U-S1 (r6, charter r9).
+    // U-S1: a removal counts whoever controls it; an exile-and-return that
+    // brings the object back does not.
     #[test]
     fn pending_removal_reads_the_rescue_reading() {
         let rows: Vec<(&str, bool, bool)> = vec![

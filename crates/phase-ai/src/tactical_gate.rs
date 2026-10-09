@@ -8426,8 +8426,8 @@ mod flicker_rows {
     // U-G1 (R1.1, R1.2): base's redundancy path no longer reads an own
     // flicker leg as removal (CR 400.7). With a value target the candidate
     // passes the gate; with only vanilla targets the gate removes it through
-    // R1.9's no-value veto (orchestrator decision amending plan r9), a reason
-    // distinct from the redundancy path.
+    // the no-value check (`flicker_no_value_gate_reject`), a reason distinct
+    // from the redundancy path.
     #[test]
     fn own_flicker_cast_and_activation_pass_the_redundancy_gate() {
         use crate::policies::anti_self_harm::{

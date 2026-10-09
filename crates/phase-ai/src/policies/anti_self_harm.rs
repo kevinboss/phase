@@ -1034,17 +1034,18 @@ pub(crate) fn flicker_no_value_gate_reject(ctx: &PolicyContext<'_>) -> Option<Fl
 /// CR 601.2h + CR 602.2b + CR 606.4: the cost is paid as part of activating.
 /// A loyalty ability's cost changes its permanent's loyalty, and that change
 /// can be the play whatever the flicker gains, so the no-value check stands
-/// down for it. Any other cost (mana, tap, a discard, a sacrifice, life) buys
-/// only the flicker, so a flicker with no gain wastes it. Read through the
-/// single cost authority (`AbilityDefinition::cost_categories`); a cost with
-/// no category (an effect cost without counters, an unimplemented cost) cannot
-/// be read, so the check stands down for it too.
+/// down for it. Every other cost (mana, tap, a discard, life, or a cost the
+/// single cost authority `AbilityDefinition::cost_categories` cannot classify)
+/// is checked: a flicker with no gain wastes it. A sacrifice cost is not
+/// treated as the play here either; whatever the sacrifice itself is worth
+/// (sacrificing a creature a pending removal targets, a dies trigger) is the
+/// cost policies' to price.
 fn cost_is_its_own_play(ability: &AbilityDefinition) -> bool {
-    if ability.cost.is_none() {
-        return false;
-    }
-    let categories = ability.cost_categories();
-    categories.is_empty() || categories.iter().any(|c| category_is_its_own_play(*c))
+    ability.cost.is_some()
+        && ability
+            .cost_categories()
+            .iter()
+            .any(|c| category_is_its_own_play(*c))
 }
 
 fn category_is_its_own_play(category: CostCategory) -> bool {
@@ -10510,6 +10511,75 @@ mod flicker_rows {
             assert_eq!(score, 0.0, "{label}");
             assert_eq!(fact(&verdict, "flicker_no_value_check"), Some(1), "{label}");
         }
+    }
+
+    // A flicker activation whose cost the cost authority cannot classify
+    // (`cost_categories()` is empty for `AbilityCost::Unimplemented`) is still
+    // no-value checked: only a loyalty cost stands the check down. Hand-built:
+    // Nephalia Smuggler's parsed activation with its cost replaced, scored as
+    // a hand-built activation candidate (the engine does not offer an
+    // activation whose cost it cannot pay).
+    #[test]
+    fn unclassifiable_cost_flicker_activation_is_no_value_checked() {
+        use engine::ai_support::{ActionMetadata, CandidateAction, TacticalClass};
+        let (mut runner, action) = no_value_arm(&NoValueArm::Smuggler, false);
+        let GameAction::ActivateAbility {
+            source_id,
+            ability_index,
+        } = action
+        else {
+            panic!("the Smuggler arm is an activation: {action:?}");
+        };
+        let object = runner.state_mut().objects.get_mut(&source_id).unwrap();
+        let ability = &mut std::sync::Arc::make_mut(&mut object.abilities)[ability_index];
+        ability.cost = Some(AbilityCost::Unimplemented {
+            description: "an unparsed cost".to_string(),
+        });
+        assert!(
+            ability.cost_categories().is_empty(),
+            "the cost must be one the cost authority cannot classify"
+        );
+        let state = runner.state();
+        let decision = engine::ai_support::build_decision_context(state);
+        let candidate = CandidateAction {
+            action,
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
+        };
+        let config = crate::config::AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: ROOT,
+        };
+        assert_eq!(
+            flicker_no_value_gate_reject(&ctx),
+            Some(FlickerCheckOutcome::NoValue(OwnLegShape::RemovedFromSearch)),
+            "the no-value check must not stand down for an unclassifiable cost"
+        );
+        let gated = crate::tactical_gate::gate_candidates(
+            state,
+            &decision,
+            vec![candidate.clone()],
+            P0,
+            &config,
+            &context,
+        );
+        assert!(
+            gated.is_empty(),
+            "the pre-filter must remove the no-value activation"
+        );
+        let verdict = AntiSelfHarmPolicy.verdict(&ctx);
+        assert_eq!(
+            fact(&verdict, "flicker_no_value_check"),
+            Some(2),
+            "the policy reads the no-value fact: {verdict:?}"
+        );
     }
 
     /// Fleeting Spirit on the AI's battlefield, a spare card in the AI's hand
