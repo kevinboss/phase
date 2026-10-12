@@ -683,6 +683,11 @@ pub(crate) fn parse_quantity_ref_with_context(
             // trim() matches the sibling completeness checks (470/482/489/527) and
             // tolerates trailing whitespace.
             if rest_after.trim().is_empty() {
+                // Counter populations already used the caller-aware census above.
+                // A context-free retry must not invent a controller after it declined.
+                if matches!(&qty, QuantityRef::CountersOnObjects { .. }) {
+                    return None;
+                }
                 return Some(canonicalize_quantity_ref(qty));
             }
         }

@@ -23,13 +23,9 @@
 //! `CostXPaid` with the override's quantity dropped.
 //!
 //! Unsupported is shown through the public coverage authority
-//! (`card_face_gaps`, via `assert_unsupported`) — except where the declined
-//! line falls through to the effect parser's verb-less for-each put-counter
-//! arm (issue #9659: an X base plus an additional counter of another kind, a
-//! counter list led by an X amount with a per-each tail, a comma before
-//! "plus"). There no enters-with replacement is published and the line is
-//! surfaced by the `Replacement` swallow detector, which whole-card coverage
-//! reads (`assert_declined_to_replacement_swallow`).
+//! (`card_face_gaps`, via `assert_unsupported`). The effect parser requires a
+//! put-counter verb, so declined enters-with lines cannot publish a placement
+//! through its for-each arm.
 //!
 //! Under "plus an additional … for each" the leading amount is an addend, not
 //! a factor, so a dynamic base composes faithfully as a sum and stays
@@ -208,27 +204,6 @@ fn assert_unsupported(text: &str) {
         card_face_gaps(&face),
         vec!["Effect:replacement_structure".to_string()],
         "{text:?}"
-    );
-}
-
-/// Assert the enters-with replacement is declined and the line surfaced, for a
-/// line that falls through to the effect parser's verb-less for-each
-/// put-counter arm (issue #9659): no replacement, trigger, or static is
-/// published and the `Replacement` swallow detector reports the line, so
-/// whole-card coverage is red. The fall-through ability itself is #9659's
-/// defect and is deliberately not pinned here.
-fn assert_declined_to_replacement_swallow(text: &str) {
-    let face = face("Dynamic Hellion", text);
-    assert!(
-        face.replacements.is_empty()
-            && face.triggers.is_empty()
-            && face.static_abilities.is_empty(),
-        "{text:?}: {face:#?}"
-    );
-    assert!(
-        has_swallow(&face, "Replacement"),
-        "{text:?}: {:?}",
-        face.parse_warnings
     );
 }
 
@@ -416,7 +391,7 @@ fn dynamic_base_plus_additional_of_another_kind_publishes_no_count() {
         control.parse_warnings
     );
 
-    assert_declined_to_replacement_swallow(DYNAMIC_PLUS_ADDITIONAL_OTHER_KIND);
+    assert_unsupported(DYNAMIC_PLUS_ADDITIONAL_OTHER_KIND);
 }
 
 /// CR 614.1c: X counters and a charge counter on it for each other creature is
@@ -442,7 +417,7 @@ fn dynamic_counter_list_with_a_per_each_tail_is_declined() {
         control.parse_warnings
     );
 
-    assert_declined_to_replacement_swallow(
+    assert_unsupported(
         "This creature enters with X +1/+1 counters and a charge counter on it for each other \
          creature you control.",
     );
@@ -459,32 +434,27 @@ fn dynamic_counter_list_with_a_per_each_tail_is_declined() {
 /// detector surfaces.
 #[test]
 fn dynamic_amount_with_an_unread_per_each_connective_is_declined() {
-    // (fixed control, dynamic line, how the dynamic line is shown declined)
-    type Case = (&'static str, &'static str, fn(&str));
-    let cases: [Case; 3] = [
+    let cases = [
         (
             "This creature enters with two +1/+1 counters on that creature for each other \
              creature you control.",
             "This creature enters with X +1/+1 counters on that creature for each other \
              creature you control.",
-            assert_unsupported,
         ),
         (
             "This creature enters with two +1/+1 counters on each of them for each other \
              creature you control.",
             "This creature enters with X +1/+1 counters on each of them for each other \
              creature you control.",
-            assert_unsupported,
         ),
         (
             "This creature enters with two +1/+1 counters on it, plus an additional +1/+1 \
              counter on it for each other creature you control.",
             "This creature enters with X +1/+1 counters on it, plus an additional +1/+1 \
              counter on it for each other creature you control.",
-            assert_declined_to_replacement_swallow,
         ),
     ];
-    for (fixed, dynamic, assert_declined) in cases {
+    for (fixed, dynamic) in cases {
         let control = face("Fixed Hellion", fixed);
         assert_eq!(
             enters_with_counts(&control),
@@ -497,7 +467,7 @@ fn dynamic_amount_with_an_unread_per_each_connective_is_declined() {
             control.parse_warnings
         );
 
-        assert_declined(dynamic);
+        assert_unsupported(dynamic);
     }
 }
 

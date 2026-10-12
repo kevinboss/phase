@@ -6395,8 +6395,7 @@ If you sang a song the whole time you were searching and shuffling, you may unta
 
     /// CR 122.1: a counter-kind census over a single object ("kind(s) of
     /// counter(s) on ~") has no census arm, so every surface form stays honest
-    /// — a `DynamicQty` swallow naming the operand, an unparsed quantity, or an
-    /// unrecognized condition — instead of being absorbed as a count of a
+    /// through an explicit unsupported clause instead of being absorbed as a count of a
     /// counter named "kind of". No printed card names a "kind" counter; these
     /// lines are synthetic because no printed card currently reaches the route.
     #[test]
@@ -6417,44 +6416,38 @@ If you sang a song the whole time you were searching and shuffling, you may unta
                 || names_kind(&serde_json::to_value(&parsed.statics).unwrap())
         };
 
-        // "for each" quantity: an honest DynamicQty swallow (reach guard: the
-        // detector fired with this exact operand).
-        let parsed = parse_creature("{T}: Draw a card for each kind of counter on Test Card.");
-        assert_eq!(
-            only_swallow(&parsed, "DynamicQty").gap(),
-            Some(&ClauseGap::Quantity {
-                operand: "kind of counter on test card".to_string()
-            })
-        );
-        assert!(!names_kind_counter(&parsed), "{:?}", parsed.abilities);
-
-        // "equal to the number of" quantity: an honest unparsed quantity.
-        let parsed = parse_creature(
+        for text in [
+            "{T}: Draw a card for each kind of counter on Test Card.",
             "{T}: You gain life equal to the number of kinds of counters on Test Card.",
-        );
-        assert!(
-            matches!(
-                &*parsed.abilities[0].effect,
-                Effect::Unimplemented { name, .. } if name == "unparsed_quantity"
-            ),
-            "{:?}",
-            parsed.abilities
-        );
-        assert!(!names_kind_counter(&parsed), "{:?}", parsed.abilities);
-
-        // Counter-has condition: unrecognized, not `HasCounters` over "kinds of".
-        let parsed = parse_creature(
             "As long as there are two or more kinds of counters on Test Card, it has flying.",
+        ] {
+            let parsed = parse_creature(text);
+            assert!(
+                any_ability_has_unimplemented(&parsed),
+                "{text:?}: the unread census must remain explicitly unsupported: {parsed:#?}"
+            );
+            assert!(!names_kind_counter(&parsed), "{text:?}: {parsed:#?}");
+        }
+
+        let control = parse_creature(
+            "{T}: You gain life equal to the number of +1/+1 counters on Test Card.",
         );
+        assert!(!any_ability_has_unimplemented(&control), "{control:#?}");
         assert!(
             matches!(
-                parsed.statics[0].condition,
-                Some(StaticCondition::Unrecognized { .. })
+                control.abilities[0].effect.as_ref(),
+                Effect::GainLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::CountersOn {
+                            counter_type: Some(CounterType::Plus1Plus1),
+                            ..
+                        }
+                    },
+                    ..
+                }
             ),
-            "{:?}",
-            parsed.statics
+            "reach guard: a real counter name must keep its counter quantity: {control:#?}"
         );
-        assert!(!names_kind_counter(&parsed), "{:?}", parsed.statics);
     }
 
     /// Every `DistinctCounterKindsAmong` census filter anywhere in the parse

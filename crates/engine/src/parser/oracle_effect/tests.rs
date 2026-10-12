@@ -8,11 +8,12 @@ use crate::game::coverage::card_face_has_unimplemented_parts;
 use crate::game::triggers::extract_target_filter_from_effect;
 use crate::parser::oracle::has_unimplemented;
 use crate::parser::oracle_ir::ast::EntersUnderSpec;
-use crate::parser::oracle_ir::diagnostic::{ClauseGap, ClauseGapKind};
+use crate::parser::oracle_ir::diagnostic::{ClauseGap, ClauseGapKind, OracleDiagnostic};
 use crate::parser::oracle_nom::enters_under::{
     bind_control_clause, ControlAnaphorAntecedent, ControlClausePossessor,
 };
 use crate::parser::parse_oracle_text;
+use crate::parser::swallow_evidence::UnitEvidence;
 use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
@@ -10685,8 +10686,9 @@ fn effect_token_for_each_this_way_produces_tracked_set_size() {
 #[test]
 fn full_pump_parser_declines_a_discarded_for_each_color_chooser() {
     // Synthetic grammar control, not an authenticated printed-card claim.
+    let text = "Target creature gets +1/+1 until end of turn for each creature you control of the color of your choice.";
     let declined = parse_oracle_text(
-        "Target creature gets +1/+1 until end of turn for each creature you control of the color of your choice.",
+        text,
         "For-Each Chooser Probe",
         &[],
         &["Instant".to_string()],
@@ -10698,7 +10700,17 @@ fn full_pump_parser_declines_a_discarded_for_each_color_chooser() {
         "the clause must reach the spell parser"
     );
     assert!(
-        has_unimplemented(&declined.abilities[0]),
+        declined.parse_warnings.iter().any(|warning| matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, description, line_index: 0, gap: Some(ClauseGap::Quantity { operand }), .. }
+                if detector == "DynamicQty"
+                    && description == text
+                    && operand == "creature you control of the color of your choice"
+        )),
+        "the rejected complete quantity must keep coverage honest: {declined:#?}",
+    );
+    assert!(
+        !UnitEvidence::of(&declined).any::<FilterProp>(|prop| matches!(prop, FilterProp::IsChosenColor)),
         "a discarded reader cannot return IsChosenColor without publishing its chooser: {declined:#?}",
     );
 
