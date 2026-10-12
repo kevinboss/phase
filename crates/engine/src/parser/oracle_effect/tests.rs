@@ -6,6 +6,7 @@ use super::sequence::split_clause_sequence;
 use super::*;
 use crate::game::coverage::card_face_has_unimplemented_parts;
 use crate::game::triggers::extract_target_filter_from_effect;
+use crate::parser::oracle::has_unimplemented;
 use crate::parser::oracle_ir::ast::EntersUnderSpec;
 use crate::parser::oracle_ir::diagnostic::{ClauseGap, ClauseGapKind};
 use crate::parser::oracle_nom::enters_under::{
@@ -10679,6 +10680,48 @@ fn effect_token_for_each_this_way_produces_tracked_set_size() {
         }
         other => panic!("expected Token, got {other:?}"),
     }
+}
+
+#[test]
+fn full_pump_parser_declines_a_discarded_for_each_color_chooser() {
+    // Synthetic grammar control, not an authenticated printed-card claim.
+    let declined = parse_oracle_text(
+        "Target creature gets +1/+1 until end of turn for each creature you control of the color of your choice.",
+        "For-Each Chooser Probe",
+        &[],
+        &["Instant".to_string()],
+        &[],
+    );
+    assert_eq!(
+        declined.abilities.len(),
+        1,
+        "the clause must reach the spell parser"
+    );
+    assert!(
+        has_unimplemented(&declined.abilities[0]),
+        "a discarded reader cannot return IsChosenColor without publishing its chooser: {declined:#?}",
+    );
+
+    let admitted = parse_oracle_text(
+        "Target creature gets +1/+1 until end of turn for each creature you control.",
+        "For-Each Chooser Probe",
+        &[],
+        &["Instant".to_string()],
+        &[],
+    );
+    assert_eq!(admitted.abilities.len(), 1);
+    assert!(
+        !has_unimplemented(&admitted.abilities[0]),
+        "reach guard: the ordinary population clause must still lower: {admitted:#?}",
+    );
+    assert!(matches!(
+        admitted.abilities[0].effect.as_ref(),
+        Effect::Pump {
+            target: TargetFilter::Typed(..),
+            power: PtValue::Quantity(..),
+            toughness: PtValue::Quantity(..),
+        }
+    ));
 }
 
 #[test]

@@ -3881,7 +3881,7 @@ fn for_each_anaphor_context(ctx: &ParseContext, antecedents: &PlayerAntecedents)
         relative_player_scope: antecedents.third_person.clone(),
         declared_player_scope: None,
         prior_player_declaration: false,
-        ..ctx.clone()
+        ..ctx.clone_throwaway()
     }
 }
 
@@ -9822,6 +9822,34 @@ mod tests {
                 ])),
             },
         }
+    }
+
+    #[test]
+    fn discarded_for_each_reader_does_not_bind_a_printed_color_choice() {
+        // Synthetic grammar discriminator: the discarded type-reader context
+        // cannot publish the chooser it would need for IsChosenColor.
+        let ctx = ParseContext {
+            relative_player_scope: Some(ControllerRef::Opponent),
+            chosen_color_qualifier: ChosenColorQualifierScope::ChainBound,
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_for_each_clause_with_context(
+                "creatures they control of the color of your choice",
+                &ctx,
+            ),
+            None,
+        );
+        assert_eq!(ctx.pending_printed_color_choice, None);
+        assert_eq!(
+            parse_for_each_clause_with_context("creatures they control", &ctx),
+            Some(QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::Opponent)
+                ),
+            }),
+            "reach guard: discarding chooser authority must preserve the player binder",
+        );
     }
 
     #[test]
