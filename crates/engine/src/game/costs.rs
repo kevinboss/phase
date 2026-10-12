@@ -115,7 +115,8 @@ fn find_eligible_exile_targets(
                 // Scan only the payer's graveyard (controller-scoped)
                 player_state
                     .map(|p| {
-                        p.graveyard
+                        state
+                            .graveyard_of(p.id)
                             .iter()
                             .copied()
                             .filter(|&id| {
@@ -451,6 +452,16 @@ fn effect_pay_cost_mana_resume(
         return Some(ManaAbilityResume::ManaPayment {
             outer_player: Some(*player),
             convoke_mode: *convoke_mode,
+        });
+    }
+    // CR 605.3a + CR 616.1: a mana ability's payment window is likewise the root.
+    if let WaitingFor::ManaAbilityManaPayment {
+        pending_mana_ability,
+        ..
+    } = &state.waiting_for
+    {
+        return Some(ManaAbilityResume::ManaAbilityManaPayment {
+            pending_mana_ability: pending_mana_ability.clone(),
         });
     }
     // CR 118.12 + CR 605.3b + CR 616.1: `UnlessPayment` is already the
@@ -1473,19 +1484,38 @@ fn pay_ability_cost_inner(
                         super::mana_sources::mana_production_could_produce_two_or_more_colors(
                             state, player, source_id, produced,
                         );
+                    let mut deposited = false;
                     for color in colors {
-                        super::mana_payment::produce_mana_with_attributes_from_source_quality(
-                            state,
-                            source_id,
-                            super::mana_sources::mana_color_to_type(color),
-                            player,
-                            false,
-                            source_could_produce_two_or_more_colors,
-                            &restrictions,
-                            grants,
-                            *expiry,
-                            events,
-                        );
+                        deposited |=
+                            !super::mana_payment::produce_mana_with_attributes_from_source_quality(
+                                state,
+                                source_id,
+                                super::mana_sources::mana_color_to_type(color),
+                                player,
+                                false,
+                                source_could_produce_two_or_more_colors,
+                                &restrictions,
+                                grants,
+                                *expiry,
+                                events,
+                            )
+                            .is_empty();
+                    }
+                    // CR 118.1 + CR 118.12 + CR 607.1c: paying this resolution-time cost
+                    // carries out the resolving ability's own instruction to add mana, so a
+                    // real deposit is mana added "with this ability". Gated on returned units:
+                    // a {0}-reduced cumulative upkeep never reaches this arm
+                    // (`expand_per_counter(_, 0)` is `Mana {0}`), and a prevented production
+                    // (CR 614.1) returns none.
+                    match scope {
+                        PaymentScope::Resolution { ability, .. } => {
+                            super::effects::mana::record_triggered_ability_added_mana(
+                                state, ability, player, deposited,
+                            )
+                        }
+                        // CR 602.1a: an activation cost belongs to an activated ability,
+                        // which has no triggered identity to record.
+                        PaymentScope::Activation { .. } => {}
                     }
                 }
                 // CR 118.3 + CR 701.26a: tapping one determined permanent (the granter, or the
@@ -4676,5 +4706,52 @@ mod tests {
         assert!(!payable_with_hand(&[true]));
         // Hostile: two cards but no Island.
         assert!(!payable_with_hand(&[false, false]));
+    }
+}
+
+#[cfg(test)]
+mod dandan_read_sweep_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{ControllerRef, TypeFilter, TypedFilter};
+    use crate::types::card_type::CoreType;
+    use crate::types::format::FormatConfig;
+    use crate::types::game_state::GameState;
+    use crate::types::identifiers::CardId;
+
+    /// CR 400.1: a controller-scoped graveyard exile cost reads the
+    /// payer's storage seat, which holds the shared pile in Dandan.
+    #[test]
+    fn payer_scoped_graveyard_exile_reads_the_shared_pile() {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 42);
+        let payer = PlayerId(1);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            payer,
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let creature = create_object(&mut state, CardId(2), payer, "Bear".into(), Zone::Graveyard);
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let filter = TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Creature).controller(ControllerRef::You),
+        );
+
+        let eligible = find_eligible_exile_targets(
+            &state,
+            payer,
+            source,
+            None,
+            Zone::Graveyard,
+            Some(&filter),
+        );
+
+        assert_eq!(eligible, vec![creature]);
     }
 }

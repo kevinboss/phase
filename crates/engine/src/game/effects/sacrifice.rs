@@ -52,6 +52,12 @@ fn resolve_sacrifice_scope(
             })
             .map(|pid| vec![pid])
             .unwrap_or_default(),
+        // CR 608.2c + CR 608.2b: the declared player, no one once that target is illegal.
+        Some(ControllerRef::DeclaredPlayer { group }) => {
+            crate::game::targeting::resolve_live_declared_player(state, ability, group)
+                .into_iter()
+                .collect()
+        }
         Some(ControllerRef::ParentTargetController) => {
             crate::game::targeting::resolve_effect_player_ref(
                 state,
@@ -1375,6 +1381,7 @@ mod tests {
             amount: 1,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         });
         let ability = make_scoped_sacrifice_ability(ControllerRef::ParentTargetController, vec![]);
         let mut events = Vec::new();

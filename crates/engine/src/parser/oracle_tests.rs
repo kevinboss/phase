@@ -3290,7 +3290,9 @@ fn winter_soldier_equipment_count_scales_power_dynamically() {
                 } => {
                     assert_eq!(*type_filters, vec![TypeFilter::Subtype("Equipment".into())]);
                     assert!(
-                        properties.contains(&FilterProp::AttachedToSource),
+                        properties.contains(&FilterProp::AttachedTo {
+                            to: crate::types::ability::AttachmentReferent::Source
+                        }),
                         "must carry AttachedToSource, got {properties:?}"
                     );
                 }
@@ -12610,11 +12612,12 @@ fn triggered_modal_labeled_modes_strip_labels_before_effect_parse() {
     ));
 }
 
-// CR 702.xxx: Prepare (Strixhaven) — Biblioplex Tomekeeper's ETB is a
+// CR 722.3a + CR 722.3b: Prepare — Biblioplex Tomekeeper's ETB is a
 // modal trigger whose branches invoke the `becomes prepared` / `becomes
 // unprepared` imperatives. The modal-branch builder must route each
 // branch body through the same effect-chain parser that recognizes these
-// imperatives at the top level. Assign when WotC publishes SOS CR update.
+// imperatives at the top level. Both "Target creature ..." branches are the
+// single scope (the paired `All` row is Codie's activated ability below).
 #[test]
 fn biblioplex_modal_etb_routes_becomes_prepared_branches() {
     let r = parse(
@@ -12638,13 +12641,124 @@ fn biblioplex_modal_etb_routes_becomes_prepared_branches() {
     // First branch: Target creature becomes prepared.
     assert!(matches!(
         *execute.mode_abilities[0].effect,
-        Effect::BecomePrepared { .. }
+        Effect::BecomePrepared {
+            scope: EffectScope::Single,
+            ..
+        }
     ));
     // Second branch: Target creature becomes unprepared.
     assert!(matches!(
         *execute.mode_abilities[1].effect,
-        Effect::BecomeUnprepared { .. }
+        Effect::BecomeUnprepared {
+            scope: EffectScope::Single,
+            ..
+        }
     ));
+}
+
+/// CR 115.10a + CR 722.3a: Codie, Ravenous Codex's "{W}{U}{B}{R}{G}, {T}: Each
+/// creature you control becomes prepared." names no target: the activated
+/// ability carries the untargeted population `Typed(Creature, You)` under
+/// `EffectScope::All`, and `target_filter()` builds no slot from it.
+#[test]
+fn codie_activated_ability_is_an_untargeted_population() {
+    let r = parse(
+        "Whenever you cast a prepared spell, copy it. You may choose new targets for the copy.\n{W}{U}{B}{R}{G}, {T}: Each creature you control becomes prepared. (Only creatures with prepare spells can become prepared.)",
+        "Codie, Ravenous Codex",
+        &[],
+        &["Artifact", "Creature"],
+        &["Book", "Construct"],
+    );
+    // Reach guard: the whole card parsed — its trigger is the prepared-spell
+    // copy trigger, and the activated ability is the prepare effect.
+    assert_eq!(r.triggers.len(), 1);
+    assert!(matches!(
+        &r.triggers[0].valid_card,
+        Some(TargetFilter::Typed(typed)) if typed.properties.contains(&FilterProp::PrepareSpell)
+    ));
+    assert!(matches!(
+        r.triggers[0].execute.as_deref().map(|def| &*def.effect),
+        Some(Effect::CopySpell { .. })
+    ));
+    assert_eq!(r.abilities.len(), 1);
+    let effect = &*r.abilities[0].effect;
+    assert_eq!(
+        *effect,
+        Effect::BecomePrepared {
+            target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            scope: EffectScope::All,
+        }
+    );
+    assert!(
+        effect.target_filter().is_none(),
+        "CR 115.10a: the population is not a target"
+    );
+}
+
+/// CR 722.3a: Skycoach Waypoint's "Target creature becomes prepared." is the
+/// single scope (the paired `All` row is Codie's activated ability above). Only
+/// the scope is asserted here.
+#[test]
+fn skycoach_waypoint_targeted_prepare_is_single_scope() {
+    let r = parse(
+        "{T}: Add {C}.\n{3}, {T}: Target creature becomes prepared. (Only creatures with prepare spells can become prepared.)",
+        "Skycoach Waypoint",
+        &[],
+        &["Land"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 2);
+    assert!(matches!(
+        *r.abilities[1].effect,
+        Effect::BecomePrepared {
+            scope: EffectScope::Single,
+            ..
+        }
+    ));
+}
+
+/// CR 722.3b + CR 608.2c: Infinite Coursework's "It becomes unprepared." is an
+/// anaphor of the tapped enchanted creature, so the derivation keeps it
+/// `Single` (the control that it does not widen an anaphor into a population).
+/// Asserts scope only: which object the anaphor resolves to is not measured
+/// here.
+#[test]
+fn infinite_coursework_anaphoric_unprepare_is_single_scope() {
+    let r = parse(
+        "Enchant creature\nWhen this Aura enters, tap enchanted creature. It becomes unprepared.\nEnchanted creature loses all abilities and doesn't untap during its controller's untap step.",
+        "Infinite Coursework",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+    assert_eq!(r.triggers.len(), 1);
+    let execute = r.triggers[0]
+        .execute
+        .as_deref()
+        .expect("the ETB trigger has an execute");
+    // Reach guard: the head of the chain is the tap, so the sentence pair parsed.
+    assert!(matches!(
+        *execute.effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            ..
+        }
+    ));
+    let sub = execute
+        .sub_ability
+        .as_deref()
+        .expect("\"It becomes unprepared.\" is the chained sub-ability");
+    assert!(
+        matches!(
+            *sub.effect,
+            Effect::BecomeUnprepared {
+                scope: EffectScope::Single,
+                ..
+            }
+        ),
+        "got {:?}",
+        sub.effect
+    );
 }
 
 #[test]
@@ -13805,7 +13919,9 @@ fn make_a_splash_tap_cap_counts_us_in_name_stickers_on_self() {
 }
 
 /// SHAPE (negative): Disemvowel counts vowels in the creature's *name* (CR
-/// 201), not on a name sticker (CR 123.6), so it keeps its base parse.
+/// 201), not on a name sticker (CR 123.6), so it is not read as a sticker
+/// count. No count reads "unique vowel in the creature's name", so the life
+/// clause is an honest gap rather than a one-life loss (CR 119.3).
 #[test]
 fn disemvowel_is_not_a_name_sticker_count() {
     let parsed = parse_oracle_text(
@@ -13824,13 +13940,7 @@ fn disemvowel_is_not_a_name_sticker_count() {
     );
     let sub = spell.sub_ability.as_deref().expect("life-loss clause");
     assert!(
-        matches!(
-            sub.effect.as_ref(),
-            Effect::LoseLife {
-                amount: QuantityExpr::Fixed { value: 1 },
-                target: Some(TargetFilter::ParentTargetController),
-            }
-        ),
+        matches!(sub.effect.as_ref(), Effect::Unimplemented { .. }),
         "{:?}",
         sub.effect
     );
@@ -26573,6 +26683,7 @@ fn target_has_pt_threshold_gate_lowers_to_target_filter() {
                     &*gated.effect,
                     Effect::BecomePrepared {
                         target: TargetFilter::SelfRef,
+                        scope: EffectScope::Single,
                     }
                 ),
                 "{name}: gated body prepares the source: {:?}",

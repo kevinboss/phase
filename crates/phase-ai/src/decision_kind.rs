@@ -136,6 +136,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::ChooseFromZoneChoice { .. }
         | WaitingFor::BeholdChoice { .. }
         | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
         | WaitingFor::ConniveDiscard { .. }
         | WaitingFor::DiscardChoice { .. }
         | WaitingFor::EffectZoneChoice { .. }
@@ -220,6 +221,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::GameOver { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
         | WaitingFor::PayManaAbilityMana { .. }
+        | WaitingFor::ManaAbilityManaPayment { .. }
         // CR 705.1 + CR 614.1a: Krark's Thumb keep choice is a forced
         // mid-resolution selection; route to the ability catch-all.
         | WaitingFor::CoinFlipKeepChoice { .. }
@@ -267,11 +269,13 @@ mod tests {
             classify(
                 &WaitingFor::MulliganDecision {
                     pending: vec![engine::types::game_state::MulliganDecisionEntry {
+                        free_reveals_taken: 0,
                         player: PlayerId(0),
                         mulligan_count: 0,
                         phase: engine::types::game_state::MulliganDecisionPhase::Declare,
                     }],
                     free_first_mulligan: false,
+                    declared: Vec::new(),
                 },
                 &dummy_action
             ),

@@ -5,7 +5,7 @@ use crate::types::ability::{
     TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{BatchCompletion, CastingVariant, GameState, WaitingFor};
+use crate::types::game_state::{BatchCompletion, GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaCost;
 use crate::types::statics::CastFrequency;
@@ -36,8 +36,10 @@ fn extract_controller_ref(filter: &TargetFilter) -> Option<&crate::types::abilit
 }
 
 /// CR 701.20e + CR 400.2: A private self-library peek keeps its looked-at
-/// cards in the controller-owned library while publishing their identities only
-/// through the resolving effect's `last_revealed_ids` window.
+/// cards in the controller's library while publishing their identities only
+/// through the resolving effect's `last_revealed_ids` window. CR 400.1 as a
+/// shared-library format modifies it: a card is in that library when its
+/// owner's library is the controller's, so the shared pile holds every owner's.
 pub(crate) fn looked_at_controller_library_cards(
     state: &GameState,
     controller: crate::types::player::PlayerId,
@@ -47,10 +49,9 @@ pub(crate) fn looked_at_controller_library_cards(
         .iter()
         .copied()
         .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .is_some_and(|object| object.zone == Zone::Library && object.owner == controller)
+            state.objects.get(id).is_some_and(|object| {
+                state.object_in_players_zone(object, Zone::Library, controller)
+            })
         })
         .collect()
 }
@@ -115,7 +116,7 @@ fn tracked_set_cast_candidates(
     // `filter: Any`, which reads no object scope) and closed here so it stays that
     // way.
     let mut scoped_ability = ability.clone();
-    scoped_ability.targets = deduped.iter().copied().map(TargetRef::Object).collect();
+    scoped_ability.set_unpinned_targets(deduped.iter().copied().map(TargetRef::Object).collect());
     let ctx = crate::game::filter::FilterContext::from_ability(&scoped_ability);
     deduped
         .into_iter()
@@ -328,7 +329,7 @@ pub(crate) fn stash_declined_cast_fallback(
     }
     let mut fallback = sub.clone();
     if fallback.targets.is_empty() && !ability.targets.is_empty() {
-        fallback.targets = ability.targets.clone();
+        fallback.mirror_targets_from(ability);
     }
     super::apply_parent_chain_context(&mut fallback, ability, None, state);
     // Reset AFTER apply_parent_chain_context (which copies the parent's context,
@@ -398,7 +399,7 @@ fn open_private_zone_cast_selection(
             *driver = crate::types::ability::CastFromZoneDriver::DuringResolution;
         }
     }
-    stash.targets.clear();
+    stash.clear_targets();
     let eligible = compute_hand_pick_eligible(state, &stash, &stored_filter, source_zone);
 
     if eligible.is_empty() {
@@ -578,6 +579,13 @@ pub fn resolve(
         return Ok(());
     }
 
+    // CR 601.2c + CR 608.2g: the head slot of a multi-slot free cast (Finale of
+    // Promise) resolves every slot of its instruction as one cast window.
+    let slot_links = cast_slot_group(ability);
+    if !slot_links.is_empty() {
+        return resolve_cast_slot_group(state, ability, target_ids, &slot_links, events);
+    }
+
     // CR 701.20e + CR 608.2c: Look-then-cast chains (Kiora) inject the legal
     // looked-at library cards as targets at the chain seam
     // (`inject_last_revealed_targets`), already filtered through this cast
@@ -640,11 +648,13 @@ pub fn resolve(
         // cast grant, bind the filter's object-scope reads to the current
         // resolution's linked cards, not the source's lifetime exile pile.
         let mut scoped_ability = ability.clone();
-        scoped_ability.targets = candidate_ids
-            .iter()
-            .copied()
-            .map(TargetRef::Object)
-            .collect();
+        scoped_ability.set_unpinned_targets(
+            candidate_ids
+                .iter()
+                .copied()
+                .map(TargetRef::Object)
+                .collect(),
+        );
         let ctx = crate::game::filter::FilterContext::from_ability(&scoped_ability);
         target_ids = candidate_ids
             .iter()
@@ -1068,7 +1078,7 @@ pub fn resolve(
         // The rider has been translated into the window's per-cast metadata;
         // retaining it would run a second destination move after the window.
         window.sub_ability = None;
-        window.targets = target_ids.drain(..).map(TargetRef::Object).collect();
+        window.set_unpinned_targets(target_ids.drain(..).map(TargetRef::Object).collect());
         return super::free_cast_from_zones::resolve_with_face_policy(
             state,
             &window,
@@ -1120,6 +1130,127 @@ pub fn resolve(
     }
 
     Ok(())
+}
+
+/// CR 601.2c + CR 608.2g: the further target slots of one "you may cast up to
+/// one target A and/or up to one target B … without paying their mana costs"
+/// instruction (Finale of Promise), in printed order, when `ability` is that
+/// instruction's head slot; empty otherwise.
+///
+/// The parser lowers each slot as its own free `CastFromZone` link so every slot
+/// keeps its own filter and target count (CR 601.2c: each "target" is a separate
+/// instance). They are still one instruction: the player casts the chosen cards
+/// during the resolution, in either order, or declines any of them — so the head
+/// resolves all of them through one cast window and the chain skips the slot
+/// links that follow it.
+pub(crate) fn cast_slot_group(ability: &ResolvedAbility) -> Vec<&ResolvedAbility> {
+    fn is_free_cast_slot(link: &ResolvedAbility) -> bool {
+        link.multi_target.is_some()
+            && matches!(
+                link.effect,
+                Effect::CastFromZone {
+                    without_paying_mana_cost: true,
+                    alt_ability_cost: None,
+                    duration: None,
+                    ..
+                }
+            )
+    }
+    if !is_free_cast_slot(ability) {
+        return Vec::new();
+    }
+    std::iter::successors(ability.sub_ability.as_deref(), |link| {
+        link.sub_ability.as_deref()
+    })
+    .take_while(|link| is_free_cast_slot(link))
+    .collect()
+}
+
+/// CR 608.2g + CR 601.2c: resolve a multi-slot free cast (see
+/// [`cast_slot_group`]) as one free-cast window over exactly the cards chosen
+/// for its slots. A card chosen for two slots (a split card that is both an
+/// instant and a sorcery) is offered once: once cast, it can't be cast again.
+/// Each candidate must still satisfy the filter of a slot it was chosen for,
+/// frozen as the effect is applied (CR 608.2h), and the graveyard rider after
+/// the last slot travels with every cast. The chosen cards are published as
+/// the chain's tracked set, which is what a following "those spells" reads.
+fn resolve_cast_slot_group(
+    state: &mut GameState,
+    head: &ResolvedAbility,
+    head_targets: Vec<ObjectId>,
+    slot_links: &[&ResolvedAbility],
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let mut pool = head_targets;
+    for link in slot_links {
+        for target in link.live_object_targets(state) {
+            if let TargetRef::Object(id) = target {
+                if !pool.contains(&id) {
+                    pool.push(id);
+                }
+            }
+        }
+    }
+    let filters = std::iter::once(head)
+        .chain(slot_links.iter().copied())
+        .filter_map(|link| match &link.effect {
+            Effect::CastFromZone { target, .. } => Some(freeze_resolution_cast_filter(
+                state,
+                link,
+                target.clone(),
+                None,
+            )),
+            _ => None,
+        })
+        .collect();
+    let filter = TargetFilter::Or { filters };
+    super::publish_tracked_set(state, pool.clone());
+
+    let mut zones: Vec<Zone> = Vec::new();
+    for zone in pool
+        .iter()
+        .filter_map(|id| state.objects.get(id).map(|obj| obj.zone))
+    {
+        if !zones.contains(&zone) {
+            zones.push(zone);
+        }
+    }
+    let count = u8::try_from(pool.len()).ok();
+    let graveyard_replacement = slot_links
+        .last()
+        .and_then(|last| cast_from_zone_graveyard_destination(last));
+    let constraint = match &head.effect {
+        Effect::CastFromZone { constraint, .. } => constraint.clone(),
+        _ => None,
+    };
+    let face_policy = crate::types::ability::ResolutionCastFacePolicy::new(
+        filter.clone(),
+        head.source_id,
+        head.controller,
+        freeze_cast_permission_constraint(state, head, constraint),
+    );
+    let mut window = head.clone();
+    window.effect = Effect::FreeCastFromZones {
+        count,
+        max_total_mv: None,
+        filter,
+        zones: zones.clone(),
+        graveyard_replacement: graveyard_replacement.clone(),
+    };
+    window.sub_ability = None;
+    window.targets = pool.into_iter().map(TargetRef::Object).collect();
+    super::free_cast_from_zones::resolve_with_face_policy(
+        state,
+        &window,
+        super::free_cast_from_zones::FreeCastWindowRequest {
+            count,
+            max_total_mv: None,
+            zones,
+            graveyard_replacement,
+            face_policy,
+        },
+        events,
+    )
 }
 
 /// CR 400.1 + CR 601.2a: The zones a resolution-scoped batch window may cast
@@ -1247,7 +1378,7 @@ fn open_resolution_cast_window(
     if graveyard_replacement.is_some() {
         window.sub_ability = None;
     }
-    window.targets = pool.into_iter().map(TargetRef::Object).collect();
+    window.set_unpinned_targets(pool.into_iter().map(TargetRef::Object).collect());
     super::free_cast_from_zones::resolve_with_face_policy(
         state,
         &window,
@@ -1493,6 +1624,7 @@ pub(crate) fn freeze_resolution_cast_filter(
         | TargetFilter::TriggeringSourceController
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTargetController
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::OriginalController
@@ -1683,24 +1815,6 @@ fn cast_stack_spell_copy_during_resolution(
         copy.cast_spell_keywords = cast_spell_keywords;
     }
 
-    let origin = obj.cast_from_zone.unwrap_or(Zone::Exile);
-    events.push(GameEvent::SpellCast {
-        card_id: obj.card_id,
-        controller: ability.controller,
-        object_id: copy_id,
-        cast_mana_value: Some(obj.spell_mana_value()),
-    });
-    let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
-        state,
-        ability.controller,
-        &obj,
-        origin,
-        CastingVariant::Normal,
-    )
-    .map_err(stack_spell_copy_cast_ledger_error)?;
-    crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell(state, copy_id, occurrence)
-        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
-
     if crate::game::effects::prepare::open_copy_target_selection(
         state,
         copy_id,
@@ -1711,6 +1825,10 @@ fn cast_stack_spell_copy_during_resolution(
     {
         return Ok(());
     }
+    // CR 707.12 + CR 601.2i: with no target to announce, the copy is cast now;
+    // otherwise it becomes cast when its announcement walk completes.
+    crate::game::casting_costs::commit_copy_cast(state, copy_id, ability.controller, events)
+        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
 
     state.waiting_for = WaitingFor::Priority {
         player: ability.controller,
@@ -2000,7 +2118,7 @@ pub(crate) fn graveyard_exile_rider_entry_counters(
         return Vec::new();
     };
     let mut rider = sub.clone();
-    rider.targets = vec![TargetRef::Object(obj_id)];
+    rider.set_unpinned_targets(vec![TargetRef::Object(obj_id)]);
     let base: Vec<(crate::types::counter::CounterType, u32)> = enter_with_counters
         .iter()
         .map(|(counter_type, quantity)| {
@@ -3842,6 +3960,32 @@ mod tests {
             Some(Zone::Stack),
             "copy remains on the stack"
         );
+        // CR 601.2i: the copy is cast only once its targets are announced.
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy_id)
+            }),
+            "the copy is not cast before its announcement completes"
+        );
+        assert_eq!(state.objects[&copy_id].cast_occurrence, None);
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::CopyRetarget { copy_id: cid, .. } if cid == copy_id
+            ),
+            "targeted copy must open retarget selection, got {:?}",
+            state.waiting_for
+        );
+
+        // Choose a target and finalize the cast.
+        let events = apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target_creature)),
+            },
+        )
+        .expect("choose shock target")
+        .events;
         assert!(
             events.iter().any(|event| {
                 matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy_id)
@@ -3866,23 +4010,6 @@ mod tests {
             state.spells_cast_this_turn_by_player[&PlayerId(0)][0].spell_object_id,
             Some(copy_id)
         );
-        assert!(
-            matches!(
-                state.waiting_for,
-                WaitingFor::CopyRetarget { copy_id: cid, .. } if cid == copy_id
-            ),
-            "targeted copy must open retarget selection, got {:?}",
-            state.waiting_for
-        );
-
-        // Choose a target and finalize the cast.
-        let _ = apply_as_current(
-            &mut state,
-            GameAction::ChooseTarget {
-                target: Some(TargetRef::Object(target_creature)),
-            },
-        )
-        .expect("choose shock target");
         assert!(
             state.stack.iter().any(|entry| {
                 matches!(
@@ -3920,7 +4047,7 @@ mod tests {
             kind: StackEntryKind::Spell {
                 card_id: CardId(68_655),
                 ability: None,
-                casting_variant: CastingVariant::Normal,
+                casting_variant: crate::types::game_state::CastingVariant::Normal,
                 actual_mana_spent: 0,
             },
         });
@@ -4795,6 +4922,7 @@ mod tests {
             Zone::Hand,
             Zone::Graveyard,
             PlayerId(0),
+            None,
             crate::types::game_state::ZoneChangeRecord::test_minimal(
                 card,
                 Some(Zone::Hand),
@@ -4859,6 +4987,7 @@ mod tests {
             Zone::Graveyard,
             Zone::Exile,
             PlayerId(0),
+            None,
             crate::types::game_state::ZoneChangeRecord::test_minimal(
                 card,
                 Some(Zone::Graveyard),
@@ -5113,5 +5242,44 @@ mod tests {
                 ..
             } if *found == constraint
         )));
+    }
+
+    fn looked_at_window(format: crate::types::format::FormatConfig) -> Vec<ObjectId> {
+        let mut state = GameState::new(format, 2, 42);
+        let mine = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mine".to_string(),
+            Zone::Library,
+        );
+        let theirs = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Theirs".to_string(),
+            Zone::Library,
+        );
+        state.last_revealed_ids = vec![mine, theirs];
+        let looked = looked_at_controller_library_cards(&state, PlayerId(0));
+        assert!(
+            looked.contains(&mine),
+            "reach: the controller's own card is looked at"
+        );
+        looked.into_iter().filter(|id| *id == theirs).collect()
+    }
+
+    #[test]
+    fn looked_at_cards_follow_the_library_the_controller_reads() {
+        use crate::types::format::FormatConfig;
+        assert!(
+            looked_at_window(FormatConfig::standard()).is_empty(),
+            "another player's library is not the controller's"
+        );
+        assert_eq!(
+            looked_at_window(FormatConfig::dandan()).len(),
+            1,
+            "the shared pile is the controller's library whoever owns a card"
+        );
     }
 }

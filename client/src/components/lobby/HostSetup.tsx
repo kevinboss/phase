@@ -11,7 +11,7 @@ import type {
   MatchType,
 } from "../../adapter/types";
 import { AI_DIFFICULTIES } from "../../constants/ai";
-import { FORMAT_REGISTRY } from "../../data/formatRegistry";
+import { FORMAT_REGISTRY, formatSuppliesDeck } from "../../data/formatRegistry";
 import {
   directoryLobbySources,
   FORMAT_DEFAULTS,
@@ -30,6 +30,7 @@ import { refreshServerDirectory, type DirectorySource } from "../../services/ser
 import type { HostSeed } from "../../pages/multiplayerPageState";
 import { DEFAULT_MULTIPLAYER_SERVER_URL } from "../../config/multiplayerServer";
 import { useAiDeckCatalog } from "../../services/aiDeckCatalog";
+import { bestOfThreeCeilingForFormat } from "../../services/engineRuntime";
 import {
   deleteSavedCustomFormat,
   loadSavedCustomFormats,
@@ -40,6 +41,8 @@ import { getHostAdapter } from "../../adapter/wasm-adapter";
 import { isFormatConfigShape } from "../../adapter/format-config-shape";
 import { expandParsedDeck } from "../../services/deckParser";
 import { menuButtonClass } from "../menu/buttonStyles";
+import { PileSourceChoice } from "../menu/PileSourceChoice";
+import { DEFAULT_PILE_CHOICE, suppliedAiDeckChoice, type PileChoice } from "../../services/pileSource";
 import { ConnectionModeSwitch } from "./ConnectionModeSwitch";
 import { IntegerField } from "../ui/IntegerField";
 import { MenuSelect, type MenuSelectGroup } from "../ui/MenuSelect";
@@ -289,6 +292,37 @@ function BotGlyph({ className = "h-4 w-4" }: { className?: string }) {
   );
 }
 
+/**
+ * The engine's best-of-three ceiling for `format`, or `null` until it resolves
+ * for exactly this format. A failed lookup answers `"Bo1"` so Bo3 is never
+ * offered on an unknown ceiling.
+ */
+export function useBestOfThreeCeiling(format: GameFormat | null): MatchType | null {
+  const [answer, setAnswer] = useState<{ format: GameFormat; ceiling: MatchType } | null>(null);
+  useEffect(() => {
+    if (format === null) return;
+    let cancelled = false;
+    void (async () => {
+      let ceiling: MatchType;
+      try {
+        ceiling = await bestOfThreeCeilingForFormat(format);
+      } catch {
+        ceiling = "Bo1";
+      }
+      if (!cancelled) setAnswer({ format, ceiling });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [format]);
+  return format !== null && answer?.format === format ? answer.ceiling : null;
+}
+
+/** Bo3 is the one value the engine's answer admits; anything else plays Bo1. */
+export function cappedMatchType(selected: MatchType, ceiling: MatchType | null): MatchType {
+  return ceiling === "Bo3" ? selected : "Bo1";
+}
+
 export function HostSetup({
   onHost,
   onBack,
@@ -468,14 +502,26 @@ export function HostSetup({
   /** Monotonic token for format resolves. A resolve that finishes after a newer
    *  one started must not write its stale config into state. */
   const formatResolveSeq = useRef(0);
-  const effectiveMatchType = playerCount === 2 ? matchType : "Bo1";
+  const ceiling = useBestOfThreeCeiling(formatConfig.format);
+  const effectiveMatchType = playerCount === 2 ? cappedMatchType(matchType, ceiling) : "Bo1";
+  const bo3Disabled = playerCount !== 2 || ceiling !== "Bo3";
   const aiDeckCatalog = useAiDeckCatalog({
     selectedFormat: formatConfig.format,
     selectedMatchType: effectiveMatchType,
   });
-  const defaultAiDeck = aiDeckCatalog.candidates[0]
-    ? { type: "DeckList" as const, data: expandParsedDeck(aiDeckCatalog.candidates[0].deck) }
-    : null;
+  // A supplied-deck format's AI seats submit nothing, so no catalog deck is needed.
+  const defaultAiDeck = formatSuppliesDeck(formatConfig.format)
+    ? suppliedAiDeckChoice().choice
+    : aiDeckCatalog.candidates[0]
+      ? { type: "DeckList" as const, data: expandParsedDeck(aiDeckCatalog.candidates[0].deck) }
+      : null;
+  const [pile, setPile] = useState<PileChoice>(DEFAULT_PILE_CHOICE);
+  // A pile is picked for one format; any format change returns to the default pile.
+  const [pileFormat, setPileFormat] = useState(formatConfig.format);
+  if (pileFormat !== formatConfig.format) {
+    setPileFormat(formatConfig.format);
+    setPile(DEFAULT_PILE_CHOICE);
+  }
   // No AI seats in a Discord game: its seats are promised to the Discord
   // players, and an all-AI table would never register the requested code.
   const aiSeatsSupported =
@@ -723,7 +769,7 @@ export function HostSetup({
         // `selectedFormat` is "Custom:0" for every Axis-A save and cannot.
         savedCustomFormatId,
         playerCount,
-        matchType: effectiveMatchType,
+        matchType,
         loopDetection,
         isPublic,
         startWhenFull,
@@ -750,6 +796,7 @@ export function HostSetup({
           startWhenFull,
           ranked: false,
           roomName: resolvedRoomName,
+          pile: pile.source,
           ...(seed ? { requestedCode: seed.code } : {}),
         },
         // `null` in P2P — this submit chose no server, and the parent then
@@ -867,7 +914,8 @@ export function HostSetup({
     || isSubmitting
     || isResolvingFormat
     || hostingStatus !== "idle"
-    || (effectiveAiSeats.length > 0 && !defaultAiDeck);
+    || (effectiveAiSeats.length > 0 && !defaultAiDeck)
+    || !pile.legal;
 
   return (
     <form
@@ -967,6 +1015,14 @@ export function HostSetup({
               </p>
             )}
 
+            <div className="sm:col-span-2 empty:hidden">
+              <PileSourceChoice
+                format={formatConfig.format}
+                value={pile.source}
+                onChange={setPile}
+              />
+            </div>
+
             <Field label={t("hostSetup.startingLife")} htmlFor="host-setup-life">
               <IntegerField
                 id="host-setup-life"
@@ -1001,14 +1057,14 @@ export function HostSetup({
 
             <Field label={t("hostSetup.matchType")}>
               <div className={segWrap}>
-                <button type="button" onClick={() => setMatchType("Bo1")} className={seg(matchType === "Bo1")}>
+                <button type="button" onClick={() => setMatchType("Bo1")} className={seg(effectiveMatchType === "Bo1")}>
                   {t("hostSetup.bo1")}
                 </button>
                 <button
                   type="button"
                   onClick={() => setMatchType("Bo3")}
-                  disabled={playerCount !== 2}
-                  className={seg(matchType === "Bo3", playerCount !== 2 ? "cursor-not-allowed opacity-40" : "")}
+                  disabled={bo3Disabled}
+                  className={seg(effectiveMatchType === "Bo3", bo3Disabled ? "cursor-not-allowed opacity-40" : "")}
                 >
                   {t("hostSetup.bo3")}
                 </button>

@@ -535,7 +535,7 @@ fn handle_opponent_may_choice_inner(
                     .player_actions_this_way
                     .insert((promptee, PlayerActionKind::AcceptedOptionalEffect));
                 if matches!(ability.effect, Effect::DealDamage { .. }) {
-                    ability.targets = vec![TargetRef::Player(promptee)];
+                    ability.set_unpinned_targets(vec![TargetRef::Player(promptee)]);
                 }
                 set_active_priority(state);
                 effects::resolve_ability_chain(state, &ability, events, 1)
@@ -589,7 +589,7 @@ fn resolve_all_declined_opponent_may(
                 // target (such as the affected player of a replaced Draw) after
                 // the post-replacement drain that supplied it has retired.
                 if else_resolved.targets.is_empty() && !ability.targets.is_empty() {
-                    else_resolved.targets = ability.targets.clone();
+                    else_resolved.mirror_targets_from(ability);
                 }
                 else_resolved.context = ability.context.clone();
                 else_resolved
@@ -793,7 +793,7 @@ fn pay_top_library_exile_cost(
         .players
         .iter()
         .find(|p| p.id == player)
-        .map(|p| p.library.len())
+        .map(|p| state.library_of(p.id).len())
         .ok_or_else(|| EngineError::InvalidAction("Player not found".to_string()))?;
     if library_len < count as usize {
         return Ok(false);
@@ -804,7 +804,8 @@ fn pay_top_library_exile_cost(
         .iter()
         .find(|p| p.id == player)
         .map(|p| {
-            p.library
+            state
+                .library_of(p.id)
                 .iter()
                 .copied()
                 .take(count as usize)
@@ -1633,7 +1634,7 @@ pub(super) fn handle_unless_payment(
                     .players
                     .iter()
                     .find(|p| p.id == player)
-                    .map(|p| p.library.len())
+                    .map(|p| state.library_of(p.id).len())
                     .ok_or_else(|| {
                         EngineError::InvalidAction("Player not found".to_string())
                     })?;
@@ -1797,7 +1798,7 @@ pub(super) fn handle_unless_payment(
                 Effect::DealDamage { .. } => {
                     let mut damage_ability = pending_effect.as_ref().clone();
                     damage_ability.effect = *effect.clone();
-                    damage_ability.targets = vec![TargetRef::Player(player)];
+                    damage_ability.set_unpinned_targets(vec![TargetRef::Player(player)]);
                     damage_ability.unless_pay = None;
                     damage_ability.sub_ability = None;
                     if let Err(e) =
@@ -1991,7 +1992,7 @@ pub(crate) fn finish_successful_unless_payment(
         state.cost_payment_failed_flag = false;
         let mut sub_resolved = sub.as_ref().clone();
         if sub_resolved.targets.is_empty() {
-            sub_resolved.targets = pending_effect.targets.clone();
+            sub_resolved.mirror_targets_from(pending_effect);
         }
         sub_resolved.context = pending_effect.context.clone();
         sub_resolved.context.optional_effect_performed = true;
@@ -2010,7 +2011,7 @@ pub(crate) fn finish_successful_unless_payment(
         // instruction and resolves even though payment suppressed the head.
         let mut sub_resolved = sub.as_ref().clone();
         if sub_resolved.targets.is_empty() {
-            sub_resolved.targets = pending_effect.targets.clone();
+            sub_resolved.mirror_targets_from(pending_effect);
         }
         sub_resolved.context = pending_effect.context.clone();
         let event_start =
@@ -4927,6 +4928,91 @@ mod tests {
             ),
             "the prompt must advance to the second round with the payable pick recorded, got {:?}",
             state.waiting_for
+        );
+    }
+}
+
+#[cfg(test)]
+mod dandan_read_sweep_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{QuantityExpr, ResolvedAbility, TargetFilter};
+    use crate::types::format::FormatConfig;
+    use crate::types::identifiers::CardId;
+
+    const P1: PlayerId = PlayerId(1);
+
+    fn pile_game(cards: u64) -> GameState {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 7);
+        for i in 0..cards {
+            create_object(
+                &mut state,
+                CardId(100 + i),
+                P1,
+                format!("Pile {i}"),
+                Zone::Library,
+            );
+        }
+        state
+    }
+
+    /// CR 118.3 + CR 400.1: a cumulative-upkeep style "exile the top card of
+    /// your library" cost is paid from the shared pile by the non-canonical seat.
+    #[test]
+    fn top_library_exile_cost_pays_from_the_shared_pile() {
+        let mut state = pile_game(2);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            P1,
+            "Cost Source".into(),
+            Zone::Battlefield,
+        );
+        let top = state.library_of(P1)[0];
+
+        let paid = pay_top_library_exile_cost(&mut state, P1, 1, source, &mut Vec::new())
+            .expect("cost resolves");
+
+        assert!(paid, "the pile pays the cost");
+        assert_eq!(state.objects[&top].zone, Zone::Exile);
+        assert_eq!(state.library_of(P1).len(), 1);
+    }
+
+    /// CR 701.17b + CR 118.12: an unless-mill payment counts and mills the pile.
+    #[test]
+    fn unless_mill_payment_mills_the_shared_pile() {
+        let mut state = pile_game(3);
+        let top_two: Vec<_> = state.library_of(P1).iter().take(2).copied().collect();
+        let pending = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 5 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(999),
+            P1,
+        );
+        state.waiting_for = WaitingFor::UnlessPayment {
+            player: P1,
+            cost: AbilityCost::Mill { count: 2 },
+            pending_effect: Box::new(pending),
+            trigger_event: None,
+            effect_description: None,
+            remaining: Vec::new(),
+        };
+
+        let waiting = state.waiting_for.clone();
+        handle_unless_payment(&mut state, waiting, true, &mut Vec::new())
+            .expect("payment resolves");
+
+        assert_eq!(
+            state.graveyard_of(P1).iter().copied().collect::<Vec<_>>(),
+            top_two
+        );
+        assert_eq!(state.library_of(P1).len(), 1);
+        assert_eq!(
+            state.players[1].life, 20,
+            "the payment suppressed the effect"
         );
     }
 }

@@ -267,7 +267,7 @@ pub(in crate::game) fn eligible_candidates(
         let mut ids = Vec::new();
         for &zone in zones {
             let zone_ids = match zone {
-                Zone::Graveyard => &player.graveyard,
+                Zone::Graveyard => state.graveyard_of(player.id),
                 Zone::Hand => &player.hand,
                 // CR 400.1 + CR 608.2g: Exile is a shared zone — the whole pile
                 // is scanned and the `filter` (e.g. `ExiledBySource` +
@@ -288,11 +288,12 @@ pub(in crate::game) fn eligible_candidates(
     };
 
     for id in candidate_ids {
-        if !state
-            .objects
-            .get(&id)
-            .is_some_and(|object| zones.contains(&object.zone))
-        {
+        // CR 108.2 + CR 109.1: the pool is the CARDS in the named zones; the
+        // CR 722.3c retained prepare copy in exile is not a card and is cast
+        // only through its own CR 722.3c permission.
+        if !state.objects.get(&id).is_some_and(|object| {
+            zones.contains(&object.zone) && object.is_card_population_member()
+        }) {
             continue;
         }
         // CR 601.2b-c + CR 608.2g: discover candidates by projecting each
@@ -407,6 +408,7 @@ fn member_pool_filter(filter: &TargetFilter) -> TargetFilter {
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -557,6 +559,34 @@ mod tests {
         let object = state.objects.get_mut(&id).unwrap();
         object.base_card_types = object.card_types.clone();
         id
+    }
+
+    /// CR 108.2 + CR 109.1 + CR 722.3c: a free-cast window over exile offers
+    /// the CARDS in exile. A non-card copy of a card (the CR 722.3c retained
+    /// prepare copy's shape: `is_copy`, not a token, an Instant owned by P0) is
+    /// not offered — it is cast only through its own CR 722.3c permission —
+    /// while a real Instant card of the same shape is.
+    #[test]
+    fn exile_card_population_free_cast_pool_offers_only_cards() {
+        let mut state = GameState::new_two_player(1);
+        let card = add_card(&mut state, PlayerId(0), Zone::Exile, CoreType::Instant, 0);
+        let copy = add_card(&mut state, PlayerId(0), Zone::Exile, CoreType::Instant, 0);
+        state.objects.get_mut(&copy).unwrap().is_copy = true;
+        assert!(state.exile.contains(&copy));
+        assert!(!state.objects[&copy].is_represented_by_a_card());
+
+        let candidates = test_eligible_candidates(
+            &state,
+            &[Zone::Exile],
+            None,
+            &[],
+            test_face_policy(
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
+                ObjectId(900),
+                PlayerId(0),
+            ),
+        );
+        assert_eq!(candidates, vec![card], "the copy {copy:?} is not offered");
     }
 
     #[test]
@@ -1016,5 +1046,55 @@ mod tests {
             }
             other => panic!("expected FreeCastWindow, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod dandan_read_sweep_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{ResolutionCastFacePolicy, TypeFilter, TypedFilter};
+    use crate::types::card_type::CoreType;
+    use crate::types::format::FormatConfig;
+    use crate::types::identifiers::CardId;
+
+    /// CR 400.1: a free-cast window over "your graveyard" enumerates the
+    /// shared pile for the non-canonical seat.
+    #[test]
+    fn the_graveyard_candidates_come_from_the_shared_pile() {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 1);
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Spell".into(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&spell)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        let face_policy = ResolutionCastFacePolicy::new(
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
+            ObjectId(900),
+            PlayerId(1),
+            None,
+        );
+        let request = free_cast_window_resolution_request(
+            PlayerId(1),
+            None,
+            None,
+            face_policy,
+            vec![Zone::Graveyard],
+            None,
+            Vec::new(),
+        );
+
+        let candidates = eligible_candidates(&state, &[Zone::Graveyard], None, &[], &request);
+
+        assert_eq!(candidates, vec![spell]);
     }
 }

@@ -22,7 +22,9 @@ use crate::types::ability::{
     SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter, TriggerCondition,
     TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
-use crate::types::ability::{EffectOutcomeSignal, IllegalTargetsDisposition, MultiTargetSpec};
+use crate::types::ability::{
+    EffectOutcomeSignal, IllegalTargetsDisposition, MultiTargetSpec, SpentColor,
+};
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::game_state::WaitingFor;
@@ -4047,12 +4049,14 @@ fn gendered_past_type_condition_does_not_hoist_outside_leading_dies_position() {
     assert_eq!(trailing.origin, Some(Zone::Battlefield));
     assert_eq!(trailing.destination, Some(Zone::Graveyard));
     assert_eq!(trailing.condition, None);
+    // The draw count position reads "a card" only; the trailing "if she was a
+    // land" it cannot read makes the clause an honest gap (CR 603.4).
     assert!(matches!(
         trailing
             .execute
             .as_deref()
             .map(|ability| ability.effect.as_ref()),
-        Some(Effect::Draw { .. })
+        Some(Effect::Unimplemented { .. })
     ));
     assert_eq!(
         trailing
@@ -4070,18 +4074,12 @@ fn gendered_past_type_condition_does_not_hoist_outside_leading_dies_position() {
         &[],
     );
     assert!(
-        trailing_card.parse_warnings.iter().any(|warning| matches!(
-            warning,
-            OracleDiagnostic::SwallowedClause {
-                detector,
-                description,
-                line_index: 0,
-                ..
-            } if detector == "Condition_If"
-                && description == "When this creature dies, draw a card if she was a land."
-        )),
-        "the trailing predicate must remain an exact honest deferral: {:?}",
-        trailing_card.parse_warnings
+        trailing_card.triggers.iter().any(|trigger| trigger
+            .execute
+            .as_deref()
+            .is_some_and(|ability| matches!(&*ability.effect, Effect::Unimplemented { .. }))),
+        "the trailing predicate must remain an honest deferral: a clause gap, not an \
+         unconditional draw"
     );
 
     let leading_card = parse_oracle_text(
@@ -15768,23 +15766,23 @@ fn widened_boundary_window_is_monotone_over_effect_verbs() {
 /// (`that `/`which `/`with `) rather than reading into it. Without this bound,
 /// **Immolation Shaman**'s "an ability of an artifact, creature, or land THAT
 /// ISN'T a mana ability" would let the widened window reach "isn't", which
-/// `is_negated_auxiliary_predicate_token` classifies as an effect predicate,
-/// moving the boundary from the card's second comma to its first and
-/// narrowing `valid_card` from `AnyOf[Artifact, Creature]` to `Artifact`.
-/// Revert-failing against the round-2 variant (sentence bound only), under
-/// which row 1 moves to the first comma and row 3 returns
-/// `"creature, or land that isn't a mana ability"`.
+/// `is_negated_auxiliary_predicate_token` classifies as an effect predicate.
+/// The window bound itself is pinned by the `type_list_clause_window` row
+/// below. The Immolation Shaman boundary row is now decided earlier, by
+/// `continues_type_list_final_leg` (an effect cannot open with "or"), so the
+/// boundary is the CR 603.1 one after the whole list — #7451 pinned it at the
+/// closing leg, which kept "land" out of `valid_card`.
 #[test]
 fn widened_window_stops_at_a_restrictive_postmodifier() {
     let immolation_shaman = "whenever an opponent activates an ability of an artifact, creature, or land that isn't a mana ability, this creature deals 1 damage to that player.";
     let lower = immolation_shaman.to_lowercase();
     let boundary = find_effect_boundary(&lower).expect("effect boundary");
     let suffix = &lower[boundary..];
-    let expected = ", or land that isn't";
+    let expected = ", this creature deals";
     assert_eq!(
         &suffix[..expected.len()],
         expected,
-        "boundary must stay at the card's second comma, got {suffix:?}"
+        "boundary must follow the whole type list, got {suffix:?}"
     );
 
     let harsh_mentor = "whenever an opponent activates an ability of an artifact, creature, or land on the battlefield, if it isn't a mana ability, this creature deals 2 damage to that player.";
@@ -15927,30 +15925,30 @@ fn comma_terminated_bare_event_verb_is_an_event_head_not_a_predicate() {
 }
 
 /// Issue #7451: a condition-side Oxford type list — the trigger's SUBJECT, not
-/// its effect — must stay exactly where it is today. These cards remain
-/// `TriggerMode::Unknown`; turning them green is out of scope for #7451.
-/// Revert-failing against `naive-B` (the two-pass design with the widened
-/// window but WITHOUT the event-head exclusion): under `naive-B` the boundary
-/// jumps to the FIRST comma. **Not** revert-failing against `naive-A` — under
-/// `naive-A` the widened window still contains the event head ("attacks" /
-/// "becomes"), so `naive-A`'s whole-window veto also leaves the boundary at
-/// comma 2.
+/// its effect — stays whole in the condition. #7451 pinned the boundary at the
+/// list's closing "or" leg and left these cards `TriggerMode::Unknown`; that
+/// split was wrong under CR 603.1 (an effect clause cannot open with the list
+/// conjunction "or"), and `continues_type_list_final_leg` now keeps the whole
+/// list. Still revert-failing against `naive-B` (the two-pass design without
+/// the event-head exclusion), which jumps to the FIRST comma.
 #[test]
-fn condition_side_type_list_boundary_is_unchanged() {
-    let bird_frog_otter = "whenever a bird, frog, or otter you control attacks, draw a card";
-    let lower = bird_frog_otter.to_lowercase();
-    let boundary = find_effect_boundary(&lower).expect("effect boundary");
-    let suffix = &lower[boundary..];
-    let expected = ", or otter";
-    assert_eq!(&suffix[..expected.len()], expected, "got {suffix:?}");
-
-    let forest_island_swamp =
-        "whenever a forest, island, or swamp you control becomes tapped, draw a card";
-    let lower = forest_island_swamp.to_lowercase();
-    let boundary = find_effect_boundary(&lower).expect("effect boundary");
-    let suffix = &lower[boundary..];
-    let expected = ", or swamp";
-    assert_eq!(&suffix[..expected.len()], expected, "got {suffix:?}");
+fn condition_side_type_list_stays_whole() {
+    for (text, first_leg) in [
+        (
+            "whenever a bird, frog, or otter you control attacks, draw a card",
+            ", frog",
+        ),
+        (
+            "whenever a forest, island, or swamp you control becomes tapped, draw a card",
+            ", island",
+        ),
+    ] {
+        let lower = text.to_lowercase();
+        let boundary = find_effect_boundary(&lower).expect("effect boundary");
+        let suffix = &lower[boundary..];
+        assert!(suffix.starts_with(", draw a card"), "got {suffix:?}");
+        assert!(!suffix.starts_with(first_leg), "got {suffix:?}");
+    }
 }
 
 /// `type_list_clause_window` bounds: extended across every list comma when
@@ -27292,7 +27290,9 @@ fn extract_adamant_three_red() {
     assert_eq!(
         cond.unwrap(),
         TriggerCondition::ManaColorSpent {
-            color: crate::types::mana::ManaColor::Red,
+            color: SpentColor::ColorWord {
+                color: crate::types::mana::ManaColor::Red,
+            },
             minimum: 3,
         }
     );
@@ -27312,7 +27312,9 @@ fn extract_symbolic_mana_spent_two_green() {
     assert_eq!(
         cond.unwrap(),
         TriggerCondition::ManaColorSpent {
-            color: crate::types::mana::ManaColor::Green,
+            color: SpentColor::ManaSymbol {
+                color: crate::types::mana::ManaColor::Green,
+            },
             minimum: 2,
         }
     );
@@ -27326,7 +27328,9 @@ fn extract_symbolic_mana_spent_two_blue_with_trailing_effect() {
     assert_eq!(
         cond.unwrap(),
         TriggerCondition::ManaColorSpent {
-            color: crate::types::mana::ManaColor::Blue,
+            color: SpentColor::ManaSymbol {
+                color: crate::types::mana::ManaColor::Blue,
+            },
             minimum: 2,
         }
     );
@@ -27339,7 +27343,9 @@ fn extract_symbolic_mana_spent_single_red_this_spell() {
     assert_eq!(
         cond.unwrap(),
         TriggerCondition::ManaColorSpent {
-            color: crate::types::mana::ManaColor::Red,
+            color: SpentColor::ManaSymbol {
+                color: crate::types::mana::ManaColor::Red,
+            },
             minimum: 1,
         }
     );
@@ -27353,7 +27359,9 @@ fn extract_symbolic_unless_mana_spent_single_blue() {
         cond.unwrap(),
         TriggerCondition::Not {
             condition: Box::new(TriggerCondition::ManaColorSpent {
-                color: crate::types::mana::ManaColor::Blue,
+                color: SpentColor::ManaSymbol {
+                    color: crate::types::mana::ManaColor::Blue,
+                },
                 minimum: 1,
             }),
         }
@@ -27368,7 +27376,9 @@ fn extract_symbolic_unless_mana_spent_two_black() {
         cond.unwrap(),
         TriggerCondition::Not {
             condition: Box::new(TriggerCondition::ManaColorSpent {
-                color: crate::types::mana::ManaColor::Black,
+                color: SpentColor::ManaSymbol {
+                    color: crate::types::mana::ManaColor::Black,
+                },
                 minimum: 2,
             }),
         }
@@ -27548,7 +27558,9 @@ fn extract_symbolic_mana_spent_mid_sentence() {
     assert_eq!(
         cond.unwrap(),
         TriggerCondition::ManaColorSpent {
-            color: crate::types::mana::ManaColor::Red,
+            color: SpentColor::ManaSymbol {
+                color: crate::types::mana::ManaColor::Red,
+            },
             minimum: 3,
         }
     );
@@ -27569,7 +27581,9 @@ fn extract_symbolic_mana_spent_lowercase_input() {
     assert_eq!(
         cond.unwrap(),
         TriggerCondition::ManaColorSpent {
-            color: crate::types::mana::ManaColor::Green,
+            color: SpentColor::ManaSymbol {
+                color: crate::types::mana::ManaColor::Green,
+            },
             minimum: 2,
         }
     );
@@ -27588,11 +27602,15 @@ fn extract_symbolic_mana_spent_mixed_colors() {
         conditions,
         vec![
             TriggerCondition::ManaColorSpent {
-                color: crate::types::mana::ManaColor::Green,
+                color: SpentColor::ManaSymbol {
+                    color: crate::types::mana::ManaColor::Green,
+                },
                 minimum: 1,
             },
             TriggerCondition::ManaColorSpent {
-                color: crate::types::mana::ManaColor::Blue,
+                color: SpentColor::ManaSymbol {
+                    color: crate::types::mana::ManaColor::Blue,
+                },
                 minimum: 1,
             },
         ]
@@ -28086,6 +28104,17 @@ fn cast_trigger_lowers_to_control_next_turn_effect() {
     }
 }
 
+/// CR 603.8 + CR 603.4: a state trigger's own condition is its trigger event, so
+/// the parser lowers it inside `TriggerCondition::EventTime` (read when the game
+/// state matches, never rechecked on resolution). Returns the wrapped head and
+/// fails the test if the wrapper is missing.
+fn state_trigger_head(def: &TriggerDefinition) -> &TriggerCondition {
+    match &def.condition {
+        Some(TriggerCondition::EventTime { condition }) => condition,
+        other => panic!("expected an EventTime-wrapped state-trigger condition, got {other:?}"),
+    }
+}
+
 #[test]
 fn state_trigger_control_no_islands() {
     let def = parse_trigger_line(
@@ -28093,7 +28122,7 @@ fn state_trigger_control_no_islands() {
         "Dandân",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsNone { filter }) = &def.condition {
+    if let TriggerCondition::ControlsNone { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(
                 tf.type_filters
@@ -28124,7 +28153,7 @@ fn state_trigger_control_no_other_creatures() {
         "Emperor Crocodile",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsNone { filter }) = &def.condition {
+    if let TriggerCondition::ControlsNone { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(tf.properties.contains(&FilterProp::Another));
             assert!(tf.type_filters.contains(&TypeFilter::Creature));
@@ -28144,7 +28173,7 @@ fn state_trigger_control_no_artifacts() {
         "Covetous Dragon",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsNone { filter }) = &def.condition {
+    if let TriggerCondition::ControlsNone { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(tf.type_filters.contains(&TypeFilter::Artifact));
         } else {
@@ -28167,7 +28196,7 @@ fn state_trigger_control_a_creature_with_toughness() {
         "Endangered Armodon",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsType { filter }) = &def.condition {
+    if let TriggerCondition::ControlsType { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(
                 tf.type_filters.contains(&TypeFilter::Creature),
@@ -28319,11 +28348,11 @@ fn state_trigger_has_no_ice_counters() {
         "Dark Depths",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(
             *counters,
@@ -28350,11 +28379,11 @@ fn state_trigger_has_no_plus1_counters() {
         "Afiya Grove",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(*counters, CounterMatch::OfType(CounterType::Plus1Plus1));
         assert_eq!(*minimum, 0);
@@ -28372,11 +28401,11 @@ fn state_trigger_has_no_counters_bare() {
         "TestCard",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(*counters, CounterMatch::Any);
         assert_eq!(*minimum, 0);
@@ -28395,11 +28424,11 @@ fn state_trigger_has_twenty_or_more_charge_counters() {
         "Darksteel Reactor",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(
             *counters,
@@ -28531,6 +28560,118 @@ fn darksteel_reactor_state_trigger_fires_and_wins_game_at_twenty_counters() {
         ),
         "game must end with player 0 as winner after Darksteel Reactor fires; got {:?}",
         state.waiting_for,
+    );
+}
+
+/// CR 603.8 + CR 122.1: the source-counter state-condition authority accepts
+/// both surface grammars (possessive / existential) in the depletion and
+/// threshold forms, and is all-consuming — trailing text after the counter
+/// phrase is not a source-counter state condition.
+#[test]
+fn source_counter_state_condition_accepts_whole_condition_only() {
+    for accepted in [
+        "there are four or more page counters on ~",
+        "~ has no ice counters on it",
+        "~ has twenty or more charge counters on it",
+    ] {
+        assert!(
+            parse_source_counter_state_condition(accepted).is_some(),
+            "{accepted:?} must be recognized as a source-counter state condition"
+        );
+    }
+    for rejected in [
+        "there are four or more page counters on ~ and you control an artifact",
+        "~ has no ice counters on it during your turn",
+        "you control no islands",
+    ] {
+        assert!(
+            parse_source_counter_state_condition(rejected).is_none(),
+            "{rejected:?} must not be recognized as a source-counter state condition"
+        );
+    }
+}
+
+/// CR 608.2k + CR 603.8 + CR 400.7: in a source-counter state trigger, the body's
+/// bare "it" ("exile it") names the ability's own source, so it lowers to
+/// `SelfRef` (whose resolver applies the new-object guard) rather than the
+/// untargeted `ParentTarget` fallback. Verbatim Oracle text (MTGJSON).
+#[test]
+fn source_counter_state_trigger_bare_it_binds_source() {
+    const MAZEMIND_TOME: &str = "{T}, Put a page counter on this artifact: Scry 1. (Look at the top card of your library. You may put that card on the bottom.)\n{2}, {T}, Put a page counter on this artifact: Draw a card.\nWhen there are four or more page counters on this artifact, exile it. If you do, you gain 4 life.";
+    const NINE_LIVES: &str = "Hexproof\nIf a source would deal damage to you, prevent that damage and put an incarnation counter on this enchantment.\nWhen there are nine or more incarnation counters on this enchantment, exile it.\nWhen this enchantment leaves the battlefield, you lose the game.";
+    for (oracle, name, core_type, keywords) in [
+        (MAZEMIND_TOME, "Mazemind Tome", "Artifact", vec![]),
+        (
+            NINE_LIVES,
+            "Nine Lives",
+            "Enchantment",
+            vec!["Hexproof".to_string()],
+        ),
+    ] {
+        let parsed = parse_oracle_text(oracle, name, &keywords, &[core_type.to_string()], &[]);
+        let state_trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| t.mode == TriggerMode::StateCondition)
+            .unwrap_or_else(|| panic!("{name} must parse a StateCondition trigger"));
+        let execute = state_trigger
+            .execute
+            .as_deref()
+            .expect("state trigger must have an execute ability");
+        assert!(
+            matches!(
+                execute.effect.as_ref(),
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    target: TargetFilter::SelfRef,
+                    ..
+                }
+            ),
+            "{name}: \"exile it\" must exile the source (SelfRef), got {:?}",
+            execute.effect
+        );
+    }
+}
+
+/// CR 608.2k: the source pin is the OUTERMOST antecedent — a typed referent
+/// introduced earlier in the same chain still owns a later bare "it". Synthetic
+/// source-counter state trigger whose body targets a creature and then refers
+/// back to it.
+#[test]
+fn source_counter_state_trigger_chain_typed_referent_keeps_parent_target() {
+    let parsed = parse_oracle_text(
+        "When there are three or more charge counters on this artifact, tap target creature. Put a stun counter on it.",
+        "Corvane Stunlatch",
+        &[],
+        &["Artifact".to_string()],
+        &[],
+    );
+    let state_trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::StateCondition)
+        .expect("the synthetic line must parse a StateCondition trigger");
+    let effects = trigger_chain_effects(state_trigger);
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SetTapState {
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        )),
+        "reach guard: the chain must open with the typed tap target, got {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PutCounter {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        )),
+        "\"put a stun counter on it\" must stay bound to the tapped creature \
+         (ParentTarget), not the source, got {effects:?}"
     );
 }
 
@@ -30659,7 +30800,7 @@ fn attack_one_or_more_opponents_uses_defending_player_controller() {
 /// cards) — distinct from the "attack a player ... that player controls"
 /// anaphor path covered above. Drives the full trigger→effect→target
 /// pipeline on the real Oracle text; the assertion flips to `None` if the
-/// `parse_zone_controller` arm is reverted.
+/// "defending player" arm of `nom_target::parse_controller_phrase` is reverted.
 #[test]
 fn attack_trigger_destroy_or_target_defending_player_controls() {
     use crate::types::ability::Effect;
@@ -33706,7 +33847,7 @@ fn thieving_skydiver_dependent_continuation_is_never_replicated_or_branch() {
 /// Mishra's Command mode 1: "Choose target player. They may discard up to X
 /// cards." Before the fix: `Discard { target: Any, .. }`, non-optional —
 /// unbound to the just-chosen player and mandatory despite "may". After: the
-/// discard binds to `ParentTarget` (the chosen player) and is optional.
+/// discard binds to the chosen player and is optional.
 #[test]
 fn mishras_command_they_may_discard_binds_to_chosen_player_and_is_optional() {
     let parsed = parse_oracle_text(
@@ -33731,10 +33872,9 @@ fn mishras_command_they_may_discard_binds_to_chosen_player_and_is_optional() {
         .expect("the discard must remain chained to the chosen target");
     match &*discard.effect {
         Effect::Discard { target, .. } => {
-            assert_eq!(
-                target,
-                &TargetFilter::ParentTarget,
-                "\"they\" discard must bind to the just-chosen target player, not float unbound"
+            assert!(
+                matches!(target, TargetFilter::DeclaredPlayer { .. }),
+                "\"they\" discard must bind to the just-chosen target player, not float unbound: {target:?}"
             );
         }
         other => panic!("expected Discard, got {other:?}"),
@@ -33750,7 +33890,7 @@ fn mishras_command_they_may_discard_binds_to_chosen_player_and_is_optional() {
 /// the second Discard's target was `Any` (unbound) and non-optional, so the
 /// "if they don't" branch's condition was unreachable in practice.
 #[test]
-fn undercity_plunder_they_may_discard_additional_binds_to_parent_target() {
+fn undercity_plunder_they_may_discard_additional_binds_to_the_declared_player() {
     let parsed = parse_oracle_text(
         "Target opponent discards a card. Then they may discard an additional card. If they don't, conjure a duplicate of a random card from their library into your hand. It perpetually gains \"You may spend mana as though it were mana of any color to cast this spell.\"",
         "Undercity Plunder",
@@ -33766,11 +33906,15 @@ fn undercity_plunder_they_may_discard_additional_binds_to_parent_target() {
         .sub_ability
         .as_ref()
         .expect("\"they may discard an additional card\" must remain chained");
+    let declared = TargetFilter::DeclaredPlayer {
+        group: head
+            .declares_chosen_group
+            .expect("the declaring clause carries its tag"),
+    };
     match &*second_discard.effect {
         Effect::Discard { target, .. } => {
             assert_eq!(
-                target,
-                &TargetFilter::ParentTarget,
+                target, &declared,
                 "the additional discard must bind to the same targeted opponent"
             );
         }
@@ -33779,6 +33923,11 @@ fn undercity_plunder_they_may_discard_additional_binds_to_parent_target() {
     assert!(
         second_discard.optional,
         "\"they may discard an additional card\" must be optional"
+    );
+    assert_eq!(
+        second_discard.optional_player.as_ref(),
+        Some(&declared),
+        "the opponent, not the caster, is offered the additional discard"
     );
     let conjure_gate = second_discard
         .sub_ability
@@ -37776,4 +37925,171 @@ fn chain_creates_reflexive_ability_descends_nested_definitions() {
     assert!(!chain_creates_reflexive_ability(&choose_one_of(
         branch_without_reflexive
     )));
+}
+
+/// Maintainer round 4, finding 2. CR 608.2c: in a becomes-target body an
+/// explicit object-controller antecedent ("that creature's controller") names
+/// the targeted object's controller, which the lowered `ParentTargetController`
+/// can't keep apart from the targeter, so the body fails closed. A spell or
+/// ability controller ("that spell's controller", "that spell or ability's
+/// controller") keeps the targeter rewrite. The first line is the maintainer's
+/// synthetic grammar control; Forsaken Wastes is verbatim (Scryfall).
+#[test]
+fn becomes_target_object_controller_antecedent_fails_closed() {
+    // The maintainer's synthetic line, then compound noun phrases: the guard
+    // reads `that|the` + any noun phrase + `'s controller`, exempting only a
+    // spell or ability head noun.
+    for (name, text) in [
+        (
+            "Synthetic Watcher",
+            "Whenever a creature becomes the target of a spell or ability, that creature's controller draws a card.",
+        ),
+        (
+            "Synthetic Token Watcher",
+            "Whenever a creature becomes the target of a spell or ability, that creature token's controller draws a card.",
+        ),
+        (
+            "Synthetic Artifact Watcher",
+            "Whenever an artifact creature becomes the target of a spell, that artifact creature's controller draws a card.",
+        ),
+        (
+            "Synthetic Bare Token Watcher",
+            "Whenever a token becomes the target of a spell, that token's controller draws a card.",
+        ),
+        (
+            "Synthetic Non-Human Watcher",
+            "Whenever a creature becomes the target of a spell, that non-Human creature's controller draws a card.",
+        ),
+        (
+            "Synthetic Assembly-Worker Watcher",
+            "Whenever an Assembly-Worker becomes the target of a spell, that Assembly-Worker's controller draws a card.",
+        ),
+        (
+            "Synthetic Stat Token Watcher",
+            "Whenever a creature token becomes the target of a spell, that 1/1 creature token's controller draws a card.",
+        ),
+    ] {
+        let def = parse_trigger_line(text, name);
+        assert_eq!(def.mode, TriggerMode::BecomesTarget, "{name}: reach guard");
+        let json = serde_json::to_string(&def).expect("trigger serializes");
+        assert!(
+            json.contains("becomes_target_object_controller_antecedent"),
+            "{name}: the explicit object-controller body fails closed: {json}"
+        );
+        assert!(
+            !json.contains("TriggeringSpellController"),
+            "{name}: no targeter rewrite for the object's controller: {json}"
+        );
+    }
+
+    // After a fresh object-target choice the rebind stops, so "that creature"
+    // names the chosen creature and the guard doesn't fire: the body stays
+    // supported and the chosen creature's controller is not rewritten.
+    let fresh = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, tap target creature. That creature's controller draws a card.",
+        "Synthetic Fresh Choice",
+    );
+    assert_eq!(fresh.mode, TriggerMode::BecomesTarget, "reach guard");
+    let json = serde_json::to_string(&fresh).expect("trigger serializes");
+    assert!(
+        !json.contains("becomes_target_object_controller_antecedent"),
+        "past the fresh-choice boundary the guard doesn't fire: {json}"
+    );
+    assert!(
+        json.contains("ParentTargetController") && !json.contains("TriggeringSpellController"),
+        "the chosen creature's controller keeps its parent-target reading: {json}"
+    );
+
+    // An "Otherwise" body is visited before the conditional link's fresh-choice
+    // stop, as the rebind visits `else_ability` first: it fails closed.
+    let otherwise = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, tap target artifact if you control an Island. Otherwise, that creature's controller draws a card.",
+        "Synthetic Otherwise Watcher",
+    );
+    assert_eq!(otherwise.mode, TriggerMode::BecomesTarget, "reach guard");
+    let json = serde_json::to_string(&otherwise).expect("trigger serializes");
+    assert!(
+        json.contains("becomes_target_object_controller_antecedent"),
+        "the else body's object controller fails closed: {json}"
+    );
+    // An "Otherwise" binds to the most recent conditional even across an
+    // intervening clause, so a chain holding one is read whole: fails closed.
+    let distant = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, tap target artifact if you control an Island. You gain 1 life. Otherwise, that creature's controller draws a card.",
+        "Synthetic Distant Otherwise Watcher",
+    );
+    assert_eq!(distant.mode, TriggerMode::BecomesTarget, "reach guard");
+    let json = serde_json::to_string(&distant).expect("trigger serializes");
+    assert!(
+        json.contains("becomes_target_object_controller_antecedent"),
+        "a distant Otherwise's object controller fails closed: {json}"
+    );
+    // Complementary reveal conditions attach an `else_ability` with no
+    // "Otherwise" clause; the assembled else reads the body whole: fails closed.
+    let complementary = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, reveal the top card of your library. If it's a land card, tap target artifact. If it isn't a land card, that creature's controller draws a card.",
+        "Synthetic Complementary Watcher",
+    );
+    assert_eq!(
+        complementary.mode,
+        TriggerMode::BecomesTarget,
+        "reach guard"
+    );
+    let json = serde_json::to_string(&complementary).expect("trigger serializes");
+    assert!(
+        json.contains("\"else_ability\"") && json.contains("RevealedHasCardType"),
+        "reach guard: the complementary conditions assemble an else branch: {json}"
+    );
+    assert!(
+        json.contains("becomes_target_object_controller_antecedent"),
+        "a complementary-condition else body's object controller fails closed: {json}"
+    );
+
+    // A modal body is scoped by the same traversal, mode by mode: the fresh
+    // target in the first mode stops the rewrite there, so the mode stays
+    // supported with its Tap and Draw.
+    let modal = parse_oracle_text(
+        "Whenever this enchantment becomes the target of a spell or ability, choose one \u{2014}\n\u{2022} Tap target creature. That creature's controller draws a card.\n\u{2022} You gain 1 life.",
+        "Synthetic Modal Watcher",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    let trigger = modal
+        .triggers
+        .iter()
+        .find(|trigger| trigger.mode == TriggerMode::BecomesTarget)
+        .expect("reach guard: the becomes-target trigger parses");
+    let json = serde_json::to_string(trigger).expect("trigger serializes");
+    assert!(
+        json.contains("\"Tap\"") && json.contains("\"Draw\""),
+        "the modal mode keeps its Tap and Draw: {json}"
+    );
+    assert!(
+        !json.contains("Unimplemented"),
+        "the modal body stays supported: {json}"
+    );
+
+    for (name, text) in [
+        (
+            "Synthetic Targeter Watcher",
+            "Whenever a creature becomes the target of a spell or ability, that spell or ability's controller draws a card.",
+        ),
+        (
+            "Forsaken Wastes",
+            "Whenever this enchantment becomes the target of a spell, that spell's controller loses 5 life.",
+        ),
+    ] {
+        let def = parse_trigger_line(text, name);
+        assert_eq!(def.mode, TriggerMode::BecomesTarget, "{name}: reach guard");
+        let json = serde_json::to_string(&def).expect("trigger serializes");
+        assert!(
+            json.contains("TriggeringSpellController"),
+            "{name}: the targeter controller keeps the rewrite: {json}"
+        );
+        assert!(
+            !json.contains("Unimplemented"),
+            "{name}: stays supported: {json}"
+        );
+    }
 }

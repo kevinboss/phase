@@ -281,6 +281,13 @@ pub(crate) fn spell_cast_record_for(
         // history record carries provenance so own-cast exclusion (CR 601.2i)
         // can identify a permanent's own pending cast positionally.
         spell_object_id: Some(obj.id),
+        // CR 722.3d + CR 601.2i: capture the prepare-spell designation the
+        // spell has as it becomes cast (the CR 722.3c linked copy's marker), so
+        // `FilterProp::PrepareSpell` and its negation are exact on the history
+        // record after the spell leaves the stack. Unconditional on zone: the
+        // live candidate seam projects the linked copy while it still waits in
+        // exile, and that object can only be cast as a prepare spell.
+        prepared_copy_source: obj.prepared_copy_source,
     }
 }
 
@@ -430,7 +437,7 @@ pub fn record_battlefield_entry(
     }
 
     let record = battlefield_entry_record_for(obj);
-    state.battlefield_entries_this_turn.push(record);
+    state.battlefield_entries_this_turn.push_back(record);
 }
 
 fn entry_controller_matches(
@@ -879,10 +886,7 @@ pub(crate) fn tap_permanent_for_cost(
     )
     .map_err(|error| EngineError::InvalidAction(error.to_string()))?
     {
-        events.push(GameEvent::PermanentTapped {
-            object_id: id,
-            caused_by: None,
-        });
+        events.push(GameEvent::permanent_tapped(state, id, None));
     }
     Ok(())
 }
@@ -2403,9 +2407,9 @@ fn player_zone_ids<'a>(
         return Box::new(std::iter::empty());
     };
     match zone {
-        crate::types::zones::Zone::Graveyard => Box::new(p.graveyard.iter()),
+        crate::types::zones::Zone::Graveyard => Box::new(state.graveyard_of(p.id).iter()),
         crate::types::zones::Zone::Hand => Box::new(p.hand.iter()),
-        crate::types::zones::Zone::Library => Box::new(p.library.iter()),
+        crate::types::zones::Zone::Library => Box::new(state.library_of(p.id).iter()),
         _ => Box::new(std::iter::empty()),
     }
 }
@@ -2556,9 +2560,36 @@ mod tests {
     use crate::types::ability::{AbilityKind, Effect, ParsedCondition, QuantityExpr};
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
-    use crate::types::game_state::WaitingFor;
+    use crate::types::game_state::{ArrivalIdentity, WaitingFor, ZoneChangeRecord};
     use crate::types::identifiers::CardId;
     use crate::types::zones::Zone;
+
+    #[test]
+    fn cards_left_your_graveyard_counts_the_departure_owner() {
+        let mut state = crate::types::game_state::GameState::new(
+            crate::types::format::FormatConfig::dandan(),
+            2,
+            42,
+        );
+        let mut record =
+            ZoneChangeRecord::test_minimal(ObjectId(1), Some(Zone::Graveyard), Zone::Battlefield);
+        record.owner = PlayerId(0);
+        record.controller = PlayerId(0);
+        record.arrival = ArrivalIdentity {
+            owner: PlayerId(1),
+            controller: PlayerId(1),
+        };
+        state.zone_changes_this_turn.push_back(record);
+        let condition = ParsedCondition::CardsLeftYourGraveyardThisTurnAtLeast { count: 1 };
+        assert!(
+            evaluate_condition(&state, PlayerId(0), ObjectId(9), &condition),
+            "the card left the departure owner's graveyard"
+        );
+        assert!(
+            !evaluate_condition(&state, PlayerId(1), ObjectId(9), &condition),
+            "the installed owner's graveyard lost nothing"
+        );
+    }
 
     /// Two-step pattern: parse condition text, then evaluate.
     /// Returns `true` for unrecognized conditions (matching prior permissive behavior).
@@ -3304,7 +3335,7 @@ mod tests {
         let mut state = crate::types::game_state::GameState::new_two_player(42);
         state
             .battlefield_entries_this_turn
-            .push(BattlefieldEntryRecord {
+            .push_back(BattlefieldEntryRecord {
                 object_id: ObjectId(99),
                 name: "Green Creature".to_string(),
                 core_types: vec![CoreType::Creature],
@@ -3373,7 +3404,7 @@ mod tests {
                 for _ in 0..*count {
                     state
                         .battlefield_entries_this_turn
-                        .push(BattlefieldEntryRecord {
+                        .push_back(BattlefieldEntryRecord {
                             object_id: ObjectId(next_id),
                             name: "Bear".to_string(),
                             core_types: vec![CoreType::Creature],
@@ -3980,6 +4011,7 @@ mod tests {
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
                 was_kicked: false,
                 spell_object_id: None,
+                prepared_copy_source: None,
             }]),
         );
 
@@ -4017,6 +4049,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
                 crate::types::game_state::SpellCastRecord {
                     name: String::new(),
@@ -4032,6 +4065,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
                 crate::types::game_state::SpellCastRecord {
                     name: String::new(),
@@ -4047,6 +4081,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
             ]),
         );
@@ -5411,5 +5446,86 @@ mod tests {
             vec![],
             Some(ControllerRef::Opponent)
         )));
+    }
+}
+
+#[cfg(test)]
+mod dandan_read_sweep_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::ParsedCondition;
+    use crate::types::card_type::CoreType;
+    use crate::types::format::FormatConfig;
+    use crate::types::game_state::GameState;
+    use crate::types::identifiers::CardId;
+    use crate::types::zones::Zone;
+
+    const P0: PlayerId = PlayerId(0);
+    const P1: PlayerId = PlayerId(1);
+
+    fn holds(state: &GameState, seat: PlayerId, condition: ParsedCondition) -> bool {
+        evaluate_condition(state, seat, ObjectId(0), &condition)
+    }
+
+    fn put(state: &mut GameState, id: u64, owner: PlayerId, zone: Zone, core: CoreType) {
+        let object = create_object(state, CardId(id), owner, format!("Card {id}"), zone);
+        state
+            .objects
+            .get_mut(&object)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(core);
+    }
+
+    /// CR 400.1 + CR 404.1: "N or more cards (of M types) in your graveyard or
+    /// library" reads the shared pile for either seat of a shared-pile format.
+    #[test]
+    fn zone_count_conditions_read_the_shared_pile() {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 1);
+        put(&mut state, 1, P1, Zone::Graveyard, CoreType::Creature);
+        put(&mut state, 2, P0, Zone::Graveyard, CoreType::Instant);
+        put(&mut state, 3, P1, Zone::Graveyard, CoreType::Land);
+        put(&mut state, 4, P1, Zone::Library, CoreType::Land);
+        put(&mut state, 5, P1, Zone::Library, CoreType::Land);
+
+        for seat in [P0, P1] {
+            let zone = |zone, count| ParsedCondition::ZoneCardCountAtLeast { zone, count };
+            assert!(holds(&state, seat, zone(Zone::Graveyard, 3)), "{seat:?}");
+            assert!(!holds(&state, seat, zone(Zone::Graveyard, 4)), "{seat:?}");
+            assert!(holds(&state, seat, zone(Zone::Library, 2)), "{seat:?}");
+            assert!(!holds(&state, seat, zone(Zone::Library, 3)), "{seat:?}");
+            let types = |count| ParsedCondition::ZoneCardTypeCountAtLeast {
+                zone: Zone::Graveyard,
+                count,
+            };
+            assert!(holds(&state, seat, types(3)), "{seat:?}");
+            assert!(!holds(&state, seat, types(4)), "{seat:?}");
+            assert!(
+                holds(
+                    &state,
+                    seat,
+                    ParsedCondition::ZoneCoreTypeCardCountAtLeast {
+                        zone: Zone::Graveyard,
+                        core_type: CoreType::Land,
+                        count: 1,
+                    }
+                ),
+                "{seat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zone_count_conditions_in_a_per_seat_format_read_the_seats_own_zone() {
+        let mut state = GameState::new_two_player(1);
+        put(&mut state, 1, P1, Zone::Graveyard, CoreType::Creature);
+        let one = ParsedCondition::ZoneCardCountAtLeast {
+            zone: Zone::Graveyard,
+            count: 1,
+        };
+
+        assert!(holds(&state, P1, one.clone()));
+        assert!(!holds(&state, P0, one));
     }
 }

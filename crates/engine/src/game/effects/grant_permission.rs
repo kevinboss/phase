@@ -20,35 +20,51 @@ use std::sync::Arc;
 
 /// CR 608.2h + CR 108.3: the player `grantee` binds to for `obj_id`, fixed once at resolution;
 /// `ObjectOwner` binds each object's owner, the others one player for the whole resolution.
+/// `None` when a `TriggeringSourceController` grant has no triggering object to read: no
+/// player is granted rather than a stand-in.
 pub(crate) fn resolve_grantee(
     state: &GameState,
     ability: &ResolvedAbility,
     grantee: PermissionGrantee,
     obj_id: ObjectId,
-) -> PlayerId {
+) -> Option<PlayerId> {
     match grantee {
-        PermissionGrantee::AbilityController => ability.controller,
-        PermissionGrantee::ParentTargetController => ability
-            .targets
-            .iter()
-            .find_map(|t| match t {
-                TargetRef::Player(pid) => Some(*pid),
+        PermissionGrantee::AbilityController => Some(ability.controller),
+        PermissionGrantee::ParentTargetController => Some(
+            ability
+                .targets
+                .iter()
+                .find_map(|t| match t {
+                    TargetRef::Player(pid) => Some(*pid),
+                    TargetRef::Object(_) => None,
+                })
+                .unwrap_or(ability.controller),
+        ),
+        PermissionGrantee::ObjectOwner => Some(
+            state
+                .objects
+                .get(&obj_id)
+                .map_or(ability.controller, |o| o.owner),
+        ),
+        // CR 603.2 + CR 109.4: the controller of the object that caused the
+        // trigger, through the event-context authority (CR 608.2h fallback).
+        PermissionGrantee::TriggeringSourceController => {
+            match crate::game::targeting::resolve_event_context_target(
+                state,
+                &TargetFilter::TriggeringSourceController,
+                ability.source_id,
+            )? {
+                TargetRef::Player(player) => Some(player),
                 TargetRef::Object(_) => None,
-            })
-            .unwrap_or(ability.controller),
-        PermissionGrantee::ObjectOwner => state
-            .objects
-            .get(&obj_id)
-            .map_or(ability.controller, |o| o.owner),
+            }
+        }
     }
 }
 
 /// Grant a CastingPermission to the target object (CR 604.6).
 ///
-/// Implements static abilities that modify where/how a card can be cast, such as
-/// "You may cast this card from exile" (CR 604.6: static abilities that apply while
-/// a card is in a zone you could cast it from). Building block for Airbending,
-/// Foretell, Suspend, and similar "cast from exile" mechanics.
+/// Implements permissions that modify where/how a card can be cast. Building block
+/// for Airbending, Foretell, Suspend, and similar "cast from exile" mechanics.
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -69,7 +85,9 @@ pub fn resolve(
     // chained grants don't inherit parent targets via
     // `effects::mod.rs::resolve_ability_chain`.
     let (target_ids, tracked_set_group): (Vec<_>, Option<TrackedSetId>) = match target_filter {
-        TargetFilter::SelfRef => (vec![ability.source_id], None),
+        // CR 400.7: Plot's cost exiles the card before the incarnation is
+        // captured, so the exiled card is still the current source here.
+        TargetFilter::SelfRef => (ability.self_ref_binding(state).into_iter().collect(), None),
         // CR 608.2c: The `TrackedSetId(0)` sentinel binds to the highest tracked
         // set id — the set the immediately preceding effect in this chain
         // published. Empty sets are *not* skipped: an empty current set means
@@ -116,7 +134,7 @@ pub fn resolve(
             // that carry explicit object targets (plotted / PlayFromExile) are
             // unaffected.
             if ids.is_empty() {
-                (vec![ability.source_id], None)
+                (ability.self_ref_binding(state).into_iter().collect(), None)
             } else {
                 (ids, None)
             }
@@ -132,7 +150,9 @@ pub fn resolve(
                 .collect(),
             None,
         ),
-        TargetFilter::Any | TargetFilter::None => (vec![ability.source_id], None),
+        TargetFilter::Any | TargetFilter::None => {
+            (ability.self_ref_binding(state).into_iter().collect(), None)
+        }
         other => {
             let ctx = crate::game::filter::FilterContext::from_ability(ability);
             (
@@ -152,7 +172,9 @@ pub fn resolve(
     // CR 611.2b: set when a host-bound lifetime was attached below.
     let mut needs_lifetime_check = false;
     for obj_id in target_ids {
-        let granted_to_pid = resolve_grantee(state, ability, grantee, obj_id);
+        let Some(granted_to_pid) = resolve_grantee(state, ability, grantee, obj_id) else {
+            continue;
+        };
         // CR 702.143d: compute any effective foretell cost (printed OR granted by
         // a static such as Singing Towers of Darillium, with its derived cost)
         // BEFORE the mutable object borrow below — `foretell_cost` takes `&state`

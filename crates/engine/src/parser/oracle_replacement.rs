@@ -37,7 +37,7 @@ use super::oracle_nom::target::{parse_type_filter_word, parse_type_phrase};
 use super::oracle_quantity::capitalize_first;
 use super::oracle_target::{
     parse_declared_damage_source_target, parse_target, parse_target_with_ctx,
-    parse_type_phrase_folding,
+    parse_type_phrase_folding, parse_type_phrase_union,
 };
 use super::oracle_util::{
     first_sentence, merge_or_filters, normalize_card_name_refs, parse_count_expr, parse_number,
@@ -1781,6 +1781,7 @@ fn parse_enters_prepared(norm_lower: &str, text: &str) -> Option<ReplacementDefi
                 AbilityKind::Spell,
                 Effect::BecomePrepared {
                     target: TargetFilter::SelfRef,
+                    scope: EffectScope::Single,
                 },
             ))
             .valid_card(TargetFilter::SelfRef)
@@ -9203,6 +9204,11 @@ fn parse_damage_source_subject(subject: &str) -> Option<TargetFilter> {
         return None;
     }
 
+    let mut scope = filter.clone();
+    scope.properties = props.clone();
+    if let Some(union) = parse_type_phrase_union(qualifier.trim(), &scope) {
+        return Some(union);
+    }
     apply_damage_source_qualifier(&mut filter, &mut props, qualifier.trim());
 
     if !props.is_empty() {
@@ -9796,7 +9802,7 @@ fn parse_draw_replacement(
             AsLongAsDrawGate::Parsed {
                 remainder,
                 condition,
-            } => (remainder, Some(condition)),
+            } => (remainder, Some(*condition)),
             AsLongAsDrawGate::Unparsed => return None,
         };
     let effect_text = extract_replacement_effect(effect_source);
@@ -10644,7 +10650,7 @@ enum AsLongAsDrawGate<'a> {
     /// original case, `condition` the lifted state restriction.
     Parsed {
         remainder: &'a str,
-        condition: ReplacementCondition,
+        condition: Box<ReplacementCondition>,
     },
     /// Gate present but its condition can't be carried — fail closed.
     Unparsed,
@@ -10686,7 +10692,7 @@ fn strip_as_long_as_draw_gate(normalized: &str) -> AsLongAsDrawGate<'_> {
     match static_gate_to_replacement_condition(static_cond) {
         Some(condition) => AsLongAsDrawGate::Parsed {
             remainder: remainder.trim_start(),
-            condition,
+            condition: Box::new(condition),
         },
         None => AsLongAsDrawGate::Unparsed,
     }
@@ -11452,8 +11458,9 @@ fn normalize_additional_token_descriptor(descriptor: &str) -> Option<String> {
 /// True when the descriptor needs a leading `"a "` before `parse_token_description`.
 /// Subtype-only specs (`"Food token"`) have no count and require an article.
 /// P/T-led specs (`"1/1 …"`, `"10/10 …"`) also require one: without it
-/// `parse_token_count_prefix` mis-reads the leading digits before `/` as a bare
-/// count and leaves `/toughness …`, breaking P/T parsing.
+/// the token count position (`oracle_util::parse_count_slot`'s `parse_count_expr`
+/// head) mis-reads the leading digits before `/` as a bare count and leaves
+/// `/toughness …`, breaking P/T parsing.
 fn additional_token_descriptor_needs_leading_article(descriptor: &str) -> bool {
     let trimmed = descriptor.trim_start();
     if nom_primitives::parse_pt_value(trimmed).is_ok() {
@@ -17844,7 +17851,8 @@ mod tests {
         assert!(matches!(
             *def.execute.as_ref().unwrap().effect,
             Effect::BecomePrepared {
-                target: TargetFilter::SelfRef
+                target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
             }
         ));
     }
@@ -17867,7 +17875,8 @@ mod tests {
                 .expect("execute should be set")
                 .effect,
             Effect::BecomePrepared {
-                target: TargetFilter::SelfRef
+                target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
             }
         ));
     }
@@ -30156,5 +30165,67 @@ mod as_enters_at_random_selection_tests {
             "Lydari Elephant",
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod damage_source_union {
+    use super::*;
+    use crate::types::mana::ManaColor;
+
+    fn you_control_legs(filter: &TargetFilter) -> Vec<&TypedFilter> {
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected an Or union, got {filter:?}");
+        };
+        filters
+            .iter()
+            .map(|leg| match leg {
+                TargetFilter::Typed(typed) => {
+                    assert_eq!(typed.controller, Some(ControllerRef::You), "{leg:?}");
+                    typed
+                }
+                other => panic!("expected a Typed leg, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// CR 609.7: Mechanized Warfare's "red or artifact source you control" is a
+    /// red source or an artifact source, both controlled by the shield's controller.
+    #[test]
+    fn color_or_type_source_is_both_kinds() {
+        let filter = parse_damage_source_subject_filter("red or artifact source you control")
+            .expect("subject parses");
+        let legs = you_control_legs(&filter);
+        assert!(legs[0].properties.contains(&FilterProp::HasColor {
+            color: ManaColor::Red
+        }));
+        assert!(!legs[0].type_filters.contains(&TypeFilter::Artifact));
+        assert!(legs[1].type_filters.contains(&TypeFilter::Artifact));
+    }
+
+    /// CR 609.7: Pyromancer's Swath's "instant or sorcery source you control" is
+    /// an instant or a sorcery, not one subtype named "Instant or sorcery".
+    #[test]
+    fn type_or_type_source_is_both_kinds() {
+        let filter = parse_damage_source_subject_filter("instant or sorcery source you control")
+            .expect("subject parses");
+        let legs = you_control_legs(&filter);
+        assert!(legs[0].type_filters.contains(&TypeFilter::Instant));
+        assert!(legs[1].type_filters.contains(&TypeFilter::Sorcery));
+    }
+
+    /// A single-kind qualifier keeps the reader's own arm.
+    #[test]
+    fn single_kind_source_keeps_its_subtype() {
+        let filter =
+            parse_damage_source_subject_filter("giant source you control").expect("subject parses");
+        let TargetFilter::Typed(typed) = &filter else {
+            panic!("expected Typed, got {filter:?}");
+        };
+        assert_eq!(
+            typed.type_filters,
+            vec![TypeFilter::Subtype("Giant".to_string())]
+        );
+        assert_eq!(typed.controller, Some(ControllerRef::You));
     }
 }

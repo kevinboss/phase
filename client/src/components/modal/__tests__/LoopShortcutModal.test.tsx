@@ -93,7 +93,11 @@ function shortcutInteraction(
 // A ConvokeTaps decision-point with two tappable creatures (informational — the
 // engine auto-taps via select_convoke_taps; the modal renders it read-only).
 const convokePoint: DecisionPoint = {
-  slot: { source: { ThisObject: { source_id: 40, incarnation: null } }, index: 0 },
+  slot: {
+    source: { ThisObject: { source_id: 40, incarnation: null } },
+    point: "ConvokeTaps",
+    index: 0,
+  },
   kind: { ConvokeTaps: { tappable: [40, 41] } },
 };
 
@@ -345,7 +349,7 @@ describe("LoopShortcutModal", () => {
     dispatchMock.mockReset();
     dispatchMock.mockResolvedValue(undefined);
     vi.mocked(dispatchInteraction).mockReset();
-    vi.mocked(dispatchInteraction).mockResolvedValue(undefined);
+    vi.mocked(dispatchInteraction).mockResolvedValue({ status: "applied" });
   });
 
   afterEach(() => {
@@ -2443,7 +2447,7 @@ describe("DeclareShortcutModal — authored-split preview", () => {
     dispatchMock.mockReset();
     dispatchMock.mockResolvedValue(undefined);
     vi.mocked(dispatchInteraction).mockReset();
-    vi.mocked(dispatchInteraction).mockResolvedValue(undefined);
+    vi.mocked(dispatchInteraction).mockResolvedValue({ status: "applied" });
     useAppNotificationStore.setState({ notification: null });
   });
 

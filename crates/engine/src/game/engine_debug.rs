@@ -163,9 +163,8 @@ pub fn apply_debug_action(
 
         DebugAction::Mill { player_id, count } => {
             validate_player(state, player_id)?;
-            let player = state.players.iter().find(|p| p.id == player_id).unwrap();
-            let top_ids: Vec<ObjectId> = player
-                .library
+            let top_ids: Vec<ObjectId> = state
+                .library_of(player_id)
                 .iter()
                 .take(count as usize)
                 .copied()
@@ -908,6 +907,7 @@ fn enter_battlefield_with_etb(
         face_down_in_exile: crate::types::ability::ExileConcealment::Public,
         chain_referent: crate::types::zones::ChainReferentIntent::Silent,
         enter_as_copy: None,
+        enter_with_choices: None,
         discard_frame: None,
         performed_by: None,
         applied: HashSet::new(),
@@ -1796,8 +1796,7 @@ mod tests {
 
         let ids: Vec<u64> = state.players[0]
             .mana_pool
-            .mana
-            .iter()
+            .units()
             .map(|u| u.pip_id.0)
             .collect();
         assert_eq!(ids.len(), 3, "three AddMana entries → three pool units");

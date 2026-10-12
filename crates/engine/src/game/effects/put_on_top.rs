@@ -1,3 +1,4 @@
+use crate::types::game_state::RandomDraw;
 use rand::seq::SliceRandom;
 
 use crate::game::quantity::resolve_quantity_with_targets;
@@ -28,7 +29,7 @@ pub(super) fn private_zone_selection<'a>(
     let player = &state.players[choosing_player.0 as usize];
     let candidates = match source_zone {
         Zone::Hand => &player.hand,
-        Zone::Library => &player.library,
+        Zone::Library => state.library_of(choosing_player),
         Zone::Battlefield | Zone::Graveyard | Zone::Stack | Zone::Exile | Zone::Command => {
             return None;
         }
@@ -78,13 +79,13 @@ pub fn resolve(
     // library-count reads for any trailing win condition.
     //
     // `ability.parent_target_missing_reason` is a typed, per-ability signal
-    // stamped ONLY by `effects::apply_parent_chain_context` at the exact
-    // moment THIS ability is handed off as a Dig's immediate sub_ability —
-    // never copied to grandchildren and never read from raw global state
-    // here. That means every OTHER `ParentTarget` consumer (Avenging Angel's
-    // LTB self-return, etc.) keeps its ordinary self-fallback regardless of
-    // an unrelated Dig anywhere else in the same resolution, including a
-    // second, later `PutAtLibraryPosition` call.
+    // stamped ONLY by `effects::apply_parent_chain_context`, when this ability
+    // is handed off as a Dig's immediate sub_ability or, still target-less,
+    // down the chain that Dig heads — never read from raw global state here.
+    // So every OTHER `ParentTarget` consumer (Avenging Angel's LTB
+    // self-return, etc.) keeps its ordinary self-fallback regardless of an
+    // unrelated Dig anywhere else in the same resolution, including a second,
+    // later `PutAtLibraryPosition` call.
     let dig_found_nothing_for_parent_target = matches!(target_filter, TargetFilter::ParentTarget)
         && ability.targets.is_empty()
         && ability.parent_target_missing_reason == Some(ParentTargetMissingReason::Dig);
@@ -117,8 +118,12 @@ pub fn resolve(
                 target_filter,
                 TargetFilter::None | TargetFilter::ParentTarget
             ));
+    // `resolved_targets` already returns EMPTY for a stale non-triggered
+    // `SelfRef` (`ResolvedAbility::self_ref_is_current`); the `[source]` shape is
+    // the triggered and `None`/`ParentTarget` fallbacks.
     if resolves_to_source
-        && effective_targets == [crate::types::ability::TargetRef::Object(ability.source_id)]
+        && (effective_targets.is_empty()
+            || effective_targets == [crate::types::ability::TargetRef::Object(ability.source_id)])
         && !source_is_current
     {
         events.push(GameEvent::EffectResolved {
@@ -509,7 +514,7 @@ pub fn resolve(
             && target_filter.references_exiled_by_source()
         {
             randomized_targets = collected_targets.clone();
-            randomized_targets.shuffle(&mut state.rng);
+            randomized_targets.shuffle(state.rng.draw(RandomDraw::Placement));
             randomized_targets.as_slice()
         } else {
             collected_targets.as_slice()

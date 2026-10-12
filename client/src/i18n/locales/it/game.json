@@ -106,6 +106,24 @@
     "grant": "Approva",
     "decline": "Mantieni priorità"
   },
+  "sandboxLifeCorrection": {
+    "open": "Correggi i punti vita",
+    "title": "Correzione dei punti vita Sandbox",
+    "description": "Usa i normali controlli della mano e della pila per lanciare e risolvere una creatura. Questo pannello invia l'azione SetLife di Sandbox tramite l'adapter di gioco esistente.",
+    "scopeNote": "La correzione passa dal percorso di modifica del giocatore del motore; non rappresenta danno né un effetto di una carta. Questa versione non include la rivelazione di mani nascoste, lo scarto secondo le regole o l'annullamento concordato prima del lancio.",
+    "target": "Giocatore",
+    "player": "{{name}} (giocatore {{seat}})",
+    "you": "Tu",
+    "opponent": "Avversario",
+    "currentLife": "Punti vita attuali",
+    "newLife": "Nuovi punti vita",
+    "submit": "Applica correzione",
+    "submitting": "Correzione inviata; chiudere il pannello non la annulla.",
+    "applied": "Punti vita attuali confermati per {{player}}: {{life}}.",
+    "notApplied": "Il motore non ha confermato questa correzione. Controlla lo snapshot attuale prima di riprovare.",
+    "failed": "Impossibile inviare la correzione.",
+    "stale": "La partita è cambiata durante la modifica. Chiudi e riapri questo pannello per ripartire dallo snapshot attuale."
+  },
   "debugCreate": {
     "copies": "Copie",
     "asToken": "Crea come pedina",
@@ -568,9 +586,6 @@
     "pendingCheaper": "La prossima magia costa {{amount}} in meno",
     "companion": "Compagno",
     "unboundedTooltip": "{{resource}} illimitato (∞)",
-    "unboundedScheduledTooltip": "{{resource}} illimitato (∞) — collasso in sospeso; verrà scelta una quantità finita",
-    "unboundedScheduledYouTooltip": "{{resource}} illimitato (∞) — collasso in sospeso; indicherai tu la quantità",
-    "unboundedScheduledGlyph": "∞→N",
     "unboundedConditionalTooltip": "{{resource}} illimitato (∞) — collasso in sospeso; questo può restare illimitato",
     "unboundedConditionalYouTooltip": "{{resource}} illimitato (∞) — collasso in sospeso; questo può restare illimitato e, in caso contrario, indicherai tu la quantità",
     "unboundedMixedTooltip": "{{resource}} illimitato (∞) — parte di questo gruppo ha un collasso in sospeso; parte resta illimitata",
@@ -653,6 +668,7 @@
     "libraryCount_one": "Grimorio ({{count}} carta)",
     "libraryCount_other": "Grimorio ({{count}} carte)",
     "playFromTop": "Gioca {{name}} dalla cima del grimorio",
+    "activateFromTop": "Attiva {{name}} dalla cima del grimorio",
     "topOfLibrary": "cima del grimorio",
     "indicatorOpponentPrefix": "Avv ",
     "graveyardLower": "cimitero",
@@ -660,6 +676,7 @@
     "zoneTitle": "{{zone}} ({{count}})",
     "noCardsIn": "Nessuna carta in {{zone}}",
     "castFromZone": "Lancia da {{zone}}: {{name}}",
+    "activateFromZone": "Attiva da {{zone}}: {{name}}",
     "viewCount": "Vedi {{count}}",
     "castableCount": "{{zone}} — {{count}} lanciabili"
   },
@@ -843,6 +860,7 @@
     "chooseNewTargetForCopy": "Scegli un nuovo bersaglio per la copia",
     "chooseTargetForCopy": "Scegli il bersaglio per la copia",
     "chooseCreatureToExplore": "Scegli quale creatura esplora dopo",
+    "chooseCreatureToEquip": "Scegli una creatura da equipaggiare",
     "chooseCreatureTokenToPopulate": "Scegli una pedina creatura da popolare",
     "chooseReturnAsAuraTarget": "Scegli un permanente da incantare",
     "tapUntappedCreatures_one": "TAPpa {{count}} creatura STAPpata",
@@ -878,6 +896,7 @@
     },
     "confirmTap": "Conferma TAP ({{selected}}/{{count}})",
     "keepCurrentTargets": "Mantieni i bersagli attuali",
+    "keepCurrentTarget": "Mantieni questo bersaglio",
     "skip": "Salta",
     "opponentChoice": "(a scelta dell'avversario)",
     "chooseNewTarget": "Scegli il nuovo bersaglio della magia",
@@ -1134,6 +1153,8 @@
       "usePowder": "Usa {{name}}",
       "powderDescription": "Esilia ogni carta in mano, pesca lo stesso numero — non è un mulligan",
       "powderTooltip": "Esilia ogni carta nella tua mano e pesca lo stesso numero. Non è un mulligan — il conteggio e le carte in fondo non sono influenzati.",
+      "freeReveal": "Rivela e pesca di nuovo (gratis)",
+      "freeRevealDescription": "Rivela la mano, rimescolala e pesca 7 — gratis, nessuna carta in fondo, non è un mulligan",
       "eyebrowMulligan": "Mulligan {{count}} · Londra",
       "eyebrowOpening": "Mano iniziale · Mulligan di Londra",
       "reviewTitle": "Rivedi la tua mano iniziale",
@@ -1698,6 +1719,10 @@
     "empowerJace": {
       "title": "Potenziare Jace",
       "subtitle": "Scegli una pedina Jace che controlli perché ottenga +{{count}} fedeltà"
+    },
+    "spellCopyOrder": {
+      "title": "Ordina le copie",
+      "subtitle": "Scegli la magia la cui copia va successivamente in pila"
     },
     "collectEvidence": {
       "title": "Raccogli prove",
@@ -2381,7 +2406,8 @@
     "confirm": "Conferma",
     "badgeNewTarget": "Nuovo bersaglio",
     "slotLabel": "Bersaglio {{index}}: {{current}} → {{chosen}}",
-    "unselected": "invariato"
+    "unselected": "invariato",
+    "keep": "Mantieni"
   },
   "separatePiles": {
     "chooserName": "Giocatore {{number}}",

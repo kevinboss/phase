@@ -596,10 +596,7 @@ fn handle_replacement_choice_inner(
                     )
                     .is_ok()
                     {
-                        events.push(GameEvent::PermanentTapped {
-                            object_id,
-                            caused_by: None,
-                        });
+                        events.push(GameEvent::permanent_tapped(state, object_id, None));
                     }
                 }
                 // CR 701.26b: Untap accepted after replacement choice.
@@ -1457,6 +1454,13 @@ fn handle_replacement_choice_inner(
                         pending.sacrifice_provenance = Some(provenance);
                     }
                 }
+                // CR 616.1f + CR 614.12a: a re-park of the SAME zone change keeps
+                // the event its logical owner parked on, so the eventual resume
+                // settles that owner's paused delivery even though an answered
+                // choice or applied replacement has changed the proposal since.
+                if let Some(paused) = parked_zone_change_delivery.as_ref() {
+                    pending.inherit_delivery_boundary(&paused.expected_event);
+                }
             }
             Ok(super::replacement::replacement_choice_waiting_for(
                 player, state,
@@ -1750,6 +1754,9 @@ pub(super) fn handle_entry_controller_choice(
             "entry controller choice has an invalid replacement resume".to_string(),
         ));
     }
+    // The logical owner parked on the unanswered event; keep that boundary
+    // before the answer changes the proposal.
+    pending.pin_delivery_boundary();
     let ProposedEvent::ZoneChange {
         controller_override,
         to: Zone::Battlefield,
@@ -1771,6 +1778,50 @@ pub(super) fn handle_entry_controller_choice(
     // Mark before re-entering the ordinary handler so the pre-entry chooser
     // is not offered again while that handler applies this same replacement.
     pending.proposed.mark_applied(pending.candidates[0]);
+    handle_replacement_choice(state, 0, events)
+}
+
+/// CR 614.12a + CR 614.12: answer path for a pre-entry as-enters choice
+/// ("As ~ enters, choose …"). The parked entry's single candidate is the
+/// entrant's own choice replacement. The answer rides the entry event
+/// (`enter_with_choices`) so the CR 616.1f re-scan sees the permanent as it
+/// would exist, and delivery installs it on the new object (CR 400.7). The
+/// event the logical owner parked on is kept as the pending record's
+/// `delivery_boundary` before the proposal changes, so the shared resume settles
+/// the same paused delivery.
+pub(super) fn handle_entry_named_choice(
+    state: &mut GameState,
+    choice_type: &crate::types::ability::ChoiceType,
+    choice: &str,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    if !super::replacement::pending_entry_named_choice_is_live(state) {
+        return Err(EngineError::InvalidAction(
+            "as-enters choice has no pending battlefield entry".to_string(),
+        ));
+    }
+    let pending = state
+        .pending_replacement
+        .as_mut()
+        .expect("a live pre-entry choice owns the pending replacement");
+    pending.pin_delivery_boundary();
+    let rid = pending.candidates[0];
+    let ProposedEvent::ZoneChange {
+        enter_with_choices, ..
+    } = &mut pending.proposed
+    else {
+        unreachable!("a live pre-entry choice parks a battlefield ZoneChange");
+    };
+    enter_with_choices
+        .get_or_insert_with(Default::default)
+        .0
+        .extend(effects::choose::chosen_attributes_for_choice(
+            choice_type,
+            choice,
+        ));
+    // Mark before re-entering the ordinary handler so the choice is not raised
+    // again while that handler applies this same replacement.
+    pending.proposed.mark_applied(rid);
     handle_replacement_choice(state, 0, events)
 }
 
@@ -3066,7 +3117,7 @@ pub(super) fn apply_post_replacement_effect(
     if ability_definition_uses_post_replacement_event_target(effect_def) {
         if let Some(target) = state.post_replacement_event_target() {
             if !resolved.targets.contains(target) {
-                resolved.targets.push(target.clone());
+                resolved.push_target(target.clone());
             }
         }
     }
@@ -3935,6 +3986,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = replacement_mod::replacement_choice_waiting_for(PlayerId(0), &state);
 
@@ -4611,6 +4663,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = replacement_mod::replacement_choice_waiting_for(PlayerId(0), &state);
         state.priority_player = PlayerId(0);
@@ -5142,6 +5195,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7474,6 +7528,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7683,6 +7738,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7808,6 +7864,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -8269,6 +8326,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -8431,7 +8489,7 @@ mod tests {
             source_id: source,
             branches,
             branch_descriptions: Vec::new(),
-            parent_targets: Vec::new(),
+            parent_occurrences: Default::default(),
             context: Default::default(),
             continuation: None,
             replacement_applied: Default::default(),
@@ -9018,17 +9076,7 @@ mod tests {
         );
     }
 
-    /// The post-replacement dispatch binds the REPLACEMENT SOURCE'S player, not the active player
-    /// — the other half of the universe argument the block-(3) `execute` firewall relief
-    /// (`analysis::resource::reveal_from_hand_execute_provably_excludes_class`) rests on. That arm
-    /// censuses `players[replacement_source_player(source)].hand`, which is the right pool only if
-    /// THIS dispatch binds the same authority: bound to `state.active_player` instead, the arm
-    /// would census one player's hand while the effect read another's, and the relief would be
-    /// unsound wherever the reveal land's controller is not the active player. A
-    /// `-> source.controller` divergence is deliberately not registered as a mutation, because
-    /// `controller_or_owner()` returns `controller` for every `Zone::Battlefield` source and the
-    /// firewall walk yields only `[Battlefield, Command]` sources with non-emblem Command dropped
-    /// upstream — no input it can produce distinguishes the two.
+    /// The post-replacement dispatch binds the REPLACEMENT SOURCE'S player, not the active player.
     ///
     /// REVERT / MUTATION PROBE: bind `apply_post_replacement_effect`'s `controller` to
     /// `state.active_player` ⇒ **this row FAILS** (the prompt goes to `PlayerId(0)`).

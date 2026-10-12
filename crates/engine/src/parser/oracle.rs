@@ -1984,6 +1984,9 @@ fn player_filter_uses_filter_prop(
             target_filter_uses_filter_prop(filter, pred)
         }
         PlayerFilter::AllExcept { exclude } => player_filter_uses_filter_prop(exclude, pred),
+        PlayerFilter::AnyOf { filters } => filters
+            .iter()
+            .any(|f| player_filter_uses_filter_prop(f, pred)),
         PlayerFilter::Controller
         | PlayerFilter::Opponent
         | PlayerFilter::DefendingPlayer
@@ -2005,6 +2008,7 @@ fn player_filter_uses_filter_prop(
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ChosenPlayer { .. }
         | PlayerFilter::GrantingObjectCaster
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::ParentObjectTargetOwner => false,
     }
 }
@@ -7108,13 +7112,13 @@ fn parse_normalized_oracle_ir(
                     continue;
                 }
             }
-            // CR 601.2a + CR 113.6b: a line headed by a recognized
-            // cast-from-graveyard permission whose permission parser declined is
-            // a STRICT gap. Falling through to the replacement/effect fallbacks
-            // reclaims it as a partial parse (e.g. the "exile it instead"
-            // sentence becomes a Moved replacement) and silently drops the
-            // permission's unmodeled prefix, so emit the same typed
-            // `static_structure` residual the generic unsupported dispatch would.
+            // CR 601.2a + CR 113.6b: a line headed by a recognized cast permission
+            // (graveyard, or the card's own exile tail) whose permission parser declined
+            // is a STRICT gap. Falling through to the replacement/effect fallbacks
+            // reclaims it as a partial parse (e.g. the "exile it instead" sentence
+            // becomes a Moved replacement) and silently drops the permission's unmodeled
+            // prefix, so emit the same typed `static_structure` residual the generic
+            // unsupported dispatch would.
             if is_graveyard_cast_permission_lead(&lower) {
                 emitter.unsupported_ir_at(
                     item_line,
@@ -9287,6 +9291,7 @@ fn resolve_guards_in_continuous_mod(modification: &mut ContinuousModification) {
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::RetainAllOtherAbilitiesFromSource
@@ -10224,6 +10229,7 @@ fn demote_lifetimes_in_modification(modification: &mut ContinuousModification) {
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::RetainAllOtherAbilitiesFromSource
@@ -10840,6 +10846,7 @@ pub(crate) fn render_modification_descriptions(
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::RetainAllOtherAbilitiesFromSource

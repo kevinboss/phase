@@ -40,7 +40,8 @@ pub(super) fn tap_untap_target_ids(
     effect_target: &TargetFilter,
 ) -> Vec<ObjectId> {
     match effect_target {
-        TargetFilter::SelfRef => vec![ability.source_id],
+        // CR 400.7: empty when the source left and returned before resolution.
+        TargetFilter::SelfRef => ability.self_ref_binding(state).into_iter().collect(),
         // CR 700.2 + CR 608.2c: "highest id" == "the set the currently-resolving
         // instruction published" — the ordering argument is written once, on
         // `effects::publish_tracked_set`. Deliberately not routed through
@@ -196,10 +197,11 @@ pub(crate) fn process_one_tap(
                 )
                 .map_err(|_| EffectError::ObjectNotFound(object_id))?
                 {
-                    events.push(GameEvent::PermanentTapped {
+                    events.push(GameEvent::permanent_tapped(
+                        state,
                         object_id,
-                        caused_by: Some(source_id),
-                    });
+                        Some(source_id),
+                    ));
                 }
             }
             Ok(TapUntapOutcome::Complete)

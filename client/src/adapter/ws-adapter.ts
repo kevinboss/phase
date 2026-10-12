@@ -210,6 +210,134 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 133 — CR 614.12a pre-entry as-enters choices: NamedChoiceSourceBinding gains
+ *      PendingEntry (WaitingFor.NamedChoice.source.binding), and the parked
+ *      entry event / PendingReplacement carry the answers and the paused
+ *      delivery's boundary — see PROTOCOL_VERSION's own `/// 133` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v132 peer cannot parse the new
+ *      binding tag. Wire 115 moves with it.
+ * 132 — `GameObject::exile_from_stack_linked_source` carries the stamping
+ *      incarnation (`ObjectIncarnationRef`, CR 400.7); a v131 peer cannot
+ *      decode a set rider. Wire 114 moves with it; no lobby frame names it.
+ * 131 — PlayerFilter gains AnyOf (the union of player sets) and TargetPlayer
+ *      (the first declared player target), carried in an ability's
+ *      player_scope inside GameState — see PROTOCOL_VERSION's own `/// 131`
+ *      entry in crates/lobby-broker/src/protocol.rs. A v130 peer cannot parse
+ *      either tag; the exact-match version check at connect refuses the
+ *      pairing. Wire 113 moves with it.
+ * 130 — `GameState::linked_exile_lki` holds one incarnation-bounded
+ *      `LinkedExileLki` per departure (CR 400.7); a v129 peer cannot decode a
+ *      non-empty map. Wire 112 moves with it; no lobby frame names it.
+ * 129 — Loop-shortcut and period-confirmation shapes, one bump over 128:
+ *      ShortcutDecisionSchema replaced max_iterations with the pair
+ *      measured_repetition_bound and deliverable_capacity, so
+ *      WaitingFor.LoopShortcut publishes the threshold the reduction measured
+ *      separately from the count this engine will deliver (every field
+ *      involved carries a serde default, so a v128 peer reads a count neither
+ *      side measured, and the handshake is the only place that can be
+ *      refused); WaitingFor.LoopShortcut and ShortcutProposal gained a
+ *      required road naming the producer that minted the offer, which a v128
+ *      peer drops from every frame it re-encodes;
+ *      WaitingFor.ManaAbilityManaPayment and its ManaAbilityResume root are
+ *      new variants a v128 peer cannot parse, and ResolvedAbility gains the
+ *      optional delayed_origin; GameState drops the recorded loop-action
+ *      sequence; ConfirmedPeriod gains its reach and PeriodicDelta its
+ *      cleanup pair. Wire 111 moves with it; no lobby frame names it.
+ * 127 — FilterProp's attachment-referent siblings (AttachedToSource,
+ *      AttachedToRecipient, AttachedToPlayer) are one AttachedTo prop with a
+ *      tagged `to` referent (Source, Recipient, Player, DeclaredTarget) — see
+ *      PROTOCOL_VERSION's own `/// 127` entry in
+ *      crates/lobby-broker/src/protocol.rs. This client hands server frames to
+ *      JSON.parse, so a v126 client would take the new shape with no decode
+ *      error; the exact-match version check at connect refuses the pairing
+ *      instead. The same version makes retarget picks positional:
+ *      RetargetSpell.new_targets is (TargetRef | null)[] (null keeps), and the
+ *      copy walk's keep/decline permissions (CopyTargetSlot.can_keep and
+ *      can_decline, CopyRetarget.can_keep_rest) are engine fields this client
+ *      renders without a fallback; CopyRetarget.controller names the copy's
+ *      controller when a slot's chooser answers, and
+ *      CopyRetarget.announcer_election carries a copy announcement's
+ *      announcing-opponent election.
+ *      (Reserved as 119 and then 121 while under review; it landed after 126, so 119 stays unused.)
+ * 128 — TargetFilter gains DeclaredPlayer { group } (CR 608.2c + CR 115.1a), the
+ *      player a later clause names after a declared target player. A v127 peer
+ *      cannot deserialize it; the exact-match handshake refuses the pairing.
+ *      SpellContext also gains outer_declared_players (CR 603.7a), the players a
+ *      delayed ability's creating chain named by group, omitted when empty;
+ *      amended in place, not bumped. P2P moves in lockstep (wire 110); lobby
+ *      messages are unchanged.
+ * 126 — `ZoneChangeRecord` gains `arrival` (the owner and controller the
+ *      destination object holds) inside `GameState` and the resolved-rules
+ *      journal's zone-change commands; a v125 peer rejects the journal when the
+ *      departure owner differs from the command owner. Wire 108 moves with it;
+ *      no lobby frame names it.
+ * 125 — `MulliganDecisionEntry` and `MulliganDeclaration` (inside
+ *      `WaitingFor::MulliganDecision`) gain `free_reveals_taken`. Wire 107
+ *      moves with it; no lobby frame names it.
+ * 124 — the resolved-rules journal admits a land-play `rebound_from`
+ *      (Library/Graveyard/Exile -> Battlefield) inside
+ *      GameState.resolved_rules_journal; a v123 peer rejects the state. Wire
+ *      106 moves with it; no lobby frame names it.
+ * 123 — FilterProp PrepareSpell ("a prepared spell" cast-trigger qualifier,
+ *      CR 722.3d), scope on Effect BecomePrepared / BecomeUnprepared (mass
+ *      "each creature you control becomes prepared", CR 722.3a + CR 115.10a),
+ *      prepared_copy_source on SpellCastRecord, and prepare_face on
+ *      CopiableValues and GameObject.copied_prepare_face (a copy of a
+ *      preparation creature keeps its prepare spell, CR 722.2b). A v122 peer
+ *      cannot parse the new FilterProp tag and would read a mass scope as a
+ *      single-target prepare; the exact-match handshake refuses the pairing.
+ *      P2P moves in lockstep (wire 105); lobby messages are unchanged.
+ * 122 — PermissionGrantee gains TriggeringSourceController (a cast grant bound to the
+ *      controller of the object that caused the trigger, CR 603.2 + CR 109.4),
+ *      serialized in the ability definitions of GameState; damage events carry
+ *      the source incarnation. A v121 peer cannot deserialize the tag. Wire 104
+ *      moves with it; no lobby frame names it.
+ * 121 — GameState's triggered-ability mana ledger records the actual
+ *       receiving player alongside the exact trigger definition. A v120 peer
+ *       cannot decode a nonempty pair ledger; the exact-match handshake
+ *       refuses it. P2P moves in lockstep (wire 103).
+ * 120 — CR 601.2a spell announcement: GameObject gains spell_announcement,
+ *      GameState gains next_spell_announcement, and GameEvent BecomesTarget
+ *      gains the targeter that announced the target. A v119 peer cannot
+ *      deserialize the new state. P2P moves in lockstep to wire 102. (119 is
+ *      reserved for the Legends of Jidoor PR.)
+ * 118 — ManaColorSpent on AbilityCondition and TriggerCondition retypes `color` from a
+ *      bare ManaColor to SpentColor (ColorWord or ManaSymbol), serialized in the ability
+ *      and trigger definitions of GameState. A v117 peer cannot deserialize the tagged
+ *      color. Wire 100 moves with it; no lobby frame names it.
+ * 117 — DerivedViews gains `shared_piles`, the seat whose Player container stores a
+ *      shared library and graveyard, omitted for a per-player format. A v116 peer
+ *      drops the key and renders per-seat piles for a state whose other seat's
+ *      containers are empty. Wire 99 moves with it; no lobby frame names it.
+ * 116 — DrawSequenceFrame gains `dealer`, the in-game simultaneous-draw dealer,
+ *      serialized in the resolution frames behind RESOLUTION_STATE_WIRE_VERSION 5.
+ *      A v115 peer refuses the version-5 resolution state. Wire 98 moves with it;
+ *      no lobby frame names it.
+ * 115 — MulliganChoice gains `FreeReveal` and MulliganDeclaration gains `kind`:
+ *      the Dandan free reveal mulligan, a MulliganDecision action payload and a
+ *      held declaration in GameState.waiting_for. A v114 peer cannot parse the
+ *      choice and would carry out a held free reveal as a regular mulligan.
+ *      Wire 97 moves with it; no lobby frame names it.
+ * 114 — WaitingFor::MulliganDecision gains `declared`, the mulligans recorded
+ *      in a CR 103.5 declare round until every player has declared. It is
+ *      serialized in GameState.waiting_for, so a v113 peer would drop it
+ *      silently. Wire 96 moves with it; no lobby frame names it.
+ * 113 — ResolvedZoneChangeCommand gains `rebound_from`, the owner a card had
+ *      before a Hand entry from a shared zone rebound it to the taker
+ *      (CR 108.3 as modified by the Dandan announcement). It is serialized
+ *      inside GameState.resolved_rules_journal, so a v112 peer would drop it
+ *      silently. Wire 95 moves with it; no lobby frame names it.
+ * 112 — ContinuousModification gains `SubstituteTextWord` (CR 612.1), serialized
+ *      inside GameState's transient continuous effects, so a v111 peer cannot
+ *      parse the tag.
+ * 111 — GameFormat gains `Dandan`. It serializes as its Display string and
+ *      deserializes through FromStr, so a v110 peer cannot parse a GameState or
+ *      a lobby FormatConfig that names it. Wire 93 and lobby 16 move with it;
+ *      see PROTOCOL_VERSION in crates/lobby-broker/src/protocol.rs.
+ * 110 — GameState.deferredSpellDelivery holds a resolving spell's move to
+ *       its zone while it is paused on its own free-cast window. Older peers
+ *       would leave the spell on the stack in no zone; P2P moves in lockstep
+ *       (wire 92).
  * 109 — CR 201.5a granter binding: ObjectScope gains GrantingObject and
  *      SpecificObject, TargetFilter.GrantingObject gains `bound`, PlayerFilter
  *      gains GrantingObjectCaster, and ability, trigger, static, replacement, spell and
@@ -709,7 +837,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 109;
+export const PROTOCOL_VERSION = 133;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -740,6 +868,9 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * PROTOCOL_VERSION moved twice for GameState-only changes and the derived lobby
  * window went disjoint from the deployed broker's.
  *
+ * 16 — GameFormat gains `Dandan` (see PROTOCOL_VERSION 110). A Rust broker below
+ *      16 rejects a lobby frame naming it; MIN_LOBBY_PROTOCOL_FOR_DANDAN below
+ *      is this client's frozen floor for that pairing.
  * 15 — FormatConfig loses `allow_experimental_dungeons` on its three lobby
  *      carriers (CreateGameWithSettings, JoinTargetInfo, PeerInfo): the
  *      per-session toggle is gone and the Wilderness pool is format-derived.
@@ -877,7 +1008,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 15;
+export const LOBBY_PROTOCOL_VERSION = 16;
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
@@ -1007,6 +1138,17 @@ export const MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION = 9;
 export const MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS = 11;
 
 /**
+ * Lowest broker `LOBBY_PROTOCOL_VERSION` whose `GameFormat` deserializer knows
+ * `Dandan`; below it a lobby frame naming it is rejected as malformed.
+ *
+ * Frozen at 16 and written as a bare literal, never derived from
+ * LOBBY_PROTOCOL_VERSION, so a later bump cannot drag it forward and start
+ * refusing v16 brokers. `scripts/check-protocol-version.mjs` refuses a derived
+ * right-hand side for it.
+ */
+export const MIN_LOBBY_PROTOCOL_FOR_DANDAN = 16;
+
+/**
  * The lowest broker `LOBBY_PROTOCOL_VERSION` that parses `format` in a lobby
  * frame, or `null` when every broker this client connects to parses it (see
  * MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL). Consult it before sending any lobby
@@ -1020,6 +1162,8 @@ export function lobbyProtocolRequiredForFormat(format: GameFormat): number | nul
     case "Freeform":
     case "FreeformCommander":
       return MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS;
+    case "Dandan":
+      return MIN_LOBBY_PROTOCOL_FOR_DANDAN;
     case "Standard":
     case "Commander":
     case "Pioneer":

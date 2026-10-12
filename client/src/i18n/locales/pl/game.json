@@ -106,6 +106,24 @@
     "grant": "Zatwierdź",
     "decline": "Zachowaj priorytet"
   },
+  "sandboxLifeCorrection": {
+    "open": "Koryguj życie",
+    "title": "Korekta życia w trybie piaskownicy",
+    "description": "Użyj zwykłych kontrolek ręki i stosu, aby rzucić i rozpatrzyć stwora. Ten panel wysyła piaskownicową akcję SetLife przez istniejący adapter gry.",
+    "scopeNote": "Korekta przechodzi przez ścieżkę edycji gracza w silniku; nie oznacza obrażeń ani efektu karty. Ten zakres nie obejmuje ujawniania ukrytej ręki, odrzucania zgodnie z regułami ani uzgodnionego wcześniej cofnięcia przed rzuceniem.",
+    "target": "Gracz",
+    "player": "{{name}} (gracz {{seat}})",
+    "you": "Ty",
+    "opponent": "Przeciwnik",
+    "currentLife": "Obecna liczba punktów życia",
+    "newLife": "Nowa liczba punktów życia",
+    "submit": "Zastosuj korektę",
+    "submitting": "Korekta została wysłana; zamknięcie tego panelu jej nie anuluje.",
+    "applied": "Potwierdzone aktualne życie gracza {{player}}: {{life}}.",
+    "notApplied": "Silnik nie potwierdził tej korekty. Przed ponowną próbą sprawdź bieżący snapshot.",
+    "failed": "Nie udało się wysłać korekty.",
+    "stale": "Stan gry zmienił się podczas edycji. Zamknij i otwórz ponownie panel, aby zacząć od bieżącego snapshotu."
+  },
   "debugCreate": {
     "copies": "Kopie",
     "asToken": "Utwórz jako żeton",
@@ -568,9 +586,6 @@
     "pendingCheaper": "Następny czar kosztuje {{amount}} mniej",
     "companion": "Towarzysz",
     "unboundedTooltip": "Nieograniczone: {{resource}} (∞)",
-    "unboundedScheduledTooltip": "Nieograniczone: {{resource}} (∞) — zwinięcie oczekuje; zostanie wybrana skończona liczba",
-    "unboundedScheduledYouTooltip": "Nieograniczone: {{resource}} (∞) — zwinięcie oczekuje; podasz liczbę",
-    "unboundedScheduledGlyph": "∞→N",
     "unboundedConditionalTooltip": "Nieograniczone: {{resource}} (∞) — zwinięcie oczekuje; może pozostać nieograniczone",
     "unboundedConditionalYouTooltip": "Nieograniczone: {{resource}} (∞) — zwinięcie oczekuje; może pozostać nieograniczone, a jeśli nie — podasz liczbę",
     "unboundedMixedTooltip": "Nieograniczone: {{resource}} (∞) — część tej grupy ma oczekujące zwinięcie; część pozostaje nieograniczona",
@@ -653,6 +668,7 @@
     "libraryCount_one": "Biblioteka ({{count}} karta)",
     "libraryCount_other": "Biblioteka ({{count}} kart)",
     "playFromTop": "Zagraj {{name}} z wierzchu biblioteki",
+    "activateFromTop": "Aktywuj {{name}} z wierzchu biblioteki",
     "topOfLibrary": "wierzch biblioteki",
     "indicatorOpponentPrefix": "Przec ",
     "graveyardLower": "cmentarz",
@@ -660,6 +676,7 @@
     "zoneTitle": "{{zone}} ({{count}})",
     "noCardsIn": "Brak kart w strefie {{zone}}",
     "castFromZone": "Rzuć z {{zone}}: {{name}}",
+    "activateFromZone": "Aktywuj z {{zone}}: {{name}}",
     "viewCount": "Zobacz {{count}}",
     "castableCount": "{{zone}} — {{count}} możliwych do rzucenia"
   },
@@ -845,6 +862,7 @@
     "chooseNewTarget": "Wybierz nowy cel czaru",
     "chooseNewTargetForSpell": "Wybierz nowy cel dla {{spell}}",
     "chooseCreatureToExplore": "Wybierz, który stwór eksploruje jako następny",
+    "chooseCreatureToEquip": "Wybierz stwora do wyposażenia",
     "chooseCreatureTokenToPopulate": "Wybierz żeton stwora do populacji",
     "chooseReturnAsAuraTarget": "Wybierz permanent do zaczarowania",
     "tapUntappedCreatures_one": "Obróć {{count}} nieobróconego stwora",
@@ -880,6 +898,7 @@
     },
     "confirmTap": "Potwierdź obrócenie ({{selected}}/{{count}})",
     "keepCurrentTargets": "Zachowaj bieżące cele",
+    "keepCurrentTarget": "Zachowaj ten cel",
     "skip": "Pomiń",
     "opponentChoice": "(wybór przeciwnika)",
     "sacrificeExact_one": "Sacrifice {{count}} permanent",
@@ -1134,6 +1153,8 @@
       "usePowder": "Użyj {{name}}",
       "powderDescription": "Wygnaj każdą kartę z ręki, dobierz tyle samo — to nie mulligan",
       "powderTooltip": "Wygnaj każdą kartę z ręki i dobierz tyle samo. To nie mulligan — liczba i karty na spodzie pozostają bez zmian.",
+      "freeReveal": "Pokaż i dobierz ponownie (za darmo)",
+      "freeRevealDescription": "Pokaż rękę, przetasuj ją i dobierz 7 — za darmo, bez kart na spód, to nie mulligan",
       "eyebrowMulligan": "Mulligan {{count}} · Londyński",
       "eyebrowOpening": "Ręka startowa · Mulligan londyński",
       "reviewTitle": "Przejrzyj swoją rękę startową",
@@ -1698,6 +1719,10 @@
     "empowerJace": {
       "title": "Wzmocnij Jace'a",
       "subtitle": "Wybierz kontrolowany przez siebie żeton Jace'a, aby zyskał +{{count}} lojalności"
+    },
+    "spellCopyOrder": {
+      "title": "Ustal kolejność kopii",
+      "subtitle": "Wybierz czar, którego kopia trafi teraz na stos"
     },
     "collectEvidence": {
       "title": "Zbierz dowody",
@@ -2381,7 +2406,8 @@
     "confirm": "Potwierdź",
     "badgeNewTarget": "Nowy cel",
     "slotLabel": "Cel {{index}}: {{current}} → {{chosen}}",
-    "unselected": "bez zmian"
+    "unselected": "bez zmian",
+    "keep": "Zachowaj"
   },
   "separatePiles": {
     "chooserName": "Gracz {{number}}",

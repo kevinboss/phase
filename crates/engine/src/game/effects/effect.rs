@@ -301,6 +301,7 @@ fn register_transient_effect(
     end_permission: Option<&EndEffectPermission>,
 ) {
     let modifications = snapshot_transient_modifications(state, ability, &static_def.modifications);
+    let modifications = latch_chosen_text_words(state, modifications);
 
     // CR 708.5: A duration-bound "you may look at face-down [permanents] you don't
     // control any time" permission (Lumbering Laundry) is a *player-scoped* look
@@ -486,7 +487,7 @@ fn register_transient_effect(
         let source_is_current = if ability.trigger_source.is_some() {
             ability.self_ref_is_current(state)
         } else {
-            ability.source_is_current(state)
+            ability.self_ref_binding(state).is_some()
         };
         if !source_is_current {
             // CR 113.7a: only this definition loses its source recipient; the
@@ -591,9 +592,16 @@ fn register_transient_effect(
             .iter()
             .any(|target| matches!(target, TargetRef::Object(_)))
             || forwarded_parent_target);
+    // CR 608.2b + CR 608.2c: a `DeclaredPlayer` application filter names one
+    // declared slot of the resolving chain, so it binds through
+    // `transient_bound_filters` (zero or one player) and never through the
+    // local target list, whichever other targets were carried.
+    let declared_player_binding =
+        application_filter.is_some_and(|f| matches!(f, TargetFilter::DeclaredPlayer { .. }));
     let direct_binding_uses_targets = target_filter.is_some()
         || application_filter.is_some_and(generic_effect_affected_uses_inherited_targets)
-        || inherited_object_target;
+        || inherited_object_target
+        || declared_player_binding;
     // CR 608.2b + CR 608.2c: a `ParentTargetSlot` anaphor names a DECLARED slot
     // of the resolving chain root, so it binds through the carrier rather than
     // through this node's local list. Chain propagation copies the immediately
@@ -605,8 +613,9 @@ fn register_transient_effect(
     // broadcast path and drop its grant, but CR 608.2b's Plague Spores example
     // keeps it: "other parts of the effect for which those targets are not
     // illegal may still affect them."
-    let slot_anaphor_binding = application_filter
-        .is_some_and(|filter| matches!(filter, TargetFilter::ParentTargetSlot { .. }));
+    let slot_anaphor_binding = declared_player_binding
+        || application_filter
+            .is_some_and(|filter| matches!(filter, TargetFilter::ParentTargetSlot { .. }));
 
     // CR 611.1 + CR 611.2c + CR 115.1: Targeted effects — register one transient
     // continuous effect per target. `TargetRef::Object` binds to
@@ -684,16 +693,19 @@ fn register_transient_effect(
             );
         }
         // Pass-through: the caller already pinned a specific player.
+        // CR 800.4a: a player who left the game holds no objects.
         Some(TargetFilter::SpecificPlayer { id }) => {
-            install_transient(
-                state,
-                end_permission,
-                ability,
-                duration.clone(),
-                TargetFilter::SpecificPlayer { id: *id },
-                modifications.clone(),
-                static_def.condition.clone(),
-            );
+            if crate::game::players::is_alive(state, *id) {
+                install_transient(
+                    state,
+                    end_permission,
+                    ability,
+                    duration.clone(),
+                    TargetFilter::SpecificPlayer { id: *id },
+                    modifications.clone(),
+                    static_def.condition.clone(),
+                );
+            }
         }
         // CR 104.3: "There are several ways to lose the game." + CR 119.7: "If an
         // effect says that a player can't gain life, that player can't make their
@@ -942,6 +954,15 @@ fn transient_bound_filters(
         return parent_target_slot_filters(state, ability, *index);
     }
 
+    // CR 608.2b + CR 608.2c: the declared player of the chain, bound to no one
+    // when that target was illegal on resolution.
+    if let Some(TargetFilter::DeclaredPlayer { group }) = resolved_filter {
+        return crate::game::targeting::resolve_live_declared_player(state, ability, *group)
+            .map(|id| TargetFilter::SpecificPlayer { id })
+            .into_iter()
+            .collect();
+    }
+
     // The `skip` is positional (it drops a companion player slot), but it skips
     // from the FRONT of a list whose leading element is a player ref, and
     // `live_object_targets` passes every `TargetRef::Player` through unfiltered.
@@ -1066,6 +1087,49 @@ pub fn generic_effect_population_filter<'a>(
         .find_map(|static_def| {
             generic_effect_application_filter(target_filter, static_def.affected.as_ref())
         })
+}
+
+/// CR 608.2d + CR 611.2c: the pending `Chosen` modification latches to the `Fixed` pair the controller just named, and the answer is taken so a skipped prompt can never latch a stale earlier one.
+fn latch_chosen_text_words(
+    state: &mut GameState,
+    modifications: Vec<ContinuousModification>,
+) -> Vec<ContinuousModification> {
+    use crate::types::ability::{ChoiceValue, TextSubstitution, TextSubstitutionSpec};
+
+    let has_chosen = modifications.iter().any(|m| {
+        matches!(
+            m,
+            ContinuousModification::SubstituteTextWord {
+                substitution: TextSubstitutionSpec::Chosen { .. },
+            }
+        )
+    });
+    if !has_chosen {
+        return modifications;
+    }
+    let answer = state.last_named_choice.take();
+    modifications
+        .into_iter()
+        .map(|modification| match modification {
+            ContinuousModification::SubstituteTextWord {
+                substitution: TextSubstitutionSpec::Chosen { domains },
+            } => {
+                let latched = match &answer {
+                    Some(ChoiceValue::Label(label)) => {
+                        TextSubstitution::from_label(label, &domains)
+                    }
+                    _ => None,
+                };
+                ContinuousModification::SubstituteTextWord {
+                    substitution: latched.map_or(
+                        TextSubstitutionSpec::Chosen { domains },
+                        TextSubstitutionSpec::Fixed,
+                    ),
+                }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 fn snapshot_transient_modifications(
@@ -5002,6 +5066,42 @@ mod tests {
                 .affected,
             TargetFilter::SpecificObject { id: army },
             "the grant must name the amassed Army itself"
+        );
+    }
+
+    /// CR 608.2d: the word answer latches once, so a later effect whose prompt was skipped must not read it.
+    #[test]
+    fn text_word_latch_consumes_the_answer() {
+        use crate::types::ability::{
+            ChoiceValue, TextSubstitution, TextSubstitutionSpec, TextWordDomain,
+        };
+
+        let mut state = GameState::new_two_player(42);
+        let chosen = || {
+            vec![ContinuousModification::SubstituteTextWord {
+                substitution: TextSubstitutionSpec::Chosen {
+                    domains: vec![TextWordDomain::BasicLandType],
+                },
+            }]
+        };
+        state.last_named_choice = Some(ChoiceValue::Label("Swamp -> Plains".into()));
+
+        let latched = latch_chosen_text_words(&mut state, chosen());
+        let expected =
+            TextSubstitution::from_label("Swamp -> Plains", &[TextWordDomain::BasicLandType])
+                .expect("valid pair");
+        assert_eq!(
+            latched,
+            [ContinuousModification::SubstituteTextWord {
+                substitution: TextSubstitutionSpec::Fixed(expected),
+            }]
+        );
+        assert!(state.last_named_choice.is_none(), "the answer is taken");
+
+        assert_eq!(
+            latch_chosen_text_words(&mut state, chosen()),
+            chosen(),
+            "with no fresh answer the effect stays inert"
         );
     }
 }

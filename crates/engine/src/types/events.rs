@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::counter::CounterType;
+use crate::types::ability::AttachmentReferent;
 
 use super::ability::{
     AbilityTag, AttachmentKind, CostPaidObjectSnapshot, EffectKind, FilterProp, TargetFilter,
@@ -30,6 +31,22 @@ fn default_nth_in_step() -> u32 {
 
 fn default_nth_in_turn() -> u32 {
     1
+}
+
+/// CR 115.1 + CR 113.8 + CR 601.2c: the stack object that announced a target,
+/// recorded when the target is chosen. "That spell or ability's controller"
+/// names that stack object, not the source permanent an ability's
+/// `BecomesTarget.source_id` points at (CR 113.7a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum Targeter {
+    /// A spell, by its announcement identity. Control of a spell can change
+    /// while it is on the stack (CR 109.4), so its controller is read live, or
+    /// as it last existed there once it has left (CR 608.2h).
+    Spell(super::game_state::SpellAnnouncement),
+    /// An activated or triggered ability. Its controller is fixed once it is on
+    /// the stack (CR 113.8): the event's `source_controller`.
+    Ability(super::ability::StackAbilityKind),
 }
 
 /// A passive, viewer-safe snapshot of one face seen during a hidden-zone search.
@@ -617,6 +634,7 @@ impl EventObjectSnapshot {
             | TargetFilter::TriggeringSource
             | TargetFilter::EventTarget
             | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
             | TargetFilter::OriginalSource
             | TargetFilter::PostReplacementDamageTarget
             // CR 615.5 + CR 615: object/compound referents never reachable from
@@ -772,7 +790,10 @@ impl EventObjectSnapshot {
             FilterProp::HasSingleTarget
             | FilterProp::Targets { .. }
             | FilterProp::TargetsOnly { .. }
-            | FilterProp::Modal => PermanentDomainFalse,
+            | FilterProp::Modal
+            // CR 722.3d: a prepare spell is a Stack-zone object by definition, so a
+            // permanent subject is a decided false, not a gap.
+            | FilterProp::PrepareSpell => PermanentDomainFalse,
 
             // ---- unsupported: needs a live candidate lookup or an unmodeled field ----
             // Not reachable from the subject grammar today. Reaching one fails the gate,
@@ -802,9 +823,10 @@ impl EventObjectSnapshot {
             // CR 607.2a: This compares against an object linked in the live
             // exile-link side table, which event snapshots deliberately omit.
             | FilterProp::SameNameAsExiledBySource
-            | FilterProp::AttachedToSource
-            | FilterProp::AttachedToRecipient
-            | FilterProp::AttachedToPlayer { .. }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Source }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Recipient }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
+            | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
             | FilterProp::Unpaired
             | FilterProp::OtherThanTriggerObject
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
@@ -1095,6 +1117,13 @@ pub enum GameEvent {
         /// `None` for self-initiated taps (mana abilities, attacking, crew, costs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caused_by: Option<ObjectId>,
+        /// CR 400.7 + CR 608.2h: the incarnation of the permanent that became
+        /// tapped. If it leaves the battlefield and returns before a trigger
+        /// that reads "that permanent's controller" resolves (Royal Decree vs.
+        /// a blink), the returned permanent is a new object; this names the one
+        /// that was tapped. `None` on legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<u64>,
     },
     /// CR 701.43a + CR 701.43d: A creature was exerted as it attacked. Fires the
     /// linked `TriggerMode::Exerted` "when you do" trigger (Combat Celebrant,
@@ -1246,6 +1275,14 @@ pub enum GameEvent {
         /// CR 120.10: Excess damage beyond lethal for creatures/planeswalkers/battles.
         #[serde(default)]
         excess: u32,
+        /// CR 400.7 + CR 608.2h: the incarnation of the object that dealt the
+        /// damage. If it leaves the battlefield and returns before a trigger
+        /// that reads "that creature's controller" resolves (a blink), the
+        /// returned permanent is a new object; this names the one that dealt
+        /// the damage. `None` on legacy events and for a source with no live
+        /// object.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_incarnation: Option<u64>,
     },
     /// CR 615: Damage was prevented (by a prevention shield or protection).
     /// Enables "when damage is prevented" triggers.
@@ -1448,6 +1485,12 @@ pub enum GameEvent {
         target: TargetRef,
         source_id: ObjectId,
         source_controller: PlayerId,
+        /// CR 115.1 + CR 113.8: which stack object announced the target.
+        /// `None` on events built before this was recorded (legacy saves, and
+        /// hand-built test events): readers fall back to the object authority
+        /// on `source_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targeter: Option<Targeter>,
     },
     /// CR 702.122e: A Vehicle's crew ability resolved.
     /// Carries creature list for trigger conditions that reference "creatures that crewed it".
@@ -1555,6 +1598,11 @@ pub enum GameEvent {
         /// damage step — the sum of all `source_amounts` entries.
         #[serde(default)]
         total_damage: u32,
+        /// CR 400.7 + CR 608.2h: the incarnation of each `source_amounts`
+        /// source as it dealt the damage, carried into the per-source
+        /// `DamageDealt` a trigger records. Empty on legacy events.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_incarnations: Vec<crate::types::identifiers::ObjectIncarnationRef>,
     },
     PlayerEliminated {
         player_id: PlayerId,
@@ -1951,6 +1999,24 @@ pub enum GameEvent {
     },
 }
 
+impl GameEvent {
+    /// CR 400.7 + CR 608.2h: a `PermanentTapped` event for `object_id`, stamped
+    /// with the incarnation of the permanent that is tapped now, so a later
+    /// "that permanent's controller" names this object even if it has left and
+    /// returned as a new one.
+    pub(crate) fn permanent_tapped(
+        state: &super::game_state::GameState,
+        object_id: ObjectId,
+        caused_by: Option<ObjectId>,
+    ) -> Self {
+        GameEvent::PermanentTapped {
+            object_id,
+            caused_by,
+            incarnation: state.objects.get(&object_id).map(|obj| obj.incarnation),
+        }
+    }
+}
+
 /// CR 603.2 + CR 702.59a: True when an off-zone trigger source was already
 /// functioning in `zone` when `event` occurred — i.e. it did not co-depart into
 /// that zone as the triggering object moved there. Shared by off-zone trigger
@@ -2113,6 +2179,7 @@ mod tests {
             amount: 3,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         };
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: GameEvent = serde_json::from_str(&serialized).unwrap();
@@ -2137,6 +2204,7 @@ mod tests {
             player_id: PlayerId(1),
             source_amounts: vec![(ObjectId(10), 3), (ObjectId(11), 4)],
             total_damage: 7,
+            source_incarnations: vec![],
         };
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: GameEvent = serde_json::from_str(&serialized).unwrap();
@@ -2238,6 +2306,14 @@ mod tests {
             properties: vec![FilterProp::HasSingleTarget],
         });
         assert_eq!(classify(&stack_prop), PermanentDomainFalse);
+
+        // CR 722.3d: a prepare spell is only ever a Stack-zone object.
+        let prepare_spell = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: None,
+            properties: vec![FilterProp::PrepareSpell],
+        });
+        assert_eq!(classify(&prepare_spell), PermanentDomainFalse);
     }
 
     /// A shape that needs a live candidate lookup is `Unsupported` — the signal that the

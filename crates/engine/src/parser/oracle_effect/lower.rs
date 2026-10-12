@@ -54,13 +54,13 @@ use super::subject;
 use super::{
     each_target_filter_mut, has_typed_target, is_broadcast_population_filter, parse_effect_clause,
     parse_event_context_ref_with_ctx, parse_for_each_object_copy_parts,
-    refine_damage_target_remainder, replace_player_anaphor_with_parent_target,
-    scan_contains_phrase, target_filter_controller_ref, ParsedEffectClause,
+    refine_damage_target_remainder, replace_player_anaphor, scan_contains_phrase,
+    target_filter_controller_ref, ParsedEffectClause,
 };
 use crate::game::effects::effect::generic_effect_population_filter;
 
 pub(super) fn rewrite_player_anaphor_targets_in_definition(def: &mut AbilityDefinition) {
-    replace_player_anaphor_with_parent_target(def.effect.as_mut());
+    replace_player_anaphor(def.effect.as_mut(), || TargetFilter::ParentTarget);
     if let Some(sub) = def.sub_ability.as_deref_mut() {
         rewrite_player_anaphor_targets_in_definition(sub);
     }
@@ -3818,6 +3818,7 @@ fn ability_reads_last_created(def: &AbilityDefinition) -> bool {
             | TargetFilter::EventTargetController
             | TargetFilter::ParentTarget
             | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
             | TargetFilter::ParentTargetController
             | TargetFilter::ParentTargetOwner
             | TargetFilter::SourceChosenPlayer
@@ -3914,6 +3915,7 @@ pub(super) fn filter_tree_has_chosen_card(filter: &TargetFilter) -> bool {
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -6573,6 +6575,7 @@ fn strip_performed_action_this_way_clause(
         | PlayerFilter::OpponentAttacked { .. }
         | PlayerFilter::OpponentAttackingEnchantedPlayer
         | PlayerFilter::AllExcept { .. }
+        | PlayerFilter::AnyOf { .. }
         | PlayerFilter::HighestSpeed
         | PlayerFilter::ZoneChangedThisWay
         | PlayerFilter::PerformedActionThisWay { .. }
@@ -6588,6 +6591,7 @@ fn strip_performed_action_this_way_clause(
         | PlayerFilter::ChosenPlayer { .. }
         | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::GrantingObjectCaster
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::TrackedSetPossessor { .. } => return None,
     };
     let (remainder, action) =
@@ -10778,7 +10782,35 @@ fn parse_amount_of_mana_paid_this_way(input: &str) -> OracleResult<'_, ()> {
     Ok((input, ()))
 }
 
+/// Whether a where-X / equal-to quantity phrase may read a non-determiner
+/// "<name>'s power/toughness" as the card's own printed name
+/// (`parse_where_x_printed_name_possessive_stat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintedNamePossessive {
+    /// The where-X binder: "where X is Halana and Alena's power" names the source.
+    Source,
+    /// The count entry's equal-to chain: a foreign possessive ("your
+    /// Ring-bearer's power") is a miss, never the source's own stat.
+    Declined,
+}
+
 pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Option<QuantityExpr> {
+    parse_where_x_quantity_with(where_x_expression, PrintedNamePossessive::Source)
+}
+
+/// Every arm of [`parse_where_x_quantity_expression`] except the printed-name
+/// possessive arm. The count entry's equal-to chain
+/// (`oracle_util::parse_equal_to_count`) reads its quantity through this core so
+/// "mills cards equal to your Ring-bearer's power" stays a miss instead of
+/// becoming the source's power.
+pub(crate) fn parse_where_x_quantity_core(where_x_expression: &str) -> Option<QuantityExpr> {
+    parse_where_x_quantity_with(where_x_expression, PrintedNamePossessive::Declined)
+}
+
+fn parse_where_x_quantity_with(
+    where_x_expression: &str,
+    possessive: PrintedNamePossessive,
+) -> Option<QuantityExpr> {
     let expression = where_x_expression.trim().trim_end_matches('.');
     let expression_lower = expression.to_ascii_lowercase();
     // CR 702.51c + CR 603.3: Knight-Errant of Eos reads the number of
@@ -10853,7 +10885,7 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
         .parse(expression_lower.as_str())
     {
         let consumed = expression_lower.len() - rest_lower.len();
-        if let Some(inner) = parse_where_x_quantity_expression(&expression[consumed..]) {
+        if let Some(inner) = parse_where_x_quantity_with(&expression[consumed..], possessive) {
             let inner = if sign < 0 {
                 QuantityExpr::Multiply {
                     factor: -1,
@@ -10963,8 +10995,10 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     // ability source (Halana and Alena, Partners). Must precede
     // `parse_event_context_quantity`, which only recognizes anaphoric/participle
     // possessives.
-    if let Some(expr) = parse_where_x_printed_name_possessive_stat(expression_lower.as_str()) {
-        return Some(expr);
+    if possessive == PrintedNamePossessive::Source {
+        if let Some(expr) = parse_where_x_printed_name_possessive_stat(expression_lower.as_str()) {
+            return Some(expr);
+        }
     }
     // CR 706.2 + CR 706.4: "where X is the result" of a die roll / coin flip
     // binds X to the rolled value via the shared `EventContextAmount` channel
@@ -11167,7 +11201,7 @@ fn parse_where_x_scry_look_count(where_x_expression: &str) -> Option<QuantityExp
 /// to bind. A node with no X reference is returned unchanged as `Some`, so an
 /// unrepresentable where-X clause on an ability that never uses X cannot poison
 /// that ability.
-pub(super) fn apply_where_x_quantity_expression(
+pub(crate) fn apply_where_x_quantity_expression(
     value: QuantityExpr,
     where_x_expression: Option<&str>,
 ) -> Option<QuantityExpr> {
@@ -11958,6 +11992,7 @@ fn apply_where_x_continuous_modification(
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::RetainAllOtherAbilitiesFromSource
@@ -12061,6 +12096,7 @@ fn rebind_target_anaphor_continuous_modification(modification: &mut ContinuousMo
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::RetainAllOtherAbilitiesFromSource

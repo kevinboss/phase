@@ -25,7 +25,7 @@ use nom::multi::separated_list1;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
-use super::oracle_ir::context::{ParseContext, TriggerConditionObjects};
+use super::oracle_ir::context::{ParseContext, PlayerAntecedents, TriggerConditionObjects};
 use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::condition::{
     inject_controller_you, parse_life_total_comparator, parse_spell_history_filter,
@@ -290,12 +290,12 @@ pub(crate) fn parse_quantity_ref_with_context(
 
     // CR 109.5 + CR 122.1: the context-aware entry for anaphoric populations;
     // grammar lives in parse_counters_on_population. The caller's context is
-    // carried (subject, trigger, actor, chain-bound qualifiers) with its
-    // third-person player as the referent of "they control" / "that player
-    // controls". The read runs on a tentative clone committed back only on
+    // carried (subject, trigger, declared players, chain-bound qualifiers).
+    // The shared controller binder selects the referent of "they control" /
+    // "that player controls"; an optional actor is not an antecedent.
+    // The read runs on a tentative clone committed back only on
     // success (the `ChosenColorQualifierScope` merge-back rule), so a pending
-    // printed-colour choice it records reaches the chain; the scope override
-    // stays local to this read.
+    // printed-colour choice it records reaches the chain.
     if let Ok((population, _)) = alt((
         tag::<_, _, OracleError<'_>>("the total number of "),
         tag("the number of "),
@@ -303,14 +303,9 @@ pub(crate) fn parse_quantity_ref_with_context(
     .parse(trimmed)
     {
         let mut population_ctx = ctx.clone();
-        population_ctx.relative_player_scope = Some(
-            ctx.third_person_player_controller_ref()
-                .unwrap_or(ControllerRef::ScopedPlayer),
-        );
         if let Ok(("", qty)) =
             nom_quantity::parse_counters_on_population_with_ctx(population, &mut population_ctx)
         {
-            population_ctx.relative_player_scope = ctx.relative_player_scope.clone();
             *ctx = population_ctx;
             return Some(qty);
         }
@@ -517,9 +512,7 @@ pub(crate) fn parse_quantity_ref_with_context(
             }
         }
 
-        // CR 608.2i: past-tense "you controlled" look-back. tag("you control") in
-        // parse_zone_controller has no word boundary and would prefix-match
-        // "you controlled", corrupting the remainder to "led …". Isolate the bare
+        // CR 608.2i: past-tense "you controlled" look-back. Isolate the bare
         // head via take_until(" you controlled ") BEFORE parse_type_phrase_folding, then
         // re-inject ControllerRef::You. Reuses the inject_controller_you building
         // block; same strip-controller-before-type-phrase ordering as
@@ -1018,6 +1011,13 @@ pub(crate) fn parse_cda_quantity_with_context(
         }
     }
 
+    if let Ok((rest, expr)) = parse_cards_put_into_target_player_graveyard_from_zones_quantity(text)
+    {
+        if rest.is_empty() {
+            return Some(expr);
+        }
+    }
+
     // "the number of card types among cards in all graveyards"
     // "the number of cards in your opponents' graveyards" / "cards in opponents' graveyards"
     if text.contains("cards in your opponents' graveyards")
@@ -1357,6 +1357,36 @@ fn parse_cards_put_into_graveyard_from_zones_quantity(
     let (rest, refs) = all_consuming(preceded(
         tag("the number of "),
         nom_quantity::parse_cards_put_into_your_graveyard_from_zones,
+    ))
+    .parse(input)?;
+    let mut exprs: Vec<QuantityExpr> = refs
+        .into_iter()
+        .map(|qty| QuantityExpr::Ref { qty })
+        .collect();
+    let expr = if exprs.len() == 1 {
+        exprs.remove(0)
+    } else {
+        QuantityExpr::Sum { exprs }
+    };
+    Ok((rest, expr))
+}
+
+/// CR 107.3c + CR 701.17a (mill = library to graveyard) + CR 400.7 +
+/// CR 404.1 + CR 111.7: "the number of [type] cards [that were] put into
+/// target player's graveyard from their hand or library this turn" (Cruel
+/// Calculations). Sole owner of the target-player zone-list forms (1..n origin
+/// zones): a single origin collapses to a bare `Ref`, several build a `Sum`
+/// of per-origin `ZoneChangeCountThisTurn` refs (disjoint, so exact).
+/// Anchored at both ends: the leading "the number of " and `all_consuming`
+/// after " this turn". Declines everything the your-form declines, plus mixed
+/// possessives and a bare "their graveyard" without the "target player's"
+/// head.
+fn parse_cards_put_into_target_player_graveyard_from_zones_quantity(
+    input: &str,
+) -> nom::IResult<&str, QuantityExpr, OracleError<'_>> {
+    let (rest, refs) = all_consuming(preceded(
+        tag("the number of "),
+        nom_quantity::parse_cards_put_into_target_player_graveyard_from_zones,
     ))
     .parse(input)?;
     let mut exprs: Vec<QuantityExpr> = refs
@@ -3297,7 +3327,7 @@ pub(crate) fn parse_for_each_clause(clause: &str) -> Option<QuantityRef> {
     }
     let mut qty = parse_for_each_clause_with_they_controller(
         clause,
-        ControllerRef::ScopedPlayer,
+        PlayerAntecedents::for_each_iteration_unscoped(),
         &ParseContext::default(),
     )?;
     // CR 608.2k: settle a deferred counter-COUNT anaphor for every caller that
@@ -3339,7 +3369,7 @@ pub(crate) fn parse_for_each_clause_deferred(
     }
     parse_for_each_clause_with_they_controller(
         clause,
-        ControllerRef::ScopedPlayer,
+        PlayerAntecedents::for_each_iteration_unscoped(),
         &ParseContext::default(),
     )
 }
@@ -3436,10 +3466,11 @@ pub(crate) fn parse_for_each_clause_with_context(
     if counter_kinds_pronoun_number(clause).is_some() {
         return None;
     }
-    let they_controller = ctx
-        .third_person_player_controller_ref()
-        .unwrap_or(ControllerRef::ScopedPlayer);
-    let mut qty = parse_for_each_clause_with_they_controller(clause, they_controller, ctx)?;
+    let mut qty = parse_for_each_clause_with_they_controller(
+        clause,
+        PlayerAntecedents::for_each_iteration(ctx),
+        ctx,
+    )?;
     // CR 608.2k: same settle as `parse_for_each_clause` — the counter-COUNT
     // anaphor keeps its established reading here, the ability's own object.
     settle_deferred_counter_anaphor_ref(&mut qty);
@@ -3448,7 +3479,7 @@ pub(crate) fn parse_for_each_clause_with_context(
 
 fn parse_for_each_clause_with_they_controller(
     clause: &str,
-    they_controller: ControllerRef,
+    antecedents: PlayerAntecedents,
     ctx: &ParseContext,
 ) -> Option<QuantityRef> {
     let clause = clause.trim().trim_end_matches('.');
@@ -3459,7 +3490,7 @@ fn parse_for_each_clause_with_they_controller(
 
     if let Ok((rest, qty)) = nom_quantity::parse_for_each_clause_ref_with_context(
         clause,
-        &for_each_anaphor_context(ctx, &they_controller),
+        &for_each_anaphor_context(ctx, &antecedents),
     ) {
         if rest.is_empty() {
             return Some(qty);
@@ -3836,7 +3867,7 @@ fn parse_for_each_clause_with_they_controller(
     // God and other caster-relative counts are unchanged. CR 608.2c: the controller
     // follows instructions in order, so a per-player-scoped count reads the
     // iterating player.
-    let mut tp_ctx = for_each_anaphor_context(ctx, &they_controller);
+    let mut tp_ctx = for_each_anaphor_context(ctx, &antecedents);
     let (filter, remainder) = parse_type_phrase_folding_with_ctx(clause, &mut tp_ctx);
     if !matches!(filter, TargetFilter::Any) && remainder.trim().is_empty() {
         return Some(QuantityRef::ObjectCount { filter });
@@ -3845,14 +3876,12 @@ fn parse_for_each_clause_with_they_controller(
     None
 }
 
-fn for_each_anaphor_context(ctx: &ParseContext, they_controller: &ControllerRef) -> ParseContext {
+fn for_each_anaphor_context(ctx: &ParseContext, antecedents: &PlayerAntecedents) -> ParseContext {
     ParseContext {
-        relative_player_scope: Some(they_controller.clone()),
-        subject: ctx.subject.clone(),
-        card_name: ctx.card_name.clone(),
-        host_self_reference: ctx.host_self_reference.clone(),
-        current_trigger_index: ctx.current_trigger_index,
-        ..Default::default()
+        relative_player_scope: antecedents.third_person.clone(),
+        declared_player_scope: None,
+        prior_player_declaration: false,
+        ..ctx.clone()
     }
 }
 
@@ -3961,6 +3990,8 @@ fn with_target_controller(filter: TargetFilter, controller: ControllerRef) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_ir::context::ChosenColorQualifierScope;
+    use crate::types::ability::ChoiceType;
     use crate::types::ability::{
         CardTypeSetSource, Comparator, ControllerRef, FilterProp, PtStat, PtValueScope,
         RoundingMode, SubtypeExclusion, TypeFilter, TypedFilter,
@@ -5351,7 +5382,12 @@ mod tests {
                     }),
             } => {
                 assert_eq!(controller, None);
-                assert_eq!(properties, vec![FilterProp::AttachedToSource]);
+                assert_eq!(
+                    properties,
+                    vec![FilterProp::AttachedTo {
+                        to: crate::types::ability::AttachmentReferent::Source
+                    }]
+                );
                 assert_eq!(type_filters, vec![TypeFilter::Subtype("Equipment".into())]);
             }
             other => panic!("expected ObjectCount{{AttachedToSource}}, got {other:?}"),
@@ -5368,7 +5404,12 @@ mod tests {
             QuantityRef::ObjectCount {
                 filter: TargetFilter::Typed(TypedFilter { properties, .. }),
             } => {
-                assert_eq!(properties, vec![FilterProp::AttachedToRecipient]);
+                assert_eq!(
+                    properties,
+                    vec![FilterProp::AttachedTo {
+                        to: crate::types::ability::AttachmentReferent::Recipient
+                    }]
+                );
             }
             other => panic!("expected recipient ObjectCount, got {other:?}"),
         }
@@ -5386,8 +5427,11 @@ mod tests {
                 filter: TargetFilter::Typed(TypedFilter { properties, .. }),
             } => {
                 assert!(
-                    !properties.contains(&FilterProp::AttachedToSource)
-                        && !properties.contains(&FilterProp::AttachedToRecipient),
+                    !properties.contains(&FilterProp::AttachedTo {
+                        to: crate::types::ability::AttachmentReferent::Source
+                    }) && !properties.contains(&FilterProp::AttachedTo {
+                        to: crate::types::ability::AttachmentReferent::Recipient
+                    }),
                     "generic ObjectCount must not gain an attachment prop, got {properties:?}"
                 );
             }
@@ -6698,8 +6742,8 @@ mod tests {
     /// CR 107.x + CR 506.2: Mr. Foxglove's binary-minus draw count composes
     /// `Sum[left, Multiply{-1, right}]` over two dynamic hand-size quantities,
     /// the right one negated. This is the arithmetic-aware shape the draw
-    /// effect-construction fallback (`try_parse_equal_to_quantity_effect`)
-    /// reaches via `parse_cda_quantity`.
+    /// count position's equal-to chain (`oracle_util::parse_equal_to_count`)
+    /// reaches via `parse_cda_quantity_with_context`.
     #[test]
     fn parse_cda_quantity_defending_minus_your_hand() {
         let result = parse_cda_quantity(
@@ -7302,6 +7346,24 @@ mod tests {
             panic!("Expected ObjectCount over Typed filter, got {qty:?}");
         };
         assert_eq!(typed.controller, Some(ControllerRef::You));
+    }
+
+    /// CR 109.5: "they" is never "you". The "for each" entry seeds "they" from
+    /// the relative player scope or the iterating player, never from `actor`.
+    #[test]
+    fn for_each_entry_does_not_read_actor() {
+        let ctx = ParseContext {
+            actor: Some(ControllerRef::You),
+            ..Default::default()
+        };
+        let qty = parse_for_each_clause_with_context("creature they control", &ctx).unwrap();
+        let QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(typed),
+        } = qty
+        else {
+            panic!("Expected ObjectCount over Typed filter, got {qty:?}");
+        };
+        assert_eq!(typed.controller, Some(ControllerRef::ScopedPlayer));
     }
 
     #[test]
@@ -9669,24 +9731,21 @@ mod tests {
         );
         assert_eq!(
             parse_quantity_ref_with_context(text, &mut ParseContext::default()),
-            Some(QuantityRef::CountersOnObjects {
-                counter_type: Some(CounterType::Plus1Plus1),
-                filter: TargetFilter::Typed(
-                    TypedFilter::creature().controller(ControllerRef::ScopedPlayer)
-                ),
-            })
+            None
         );
-        // The actor stands in for a missing relative scope (third-person player).
+        // An optional actor is not a controller antecedent.
         let mut acting = ParseContext {
             actor: Some(ControllerRef::Opponent),
             ..Default::default()
         };
+        assert_eq!(parse_quantity_ref_with_context(text, &mut acting), None);
+        acting.relative_player_scope = Some(ControllerRef::DefendingPlayer);
         assert_eq!(
             parse_quantity_ref_with_context(text, &mut acting),
             Some(QuantityRef::CountersOnObjects {
                 counter_type: Some(CounterType::Plus1Plus1),
                 filter: TargetFilter::Typed(
-                    TypedFilter::creature().controller(ControllerRef::Opponent)
+                    TypedFilter::creature().controller(ControllerRef::DefendingPlayer)
                 ),
             })
         );
@@ -9734,10 +9793,39 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // CR 107.3c + CR 701.17a + CR 400.7 + CR 404.1 + CR 115.1a:
+    // "the number of cards [that were] put into target player's graveyard from
+    // their hand or library this turn" (Cruel Calculations).
+    // -----------------------------------------------------------------------
+
+    const CRUEL_POSITIVE: &str =
+        "the number of cards that were put into target player's graveyard from their library this turn";
+
+    fn put_into_target_player_graveyard_ref(
+        from: Zone,
+        type_filter: Option<TypeFilter>,
+    ) -> QuantityExpr {
+        let base = match type_filter {
+            Some(tf) => TypedFilter::new(tf),
+            None => TypedFilter::default(),
+        };
+        QuantityExpr::Ref {
+            qty: QuantityRef::ZoneChangeCountThisTurn {
+                from: Some(from),
+                to: Some(Zone::Graveyard),
+                filter: TargetFilter::Typed(base.properties(vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::TargetPlayer,
+                    },
+                    FilterProp::NonToken,
+                ])),
+            },
+        }
+    }
+
     #[test]
     fn counter_census_carries_and_commits_the_callers_chain_context() {
-        use crate::parser::oracle_ir::context::ChosenColorQualifierScope;
-        use crate::types::ability::ChoiceType;
         // CR 105.4 + CR 608.2c: the census reads its population under the
         // CALLER's context, not a fresh one. Only an effect-chain context
         // (`ChainBound`) may consume the printed "of the color of your choice"
@@ -9747,7 +9835,7 @@ mod tests {
         let text =
             "the number of +1/+1 counters on creatures they control of the color of your choice";
         let mut chain = ParseContext {
-            actor: Some(ControllerRef::Opponent),
+            relative_player_scope: Some(ControllerRef::Opponent),
             chosen_color_qualifier: ChosenColorQualifierScope::ChainBound,
             ..Default::default()
         };
@@ -9768,21 +9856,99 @@ mod tests {
             "the chooser request is committed to the caller's context"
         );
         assert_eq!(
-            chain.relative_player_scope, None,
-            "the 'they control' referent stays local to the census read"
+            chain.relative_player_scope,
+            Some(ControllerRef::Opponent),
+            "the census preserves the caller's player antecedent"
         );
 
         // The same phrase under an unbound context leaves the qualifier
         // unconsumed, so the census declines it rather than stamping a
         // chooser-less colour filter.
         let mut unbound = ParseContext {
-            actor: Some(ControllerRef::Opponent),
+            relative_player_scope: Some(ControllerRef::Opponent),
             ..Default::default()
         };
         assert_eq!(parse_quantity_ref_with_context(text, &mut unbound), None);
         assert_eq!(unbound.pending_printed_color_choice, None);
     }
 
+    #[test]
+    fn put_into_target_player_graveyard_single_origin_collapses_to_ref() {
+        let expected = put_into_target_player_graveyard_ref(Zone::Library, None);
+        for phrase in [
+            CRUEL_POSITIVE,
+            "the number of cards put into target player's graveyard from their library this turn",
+        ] {
+            assert_eq!(
+                parse_cda_quantity(phrase),
+                Some(expected.clone()),
+                "{phrase:?}"
+            );
+            assert_eq!(where_x(phrase), Some(expected.clone()), "{phrase:?}");
+        }
+    }
+
+    #[test]
+    fn put_into_target_player_graveyard_hand_or_library_builds_sum() {
+        let expected = QuantityExpr::Sum {
+            exprs: vec![
+                put_into_target_player_graveyard_ref(Zone::Hand, None),
+                put_into_target_player_graveyard_ref(Zone::Library, None),
+            ],
+        };
+        for phrase in [
+            "the number of cards that were put into target player's graveyard from their hand or library this turn",
+            "the number of cards that were put into target player's graveyard from their hand or their library this turn",
+        ] {
+            assert_eq!(parse_cda_quantity(phrase), Some(expected.clone()), "{phrase:?}");
+            assert_eq!(where_x(phrase), Some(expected.clone()), "{phrase:?}");
+        }
+    }
+
+    #[test]
+    fn put_into_target_player_graveyard_type_narrows() {
+        assert_eq!(
+            parse_cda_quantity(
+                "the number of creature cards that were put into target player's graveyard from their hand this turn"
+            ),
+            Some(put_into_target_player_graveyard_ref(
+                Zone::Hand,
+                Some(TypeFilter::Creature)
+            ))
+        );
+    }
+
+    /// Hostile sentences. Each decline is paired with the positive control so a
+    /// broken harness cannot make every row vacuously `None`.
+    #[test]
+    fn put_into_target_player_graveyard_hostile_variants_decline() {
+        assert!(where_x(CRUEL_POSITIVE).is_some(), "positive control");
+        for phrase in [
+            "the number of cards that were put into target player's graveyard from your library this turn",
+            "the number of cards that were put into target player's graveyard from their hand or your library this turn",
+            "the number of cards that were put into target player's graveyard from your hand or their library this turn",
+            "the number of cards that were put into their graveyard from their library this turn",
+            "the number of cards that were put into target player's graveyard from his or her library this turn",
+            "the number of cards that were put into target player's graveyard from their hand and library this turn",
+            "the number of cards that were put into target player's graveyard from their library or their library this turn",
+            "the number of cards that were put into target player's graveyard from their library or library this turn",
+            "the number of cards that were put into target player's graveyard from their exile this turn",
+            "the number of cards that were put into target player's graveyard from their graveyard this turn",
+            "the number of cards that were put into target player's graveyard from their library",
+            "the number of cards that were put into target player's graveyard from their library last turn",
+            "the number of cards that were put into target player's graveyard from their library this turn and exile",
+            "when the number of cards that were put into target player's graveyard from their library this turn",
+        ] {
+            assert_eq!(where_x(phrase), None, "where-X must decline {phrase:?}");
+            assert_eq!(
+                parse_cards_put_into_target_player_graveyard_from_zones_quantity(phrase)
+                    .ok()
+                    .filter(|(rest, _)| rest.is_empty()),
+                None,
+                "combinator must decline {phrase:?}"
+            );
+        }
+    }
     #[test]
     fn targeted_population_preserves_controller_domain_shape() {
         for (text, expected) in [

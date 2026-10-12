@@ -1,3 +1,4 @@
+use crate::types::game_state::RandomDraw;
 use rand::seq::IndexedRandom; // rand 0.9: `choose_multiple` on `[T]` lives here.
 
 use crate::game::filter::{matches_target_filter, FilterContext};
@@ -802,10 +803,10 @@ pub(crate) fn resolve_random_in_chain(
     // CR 608.2d (override): the game selects `count` distinct cards at random.
     let clamped = count.min(cards.len());
     let picked: Vec<ObjectId> = cards
-        .choose_multiple(&mut state.rng, clamped)
+        .choose_multiple(state.rng.draw(RandomDraw::Outcome), clamped)
         .copied()
         .collect();
-    ability.targets = picked.iter().map(|&id| TargetRef::Object(id)).collect();
+    ability.set_unpinned_targets(picked.iter().map(|&id| TargetRef::Object(id)).collect());
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::ChooseFromZone,
@@ -1260,7 +1261,7 @@ pub(crate) fn drain_active_per_player_zone_choice(
     };
     let (ability, mut cursor) = PerPlayerCursor::of(pending);
 
-    // CR 603.7 + CR 608.2c: The FIRST resolution of this per-player iteration
+    // CR 608.2c: The FIRST resolution of this per-player iteration
     // STARTS a fresh chosen-card set — even when that first player declines (an
     // empty "up to one" pick). It must NOT extend or inherit an earlier
     // producer's tracked set: Breach the Multiverse mills first (publishing a
@@ -1505,7 +1506,7 @@ fn collect_player_zone_cards(
         .collect()
 }
 
-/// CR 608.2c + CR 608.2d + CR 603.7: Resolve the candidate card pool for a
+/// CR 608.2c + CR 608.2d: Resolve the candidate card pool for a
 /// tracked-set pick.
 ///
 /// Priority order (the `Legacy` provenance; every other
@@ -1884,13 +1885,24 @@ fn object_ids_in_player_zone(state: &GameState, player: PlayerId, zone: Zone) ->
 
     match zone {
         Zone::Hand => player_state.hand.iter().copied().collect(),
-        Zone::Library => player_state.library.iter().copied().collect(),
-        Zone::Graveyard => player_state.graveyard.iter().copied().collect(),
+        Zone::Library => state.library_of(player_state.id).iter().copied().collect(),
+        Zone::Graveyard => state
+            .graveyard_of(player_state.id)
+            .iter()
+            .copied()
+            .collect(),
+        // CR 108.2 + CR 109.1: the choice is among the cards the player owns
+        // in exile; the CR 722.3c retained prepare copy is not a card.
         Zone::Exile => state
             .exile
             .iter()
             .copied()
-            .filter(|id| state.objects.get(id).is_some_and(|obj| obj.owner == player))
+            .filter(|id| {
+                state
+                    .objects
+                    .get(id)
+                    .is_some_and(|obj| obj.owner == player && obj.is_card_population_member())
+            })
             .collect(),
         Zone::Battlefield => state
             .battlefield
@@ -2141,6 +2153,7 @@ mod tests {
                 amount: combat_damage,
                 is_combat: true,
                 excess: 0,
+                source_incarnation: None,
             };
             process_triggers(state, std::slice::from_ref(&event));
             crate::game::stack::resolve_top(state, &mut Vec::new());
@@ -2256,6 +2269,65 @@ mod tests {
             0,
             "all time counters removed when damage equals the counter count"
         );
+    }
+
+    /// CR 108.2 + CR 109.1 + CR 722.3c: choosing among the cards the
+    /// controller owns in exile offers the real cards only. A non-card copy of
+    /// a card (the CR 722.3c retained prepare copy's shape: `is_copy`, not a
+    /// token, an Instant owned by P0) in the same exile is not offered.
+    #[test]
+    fn exile_card_population_choose_from_owned_exile_offers_only_cards() {
+        let mut state = GameState::new_two_player(42);
+        let mut exiled = Vec::new();
+        for (card, name) in [(1, "Exiled A"), (2, "Exiled B"), (3, "Retained Copy")] {
+            let id = create_object(
+                &mut state,
+                CardId(card),
+                PlayerId(0),
+                name.to_string(),
+                Zone::Exile,
+            );
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Instant);
+            exiled.push(id);
+        }
+        let (a, b, copy) = (exiled[0], exiled[1], exiled[2]);
+        state.objects.get_mut(&copy).unwrap().is_copy = true;
+        assert!(state.exile.contains(&copy));
+
+        let ability = ResolvedAbility::new(
+            Effect::ChooseFromZone {
+                count: 1,
+                zone: Zone::Exile,
+                additional_zones: Vec::new(),
+                zone_owner: ZoneOwner::Controller,
+                filter: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Direct,
+                reciprocal_role: None,
+                up_to: false,
+                constraint: None,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::ChooseFromZoneChoice { cards, .. } => {
+                let mut offered = cards.clone();
+                offered.sort_by_key(|id| id.0);
+                assert_eq!(offered, vec![a, b], "the copy {copy:?} is not offered");
+            }
+            other => panic!("Expected ChooseFromZoneChoice, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4250,7 +4322,7 @@ mod tests {
         assert!(exiled.contains(&plain_sorcery));
     }
 
-    /// CR 603.7 + CR 608.2c (MED #4093): the FIRST resolution of a per-player
+    /// CR 608.2c (MED #4093): the FIRST resolution of a per-player
     /// `ChooseFromZone` iteration must rebind a fresh (possibly empty) chain
     /// tracked set EVEN when that first player declines. Otherwise an earlier
     /// same-chain producer's tracked set stays bound, and a downstream
