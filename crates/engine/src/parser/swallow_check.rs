@@ -6029,6 +6029,7 @@ fn effect_name(effect: &Effect) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use crate::game::coverage::{card_face_gaps, card_face_has_unimplemented_parts};
     use crate::parser::swallow_evidence::UnitEvidence;
 
     use super::{
@@ -6050,6 +6051,7 @@ mod tests {
         StaticDefinition, TargetFilter, TriggerCondition, TypedFilter, UnlessPayModifier,
         ZoneChoiceCandidateSource, ZoneOwner,
     };
+    use crate::types::card::CardFace;
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::identifiers::TrackedSetId;
@@ -6419,7 +6421,6 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         for text in [
             "{T}: Draw a card for each kind of counter on Test Card.",
             "{T}: You gain life equal to the number of kinds of counters on Test Card.",
-            "As long as there are two or more kinds of counters on Test Card, it has flying.",
         ] {
             let parsed = parse_creature(text);
             assert!(
@@ -6428,6 +6429,37 @@ If you sang a song the whole time you were searching and shuffling, you may unta
             );
             assert!(!names_kind_counter(&parsed), "{text:?}: {parsed:#?}");
         }
+
+        let static_census = parse_creature(
+            "As long as there are two or more kinds of counters on Test Card, it has flying.",
+        );
+        assert!(
+            matches!(
+                static_census.statics.as_slice(),
+                [StaticDefinition {
+                    mode: StaticMode::Continuous,
+                    affected: Some(TargetFilter::SelfRef),
+                    condition: Some(StaticCondition::Unrecognized { text }),
+                    modifications,
+                    ..
+                // allow-noncombinator: Test assertion pins diagnostic text, not parser dispatch.
+                }] if text == "there are two or more kinds of counters on ~"
+                    && matches!(modifications.as_slice(), [ContinuousModification::AddKeyword {
+                        keyword: Keyword::Flying
+                    }])
+            ),
+            "the static census must preserve its exact unsupported condition: {static_census:#?}"
+        );
+        assert!(!names_kind_counter(&static_census), "{static_census:#?}");
+        let face = CardFace {
+            static_abilities: static_census.statics,
+            ..CardFace::default()
+        };
+        assert!(card_face_has_unimplemented_parts(&face));
+        assert_eq!(
+            card_face_gaps(&face),
+            vec!["Static:Unrecognized(there are two or more kinds of counters on ~)".to_string()]
+        );
 
         let control = parse_creature(
             "{T}: You gain life equal to the number of +1/+1 counters on Test Card.",
